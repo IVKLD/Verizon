@@ -1,0 +1,35 @@
+mod app;
+mod audio_player;
+mod inspector;
+mod media_page;
+mod media_pool;
+mod theme;
+mod timecode;
+mod timeline;
+mod timeline_view;
+mod video_decoder;
+mod viewer;
+
+use app::NleApp;
+use eframe::egui;
+
+fn main() -> Result<(), eframe::Error> {
+    // Чистый нативный Wayland бэкенд (никакого X11 / XWayland)
+    std::env::set_var("WINIT_UNIX_BACKEND", "wayland");
+
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Verizon NLE - DaVinci Resolve Edition (Zero-Lag)")
+            .with_inner_size([1600.0, 950.0])
+            .with_min_inner_size([1024.0, 600.0])
+            .with_active(true)
+            .with_transparent(false),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Verizon NLE",
+        native_options,
+        Box::new(|cc| Ok(Box::new(NleApp::new(cc)))),
+    )
+}

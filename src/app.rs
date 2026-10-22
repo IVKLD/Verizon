@@ -1,0 +1,475 @@
+use egui::{Color32, Context, Id, Margin, Panel, Stroke, Ui, WidgetText};
+use egui_dock::{DockArea, DockState, NodeIndex, Style as DockStyle, TabViewer};
+
+use crate::audio_player::AudioPlayer;
+use crate::inspector::InspectorState;
+use crate::media_page::MediaPageState;
+use crate::media_pool::MediaPoolState;
+use crate::theme::{apply_resolve_theme, ResolveColors};
+use crate::timeline::{TimelineState, Tool};
+use crate::timeline_view::TimelineView;
+use crate::video_decoder::VideoPlayer;
+use crate::viewer::ViewerState;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Page {
+    Media,
+    Cut,
+    Edit,
+    Color,
+    Deliver,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Tab {
+    MediaPool,
+    Viewers,
+    Inspector,
+    Timeline,
+}
+
+struct ResolveTabViewer<'a> {
+    media_pool: &'a mut MediaPoolState,
+    viewer: &'a mut ViewerState,
+    inspector: &'a mut InspectorState,
+    timeline: &'a mut TimelineState,
+    video_player: &'a mut VideoPlayer,
+}
+
+impl<'a> TabViewer for ResolveTabViewer<'a> {
+    type Tab = Tab;
+
+    fn id(&mut self, tab: &mut Self::Tab) -> Id {
+        Id::new(*tab)
+    }
+
+    fn title(&mut self, tab: &mut Self::Tab) -> WidgetText {
+        match tab {
+            Tab::MediaPool => "📁 Media Pool".into(),
+            Tab::Viewers => "🖥 Viewers".into(),
+            Tab::Inspector => "🔍 Inspector".into(),
+            Tab::Timeline => "🎬 Timeline".into(),
+        }
+    }
+
+    // Запрет случайного удаления основных рабочих панелей (исправление бага пропажи окон)
+    fn is_closeable(&self, _tab: &Self::Tab) -> bool {
+        false
+    }
+
+    fn ui(&mut self, ui: &mut Ui, tab: &mut Self::Tab) {
+        let ctx = ui.ctx().clone();
+        match tab {
+            Tab::MediaPool => {
+                self.media_pool.render(ui, self.timeline);
+            }
+            Tab::Viewers => {
+                self.viewer.render_dual_viewers(ui, self.timeline, self.video_player, &ctx);
+            }
+            Tab::Inspector => {
+                self.inspector.render(ui, self.timeline);
+            }
+            Tab::Timeline => {
+                TimelineView::render(ui, self.timeline);
+            }
+        }
+    }
+}
+
+pub struct NleApp {
+    pub current_page: Page,
+    pub dock_state: DockState<Tab>,
+    pub media_pool: MediaPoolState,
+    pub media_page: MediaPageState,
+    pub viewer: ViewerState,
+    pub inspector: InspectorState,
+    pub timeline: TimelineState,
+    pub video_player: VideoPlayer,
+    pub audio_player: AudioPlayer,
+    pub last_frame_time: std::time::Instant,
+    pub notification: Option<(String, std::time::Instant)>,
+}
+
+impl NleApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        apply_resolve_theme(&cc.egui_ctx);
+
+        let mut app = Self {
+            current_page: Page::Edit,
+            dock_state: DockState::new(vec![Tab::Viewers]),
+            media_pool: MediaPoolState::new_demo(),
+            media_page: MediaPageState::new(),
+            viewer: ViewerState::new(),
+            inspector: InspectorState::new(),
+            timeline: TimelineState::new_demo(),
+            video_player: VideoPlayer::new(),
+            audio_player: AudioPlayer::new(),
+            last_frame_time: std::time::Instant::now(),
+            notification: None,
+        };
+
+        app.reset_dock_layout();
+        app
+    }
+
+    /// Сброс расположения окон к дефолтному стандарту DaVinci Resolve
+    pub fn reset_dock_layout(&mut self) {
+        let mut dock = DockState::new(vec![Tab::Viewers]);
+
+        // 1. Снизу во всю ширину: Timeline
+        let [top, _bottom] = dock.main_surface_mut().split_below(
+            NodeIndex::root(),
+            0.55,
+            vec![Tab::Timeline],
+        );
+
+        // 2. Слева сверху: Media Pool (media слева)
+        let [_left, center] = dock.main_surface_mut().split_left(
+            top,
+            0.22,
+            vec![Tab::MediaPool],
+        );
+
+        // 3. Справа сверху: Inspector (inspector справа, viewers по центру)
+        let [_center, _right] = dock.main_surface_mut().split_right(
+            center,
+            0.70,
+            vec![Tab::Inspector],
+        );
+
+        self.dock_state = dock;
+    }
+
+    fn handle_drag_and_drop(&mut self, ctx: &Context) {
+        // 1. Прямой сброс файлов из файлового менеджера Nautilus (Drag & Drop)
+        let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
+        if !dropped_files.is_empty() {
+            let mut total_imported = 0;
+            for file in dropped_files {
+                let path = file.path();
+                let count = self.media_pool.import_path(path);
+                total_imported += count;
+
+                // СРАЗУ ПОМЕЩАЕМ СБРОШЕННЫЙ ФАЙЛ НА ДОРОЖКУ ТАЙМЛАЙНА!
+                self.media_pool.insert_selected_to_timeline(&mut self.timeline);
+
+                if MediaPoolState::is_media_file(path) {
+                    let _ = self.video_player.open_file(path, ctx);
+                    let _ = self.audio_player.load_audio_from_file(path);
+                }
+            }
+            if total_imported > 0 {
+                self.notification = Some((
+                    format!("✅ Файл из Nautilus помещен на дорожку таймлайна (импортировано: {})", total_imported),
+                    std::time::Instant::now(),
+                ));
+            }
+        }
+
+        // 2. Вставка из буфера обмена (Ctrl+V) файлов, скопированных в Nautilus
+        for event in &ctx.input(|i| i.events.clone()) {
+            if let egui::Event::Paste(text) = event {
+                for line in text.lines() {
+                    let clean = line.trim().trim_start_matches("file://");
+                    let path = std::path::Path::new(clean);
+                    if path.exists() {
+                        let count = self.media_pool.import_path(path);
+                        if count > 0 {
+                            self.media_pool.insert_selected_to_timeline(&mut self.timeline);
+                            if MediaPoolState::is_media_file(path) {
+                                let _ = self.video_player.open_file(path, ctx);
+                                let _ = self.audio_player.load_audio_from_file(path);
+                            }
+                            self.notification = Some((
+                                format!("✅ Вставлен клип на дорожку (Ctrl+V): {}", path.file_name().and_then(|n| n.to_str()).unwrap_or("")),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_keyboard_shortcuts(&mut self, ctx: &Context) {
+        ctx.input(|i| {
+            // Space: Play / Pause
+            if i.key_pressed(egui::Key::Space) {
+                self.timeline.is_playing = !self.timeline.is_playing;
+                self.timeline.playback_speed = 1.0;
+            }
+
+            // J / K / L Shuttle
+            if i.key_pressed(egui::Key::J) {
+                self.timeline.playback_speed = -2.0;
+                self.timeline.is_playing = true;
+            }
+            if i.key_pressed(egui::Key::K) {
+                self.timeline.is_playing = false;
+            }
+            if i.key_pressed(egui::Key::L) {
+                self.timeline.playback_speed = 2.0;
+                self.timeline.is_playing = true;
+            }
+
+            // Инструменты: A (Arrow), B (Blade)
+            if i.key_pressed(egui::Key::A) {
+                self.timeline.active_tool = Tool::Selection;
+            }
+            if i.key_pressed(egui::Key::B) {
+                if i.modifiers.ctrl {
+                    self.timeline.blade_all_at_playhead();
+                } else {
+                    self.timeline.active_tool = Tool::Blade;
+                }
+            }
+
+            // Enter: вставить выбранный клип из пула на таймлайн
+            if i.key_pressed(egui::Key::Enter) {
+                self.media_pool.insert_selected_to_timeline(&mut self.timeline);
+            }
+
+            // Snapping: N
+            if i.key_pressed(egui::Key::N) {
+                self.timeline.snapping_enabled = !self.timeline.snapping_enabled;
+            }
+
+            // In / Out: I / O
+            if i.key_pressed(egui::Key::I) {
+                self.timeline.in_point = Some(self.timeline.playhead_frame);
+            }
+            if i.key_pressed(egui::Key::O) {
+                self.timeline.out_point = Some(self.timeline.playhead_frame);
+            }
+
+            // Delete selected clip
+            if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
+                self.timeline.delete_selected_clip();
+            }
+
+            // Undo: Ctrl + Z
+            if i.modifiers.ctrl && i.key_pressed(egui::Key::Z) {
+                self.timeline.undo();
+            }
+        });
+    }
+
+    fn render_top_bar(&mut self, ui: &mut Ui) {
+        Panel::top("top_header_panel")
+            .frame(
+                egui::Frame::new()
+                    .fill(ResolveColors::BG_HEADER)
+                    .stroke(Stroke::new(1.0, ResolveColors::BORDER))
+                    .inner_margin(Margin::symmetric(10, 4)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // Логотип
+                    ui.label(
+                        egui::RichText::new("⚡ VERIZON NLE")
+                            .size(13.0)
+                            .strong()
+                            .color(ResolveColors::ACCENT_ORANGE),
+                    );
+
+                    ui.separator();
+
+                    // Верхнее главное меню DaVinci Resolve
+                    ui.menu_button("File", |ui| {
+                        if ui.button("📂 Import Media...").clicked() {
+                            if let Some(files) = rfd::FileDialog::new()
+                                .add_filter("Video & Audio", &["mp4", "mov", "mkv", "avi", "webm", "wav", "mp3", "flac"])
+                                .pick_files()
+                            {
+                                for f in files {
+                                    self.media_pool.import_path(&f);
+                                    self.media_pool.insert_selected_to_timeline(&mut self.timeline);
+                                    let _ = self.video_player.open_file(&f, ui.ctx());
+                                    let _ = self.audio_player.load_audio_from_file(&f);
+                                }
+                            }
+                            ui.close();
+                        }
+                        if ui.button("📁 Import Folder...").clicked() {
+                            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                self.media_pool.import_path(&folder);
+                            }
+                            ui.close();
+                        }
+                    });
+
+                    ui.menu_button("Edit", |ui| {
+                        if ui.button("⮌ Undo [Ctrl+Z]").clicked() {
+                            self.timeline.undo();
+                            ui.close();
+                        }
+                        if ui.button("✂ Blade Cut at Playhead [Ctrl+B]").clicked() {
+                            self.timeline.blade_all_at_playhead();
+                            ui.close();
+                        }
+                        if ui.button("🗑 Delete Selected [Del]").clicked() {
+                            self.timeline.delete_selected_clip();
+                            ui.close();
+                        }
+                    });
+
+                    ui.menu_button("Timeline", |ui| {
+                        let play_str = if self.timeline.is_playing { "⏸ Pause [Space]" } else { "▶ Play [Space]" };
+                        if ui.button(play_str).clicked() {
+                            self.timeline.is_playing = !self.timeline.is_playing;
+                            ui.close();
+                        }
+                        if ui.button("[ I ] Mark In").clicked() {
+                            self.timeline.in_point = Some(self.timeline.playhead_frame);
+                            ui.close();
+                        }
+                        if ui.button("[ O ] Mark Out").clicked() {
+                            self.timeline.out_point = Some(self.timeline.playhead_frame);
+                            ui.close();
+                        }
+                    });
+
+                    ui.menu_button("Workspace", |ui| {
+                        if ui.button("⟲ Сбросить расположение панелей к дефолту").clicked() {
+                            self.reset_dock_layout();
+                            self.notification = Some(("✅ Расположение окон сброшено к дефолту".to_string(), std::time::Instant::now()));
+                            ui.close();
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Кнопка быстрого сброса окон прямо на панели
+                    if ui.button(egui::RichText::new("⟲ Сбросить окна").size(10.0)).on_hover_text("Вернуть исходное расположение всех панелей (Media, Viewers, Inspector, Timeline)").clicked() {
+                        self.reset_dock_layout();
+                    }
+
+                    if let Some((msg, time)) = &self.notification {
+                        if time.elapsed().as_secs() < 5 {
+                            ui.separator();
+                            ui.label(egui::RichText::new(msg).size(11.0).color(ResolveColors::ACCENT_ORANGE).strong());
+                        }
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new("Zero-Lag Audio/Video Active")
+                                .size(10.0)
+                                .color(ResolveColors::VU_GREEN),
+                        );
+                    });
+                });
+            });
+    }
+
+    fn render_bottom_page_bar(&mut self, ui: &mut Ui) {
+        Panel::bottom("bottom_page_bar")
+            .frame(
+                egui::Frame::new()
+                    .fill(ResolveColors::BG_HEADER)
+                    .stroke(Stroke::new(1.0, ResolveColors::BORDER))
+                    .inner_margin(Margin::symmetric(8, 4)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.add_space(ui.available_width() * 0.28);
+
+                    let pages = [
+                        (Page::Media, "📁 Media"),
+                        (Page::Cut, "✂ Cut"),
+                        (Page::Edit, "🎬 Edit"),
+                        (Page::Color, "🎨 Color"),
+                        (Page::Deliver, "🚀 Deliver"),
+                    ];
+
+                    for (page, label) in pages {
+                        let is_active = self.current_page == page;
+                        let text = egui::RichText::new(label)
+                            .size(12.0)
+                            .strong()
+                            .color(if is_active { ResolveColors::ACCENT_ORANGE } else { ResolveColors::TEXT_MUTED });
+
+                        let btn = egui::Button::new(text)
+                            .fill(if is_active { Color32::from_rgb(0x2d, 0x24, 0x1c) } else { Color32::TRANSPARENT })
+                            .stroke(if is_active {
+                                Stroke::new(1.0, ResolveColors::ACCENT_ORANGE)
+                            } else {
+                                Stroke::NONE
+                            });
+
+                        if ui.add(btn).clicked() {
+                            self.current_page = page;
+                        }
+                    }
+                });
+            });
+    }
+}
+
+impl eframe::App for NleApp {
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
+        // 1. Шаг воспроизведения по таймеру
+        let now = std::time::Instant::now();
+        let delta = now.duration_since(self.last_frame_time).as_secs_f64();
+        self.last_frame_time = now;
+
+        if self.timeline.is_playing {
+            self.timeline.step_playback(delta);
+            ctx.request_repaint(); // 144+ FPS перерисовка при активном воспроизведении
+        }
+
+        // 2. Синхронизация звука с видеоплейбэком
+        self.audio_player.sync_playhead(
+            self.timeline.playhead_frame,
+            self.timeline.fps as f64,
+            self.timeline.is_playing,
+        );
+
+        // 3. Обработка Drag & Drop файлов и буфера обмена (Ctrl+V)
+        self.handle_drag_and_drop(&ctx);
+
+        // 4. Обработка хоткеев DaVinci
+        self.handle_keyboard_shortcuts(&ctx);
+
+        // 5. Верхний бар и Меню
+        self.render_top_bar(ui);
+
+        // 6. Нижняя панель страниц DaVinci Resolve
+        self.render_bottom_page_bar(ui);
+
+        // 7. Отображение активной страницы (Media / Edit)
+        match self.current_page {
+            Page::Media => {
+                // Полноценная страница DaVinci Resolve 21 Media Page
+                self.media_page.render(
+                    ui,
+                    &mut self.media_pool,
+                    &mut self.video_player,
+                    &ctx,
+                );
+            }
+            Page::Edit | Page::Cut | Page::Color | Page::Deliver => {
+                // Страница монтажа Edit Page
+                let mut dock_style = DockStyle::from_egui(ui.style());
+                dock_style.dock_area_padding = None;
+
+                let mut tab_viewer = ResolveTabViewer {
+                    media_pool: &mut self.media_pool,
+                    viewer: &mut self.viewer,
+                    inspector: &mut self.inspector,
+                    timeline: &mut self.timeline,
+                    video_player: &mut self.video_player,
+                };
+
+                DockArea::new(&mut self.dock_state)
+                    .style(dock_style)
+                    .draggable_tabs(false)
+                    .show_close_buttons(false)
+                    .show_add_buttons(false)
+                    .show_inside(ui, &mut tab_viewer);
+            }
+        }
+    }
+}
