@@ -201,18 +201,31 @@ impl AudioPlayer {
         Ok(())
     }
 
-    /// Синхронизация текущей позиции звука с плейхедом таймлайна
+    /// Синхронизация текущей позиции звука с плейхедом таймлайна без щелчков и заиканий
     pub fn sync_playhead(&self, current_time_seconds: Option<f64>, is_playing: bool) {
         if let Ok(mut state) = self.shared_state.lock() {
+            let was_playing = state.is_playing;
             state.is_playing = is_playing;
+
             if let Some(time_sec) = current_time_seconds {
                 let sample_rate = state.sample_rate as f64;
                 let target_sample = (time_sec * sample_rate * state.channels as f64).max(0.0) as usize;
-                let diff = (state.current_sample_pos as isize - target_sample as isize).abs();
-                let threshold = (sample_rate * 0.05 * state.channels as f64) as isize;
 
-                if diff > threshold || !is_playing {
+                if !was_playing && is_playing {
+                    // Момент запуска воспроизведения: жестко встаем на позицию плейхеда
                     state.current_sample_pos = target_sample.min(state.samples.len());
+                } else if !is_playing {
+                    // Пауза / скраббинг / перемотка вручную: всегда точно следуем за плейхедом
+                    state.current_sample_pos = target_sample.min(state.samples.len());
+                } else {
+                    // При активном непрерывном воспроизведении НЕ дергаем семплы каждые 7-16мс!
+                    // Аудиопоток течет плавно без заиканий и щелчков (anti-crackling buffer).
+                    // Корректируем ТОЛЬКО при реальном прыжке/клике по таймлайну (>200 мс).
+                    let diff = (state.current_sample_pos as isize - target_sample as isize).abs();
+                    let threshold = (sample_rate * 0.20 * state.channels as f64) as isize;
+                    if diff > threshold {
+                        state.current_sample_pos = target_sample.min(state.samples.len());
+                    }
                 }
             } else {
                 state.current_sample_pos = state.samples.len();

@@ -160,6 +160,13 @@ impl MediaPoolState {
                 timeline.push_history();
                 let dur = (asset.duration_secs * timeline.fps as f64).round().max(1.0) as i64;
                 let start = timeline.playhead_frame;
+                let link_id = if asset.has_video && asset.has_audio {
+                    let id = timeline.next_link_id;
+                    timeline.next_link_id += 1;
+                    Some(id)
+                } else {
+                    None
+                };
 
                 // 1. Создаем видеоклип на V1, если есть видео
                 if asset.has_video {
@@ -174,6 +181,7 @@ impl MediaPoolState {
                         source_path: asset.path.clone(),
                         source_in_frame: 0,
                         source_fps: asset.fps_num,
+                        link_group: link_id,
                         zoom_x: 1.0,
                         zoom_y: 1.0,
                         position_x: 0.0,
@@ -201,6 +209,7 @@ impl MediaPoolState {
                         source_path: asset.path.clone(),
                         source_in_frame: 0,
                         source_fps: asset.fps_num,
+                        link_group: link_id,
                         zoom_x: 1.0,
                         zoom_y: 1.0,
                         position_x: 0.0,
@@ -323,6 +332,7 @@ impl MediaPoolState {
                                 is_audio: asset.is_audio_only,
                                 duration_frames: dur_frames,
                                 source_fps: asset.fps_num,
+                                link_group: None,
                             });
                         }
 

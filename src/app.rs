@@ -300,6 +300,11 @@ impl NleApp {
                 self.timeline.snapping_enabled = !self.timeline.snapping_enabled;
             }
 
+            // Ctrl+Shift+L: Связность клипов (Linked Selection)
+            if (i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(egui::Key::L) {
+                self.timeline.linked_selection = !self.timeline.linked_selection;
+            }
+
             // In / Out: I / O (без модификаторов)
             if !i.modifiers.ctrl && !i.modifiers.command {
                 if i.key_pressed(egui::Key::I) {
@@ -400,6 +405,12 @@ impl NleApp {
                         }
                         if ui.button("[ O ] Mark Out").clicked() {
                             self.timeline.out_point = Some(self.timeline.playhead_frame);
+                            ui.close();
+                        }
+                        ui.separator();
+                        let link_label = if self.timeline.linked_selection { "🔗 Linked Selection: ON [Ctrl+Shift+L]" } else { "🔗 Linked Selection: OFF [Ctrl+Shift+L]" };
+                        if ui.button(link_label).clicked() {
+                            self.timeline.linked_selection = !self.timeline.linked_selection;
                             ui.close();
                         }
                     });
@@ -637,8 +648,14 @@ impl eframe::App for NleApp {
                     let _ = self.audio_player.load_audio_from_file(path);
                 }
                 let offset = self.timeline.playhead_frame - clip.start_frame;
-                let time_secs = offset as f64 / self.timeline.fps as f64;
-                self.audio_player.sync_playhead(Some(time_secs), self.timeline.is_playing);
+                let time_in_clip = offset as f64 / self.timeline.fps as f64;
+                let source_in_secs = if clip.source_fps > 0.0 {
+                    clip.source_in_frame as f64 / clip.source_fps
+                } else {
+                    0.0
+                };
+                let total_source_secs = source_in_secs + time_in_clip;
+                self.audio_player.sync_playhead(Some(total_source_secs), self.timeline.is_playing);
             } else {
                 self.audio_player.sync_playhead(None, self.timeline.is_playing);
             }

@@ -19,10 +19,13 @@ pub struct Clip {
     pub is_audio: bool,
     pub color: Color32,
 
-    // Ссылка на реальный медиафайл
+    // Ссылка на реальный медиафайл и смещение
     pub source_path: Option<PathBuf>,
     pub source_in_frame: i64,
     pub source_fps: f64,
+
+    // Связанность клипов (Linked Clips: Video + Audio)
+    pub link_group: Option<u64>,
 
     // Свойства инспектора (Transform / Composite / Audio)
     pub zoom_x: f32,
@@ -64,6 +67,7 @@ pub struct DraggedMedia {
     pub is_audio: bool,
     pub duration_frames: i64,
     pub source_fps: f64,
+    pub link_group: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +75,7 @@ pub struct TimelineState {
     pub tracks: Vec<Track>,
     pub clips: Vec<Clip>,
     pub next_clip_id: u64,
+    pub next_link_id: u64,
 
     pub playhead_frame: i64,
     pub fps: u32,
@@ -83,6 +88,7 @@ pub struct TimelineState {
 
     pub active_tool: Tool,
     pub snapping_enabled: bool,
+    pub linked_selection: bool, // Связность клипов (Linked Selection Ctrl+Shift+L)
     pub selected_clip_id: Option<u64>,
     pub is_playing: bool,
     pub playback_speed: f64, // 1.0 = нормальная, 2.0 = 2x (L), -1.0 = реверс (J)
@@ -135,6 +141,7 @@ impl TimelineState {
             tracks,
             clips: Vec::new(),
             next_clip_id: 1,
+            next_link_id: 1,
             playhead_frame: 0,
             fps: 24,
             zoom_factor: 2.0,
@@ -144,6 +151,7 @@ impl TimelineState {
             loop_enabled: false,
             active_tool: Tool::Selection,
             snapping_enabled: true,
+            linked_selection: true, // По умолчанию связность включена как в Resolve
             selected_clip_id: None,
             is_playing: false,
             playback_speed: 1.0,
@@ -179,16 +187,44 @@ impl TimelineState {
         }
     }
 
-    /// Разрезать клип лезвием (Blade Cut) в указанном кадре
+    /// Разрезать клип лезвием (Blade Cut) в указанном кадре со связностью
     pub fn blade_cut_at(&mut self, clip_id: u64, cut_frame: i64) -> bool {
-        if let Some(idx) = self.clips.iter().position(|c| c.id == clip_id) {
-            let start = self.clips[idx].start_frame;
-            let duration = self.clips[idx].duration_frames;
-            let end = start + duration;
+        let clip_opt = self.clips.iter().find(|c| c.id == clip_id).cloned();
+        let clip = match clip_opt {
+            Some(c) => c,
+            None => return false,
+        };
 
-            if cut_frame > start && cut_frame < end {
-                self.push_history();
+        // Если включена связность клипов, находим все клипы в группе (Video + Audio)
+        let target_ids: Vec<u64> = if self.linked_selection && clip.link_group.is_some() {
+            self.clips
+                .iter()
+                .filter(|c| c.link_group == clip.link_group && cut_frame > c.start_frame && cut_frame < c.end_frame())
+                .map(|c| c.id)
+                .collect()
+        } else if cut_frame > clip.start_frame && cut_frame < clip.end_frame() {
+            vec![clip.id]
+        } else {
+            Vec::new()
+        };
 
+        if target_ids.is_empty() {
+            return false;
+        }
+
+        self.push_history();
+        let new_link_group = if clip.link_group.is_some() {
+            let id = self.next_link_id;
+            self.next_link_id += 1;
+            Some(id)
+        } else {
+            None
+        };
+
+        for id in target_ids {
+            if let Some(idx) = self.clips.iter().position(|c| c.id == id) {
+                let start = self.clips[idx].start_frame;
+                let duration = self.clips[idx].duration_frames;
                 let left_duration = cut_frame - start;
                 let right_duration = duration - left_duration;
 
@@ -197,16 +233,20 @@ impl TimelineState {
                 self.next_clip_id += 1;
                 right_clip.start_frame = cut_frame;
                 right_clip.duration_frames = right_duration;
-                // Сдвиг смещения в исходном файле
-                let frames_offset_in_source = (left_duration as f64 * (right_clip.source_fps / self.fps as f64)).round() as i64;
-                right_clip.source_in_frame += frames_offset_in_source;
+                right_clip.link_group = new_link_group;
+
+                let frames_offset = if self.fps > 0 {
+                    (left_duration as f64 * (right_clip.source_fps / self.fps as f64)).round() as i64
+                } else {
+                    left_duration
+                };
+                right_clip.source_in_frame += frames_offset;
 
                 self.clips[idx].duration_frames = left_duration;
                 self.clips.insert(idx + 1, right_clip);
-                return true;
             }
         }
-        false
+        true
     }
 
     /// Разрезать все клипы под плейхедом (Ctrl+B)
@@ -226,30 +266,42 @@ impl TimelineState {
         }
     }
 
-    /// Удалить выделенный клип (Delete / Backspace)
+    /// Удалить выделенный клип (Delete / Backspace) с учетом связности
     pub fn delete_selected_clip(&mut self) {
         if let Some(selected_id) = self.selected_clip_id {
             self.push_history();
-            self.clips.retain(|c| c.id != selected_id);
+            let link_grp = self.clips.iter().find(|c| c.id == selected_id).and_then(|c| c.link_group);
+            if self.linked_selection && link_grp.is_some() {
+                self.clips.retain(|c| c.link_group != link_grp);
+            } else {
+                self.clips.retain(|c| c.id != selected_id);
+            }
             self.selected_clip_id = None;
         }
     }
 
-    /// Перемещение клипа с учетом магнитного прилипания (Snapping)
+    /// Перемещение клипа с учетом магнитного прилипания и связности клипов (Linked Clips)
     pub fn move_clip(&mut self, clip_id: u64, raw_start: i64) {
+        let clip_idx = match self.clips.iter().position(|c| c.id == clip_id) {
+            Some(idx) => idx,
+            None => return,
+        };
+
+        let old_start = self.clips[clip_idx].start_frame;
         let mut target_frame = raw_start.max(0);
 
         if self.snapping_enabled {
-            let snap_threshold = (10.0 / self.zoom_factor) as i64;
+            let snap_threshold = (10.0 / self.zoom_factor).max(2.0) as i64;
 
             // Прилипание к плейхеду
             if (target_frame - self.playhead_frame).abs() <= snap_threshold {
                 target_frame = self.playhead_frame;
             }
 
-            // Прилипание к точкам других клипов
+            // Прилипание к границам других несвязанных клипов
+            let current_link = self.clips[clip_idx].link_group;
             for other in &self.clips {
-                if other.id == clip_id {
+                if other.id == clip_id || (current_link.is_some() && other.link_group == current_link) {
                     continue;
                 }
                 if (target_frame - other.start_frame).abs() <= snap_threshold {
@@ -263,8 +315,21 @@ impl TimelineState {
             }
         }
 
-        if let Some(clip) = self.clips.iter_mut().find(|c| c.id == clip_id) {
-            clip.start_frame = target_frame;
+        let delta_frames = target_frame - old_start;
+        if delta_frames == 0 {
+            return;
+        }
+
+        let link_grp = self.clips[clip_idx].link_group;
+        if self.linked_selection && link_grp.is_some() {
+            // Перемещаем ВСЕ связанные клипы (Видео + Аудио) синхронно!
+            for clip in &mut self.clips {
+                if clip.link_group == link_grp {
+                    clip.start_frame = (clip.start_frame + delta_frames).max(0);
+                }
+            }
+        } else {
+            self.clips[clip_idx].start_frame = target_frame;
         }
     }
 

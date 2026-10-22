@@ -43,12 +43,16 @@ impl TimelineView {
         );
 
         let ruler_rect = Rect::from_min_size(canvas_rect.min, vec2(canvas_rect.width(), ruler_height));
+        let tracks_canvas_rect = Rect::from_min_max(
+            pos2(canvas_rect.min.x, ruler_rect.max.y),
+            canvas_rect.max,
+        );
 
         let mouse_pos = ui.input(|i| i.pointer.hover_pos());
 
-        // Взаимодействие со скраббингом по линейке и таймлайну
-        let timeline_sense = ui.interact(canvas_rect, ui.id().with("timeline_canvas"), egui::Sense::click_and_drag());
-        if (timeline_sense.dragged() || timeline_sense.clicked()) && timeline.dragged_media.is_none() {
+        // 1. Взаимодействие со скраббингом исключительно по линейке времени (Ruler)
+        let ruler_sense = ui.interact(ruler_rect, ui.id().with("ruler_scrub"), egui::Sense::click_and_drag());
+        if ruler_sense.dragged() || ruler_sense.clicked() {
             if let Some(m_pos) = mouse_pos {
                 let rel_x = m_pos.x - canvas_rect.min.x + timeline.scroll_x;
                 let target_frame = (rel_x / timeline.zoom_factor).max(0.0) as i64;
@@ -94,10 +98,14 @@ impl TimelineView {
             );
         }
 
-        // 5. Отрисовка клипов на дорожках
+        // 5. Отрисовка и высокоточная интерактивность клипов на дорожках
+        let drag_session_id = ui.id().with("clip_moving_session");
+        let mut moving_session: Option<(u64, f32, i64)> = ui.data(|d| d.get_temp(drag_session_id));
+
+        let mut hovered_clip_id = None;
         let mut clicked_clip_id = None;
         let mut cut_request = None;
-        let mut drag_request = None;
+        let mut start_drag_request = None;
 
         for clip in &timeline.clips {
             if clip.track_index >= timeline.tracks.len() {
@@ -116,25 +124,42 @@ impl TimelineView {
                 continue;
             }
 
-            let is_selected = timeline.selected_clip_id == Some(clip.id);
+            // Связанная подсветка клипов при выделении
+            let is_selected = if let Some(sel_id) = timeline.selected_clip_id {
+                if sel_id == clip.id {
+                    true
+                } else if timeline.linked_selection && clip.link_group.is_some() {
+                    timeline.clips.iter().any(|c| c.id == sel_id && c.link_group == clip.link_group)
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
             Self::draw_clip(&painter, clip_rect, clip, is_selected);
 
-            // Интерактивность клипа
+            // Четкая регистрация клика и перетаскивания клипа
             let clip_resp = ui.interact(clip_rect, ui.id().with(format!("clip_{}", clip.id)), egui::Sense::click_and_drag());
+            if clip_resp.hovered() {
+                hovered_clip_id = Some(clip.id);
+            }
+
             if clip_resp.clicked() {
                 if timeline.active_tool == Tool::Blade {
                     if let Some(m_pos) = mouse_pos {
-                        let rel_frame = ((m_pos.x - canvas_rect.min.x + timeline.scroll_x) / timeline.zoom_factor) as i64;
+                        let rel_frame = ((m_pos.x - canvas_rect.min.x + timeline.scroll_x) / timeline.zoom_factor).round() as i64;
                         cut_request = Some((clip.id, rel_frame));
                     }
                 } else {
                     clicked_clip_id = Some(clip.id);
                 }
-            } else if clip_resp.dragged() && timeline.active_tool == Tool::Selection {
-                let drag_delta_x = clip_resp.drag_delta().x;
-                let frames_drag = (drag_delta_x / timeline.zoom_factor).round() as i64;
-                if frames_drag != 0 {
-                    drag_request = Some((clip.id, clip.start_frame + frames_drag));
+            }
+
+            // Инициализация плавного drag-перемещения клипа
+            if clip_resp.drag_started() && timeline.active_tool == Tool::Selection {
+                if let Some(m_pos) = mouse_pos {
+                    start_drag_request = Some((clip.id, m_pos.x, clip.start_frame));
                 }
             }
 
@@ -151,15 +176,46 @@ impl TimelineView {
             }
         }
 
+        if let Some((id, mouse_x, start_fr)) = start_drag_request {
+            timeline.push_history();
+            moving_session = Some((id, mouse_x, start_fr));
+        }
+
+        // Обновление позиции перетаскиваемого клипа (и всех связанных с ним)
+        if let Some((drag_id, start_mouse_x, init_start_frame)) = moving_session {
+            if let Some(m_pos) = mouse_pos {
+                let dx = m_pos.x - start_mouse_x;
+                let delta_frames = (dx / timeline.zoom_factor).round() as i64;
+                let target_start = (init_start_frame + delta_frames).max(0);
+                timeline.move_clip(drag_id, target_start);
+            }
+            if ui.input(|i| i.pointer.any_released()) {
+                moving_session = None;
+            }
+        }
+        ui.data_mut(|d| d.insert_temp(drag_session_id, moving_session));
+
+        // Клик по пустой области дорожек (где нет клипов) — перемещение плейхеда
+        if moving_session.is_none() && hovered_clip_id.is_none() && timeline.dragged_media.is_none() {
+            let canvas_sense = ui.interact(tracks_canvas_rect, ui.id().with("empty_tracks_canvas"), egui::Sense::click_and_drag());
+            if canvas_sense.clicked() || canvas_sense.dragged() {
+                if let Some(m_pos) = mouse_pos {
+                    let rel_x = m_pos.x - canvas_rect.min.x + timeline.scroll_x;
+                    let target_frame = (rel_x / timeline.zoom_factor).max(0.0) as i64;
+                    timeline.playhead_frame = target_frame;
+                    if canvas_sense.clicked() && timeline.active_tool != Tool::Blade {
+                        timeline.selected_clip_id = None;
+                    }
+                }
+            }
+        }
+
         // Применение действий с клипами
         if let Some(id) = clicked_clip_id {
             timeline.selected_clip_id = Some(id);
         }
         if let Some((id, cut_frame)) = cut_request {
             timeline.blade_cut_at(id, cut_frame);
-        }
-        if let Some((id, new_start)) = drag_request {
-            timeline.move_clip(id, new_start);
         }
 
         // 6. ОБРАБОТКА И ОТРИСОВКА ПЕРЕТАСКИВАНИЯ НА ДОРОЖКУ (DRAG & DROP ONTO TRACK)
@@ -224,6 +280,7 @@ impl TimelineView {
                             source_path: media.path.clone(),
                             source_in_frame: 0,
                             source_fps: media.source_fps,
+                            link_group: media.link_group,
                             zoom_x: 1.0,
                             zoom_y: 1.0,
                             position_x: 0.0,
@@ -287,10 +344,16 @@ impl TimelineView {
 
             ui.separator();
 
-            // Магнит (Snapping)
+            // Магнит (Snapping: N)
             let snap_text = if timeline.snapping_enabled { "🧲 Snapping: ON" } else { "🧲 Snapping: OFF" };
-            if ui.selectable_label(timeline.snapping_enabled, egui::RichText::new(snap_text).size(11.0)).clicked() {
+            if ui.selectable_label(timeline.snapping_enabled, egui::RichText::new(snap_text).size(11.0)).on_hover_text("Магнитное прилипание [N]").clicked() {
                 timeline.snapping_enabled = !timeline.snapping_enabled;
+            }
+
+            // Связность клипов (Linked Selection: Ctrl+Shift+L)
+            let link_text = if timeline.linked_selection { "🔗 Link: ON" } else { "🔗 Link: OFF" };
+            if ui.selectable_label(timeline.linked_selection, egui::RichText::new(link_text).size(11.0)).on_hover_text("Связность видео и аудиоклипов [Ctrl+Shift+L]").clicked() {
+                timeline.linked_selection = !timeline.linked_selection;
             }
 
             ui.separator();
@@ -421,10 +484,15 @@ impl TimelineView {
 
         // Название клипа
         if rect.width() > 30.0 {
+            let label = if clip.link_group.is_some() {
+                format!("🔗 {}", clip.name)
+            } else {
+                clip.name.clone()
+            };
             painter.text(
                 pos2(rect.min.x + 4.0, rect.min.y + 4.0),
                 egui::Align2::LEFT_TOP,
-                &clip.name,
+                label,
                 egui::FontId::proportional(10.0),
                 Color32::WHITE,
             );
