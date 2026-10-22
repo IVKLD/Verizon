@@ -36,6 +36,14 @@ pub struct VideoPlayer {
 
     // Преаллоцированный буфер для плейсхолдера
     placeholder_buffer: Vec<u8>,
+
+    // Мониторинг производительности реального времени (DaVinci Drop Frame Indicator)
+    pub real_playback_fps: f32,
+    pub dropped_frames_count: u64,
+    pub is_dropping_frames: bool,
+    pub drop_frames_enabled: bool,
+    pub fps_sample_time: std::time::Instant,
+    pub rendered_frames_in_sample: u32,
 }
 
 impl VideoPlayer {
@@ -59,6 +67,12 @@ impl VideoPlayer {
             is_playing_mode: false,
             last_request_time: std::time::Instant::now(),
             placeholder_buffer: Vec::new(),
+            real_playback_fps: 24.0,
+            dropped_frames_count: 0,
+            is_dropping_frames: false,
+            drop_frames_enabled: true,
+            fps_sample_time: std::time::Instant::now(),
+            rendered_frames_in_sample: 0,
         }
     }
 
@@ -157,6 +171,10 @@ impl VideoPlayer {
                 self.is_playing_mode = true;
                 self.last_playback_target = target_frame;
                 self.frame_queue.clear();
+                self.dropped_frames_count = 0;
+                self.rendered_frames_in_sample = 0;
+                self.fps_sample_time = std::time::Instant::now();
+                self.is_dropping_frames = false;
                 if let Some(tx) = &self.command_tx {
                     let _ = tx.send(DecoderCommand::Play { start_frame: target_frame });
                 }
@@ -181,6 +199,7 @@ impl VideoPlayer {
             if self.is_playing_mode {
                 self.is_playing_mode = false;
                 self.frame_queue.clear();
+                self.is_dropping_frames = false;
                 if let Some(tx) = &self.command_tx {
                     let _ = tx.send(DecoderCommand::Pause);
                 }
@@ -190,7 +209,7 @@ impl VideoPlayer {
         }
     }
 
-    /// Выборка кадров из буфера упреждающего чтения в режиме воспроизведения (без пропуска кадров)
+    /// Выборка кадров из буфера упреждающего чтения в режиме воспроизведения с поддержкой DaVinci Drop-Frame
     fn poll_playback_frames(&mut self, target_frame: i64, ctx: &Context) {
         if let Some(rx) = &self.frame_rx {
             while let Ok((frame_num, image)) = rx.try_recv() {
@@ -208,18 +227,38 @@ impl VideoPlayer {
             best_frame = f;
         }
 
+        let mut dropped = 0;
         while let Some(&(f_num, _)) = self.frame_queue.front() {
             if f_num <= target_frame {
                 let (f, img) = self.frame_queue.pop_front().unwrap();
-                best_img = Some(img);
-                best_frame = f;
+                // Если включен режим Drop Frame (по умолчанию как в Resolve) и в очереди есть более актуальный кадр,
+                // устаревший кадр отбрасывается без отображения для поддержания точной скорости 1.0x
+                if self.drop_frames_enabled && !self.frame_queue.is_empty() && self.frame_queue.front().unwrap().0 <= target_frame {
+                    dropped += 1;
+                } else {
+                    best_img = Some(img);
+                    best_frame = f;
+                }
             } else {
                 break;
             }
         }
+        self.dropped_frames_count += dropped;
 
         while self.frame_queue.len() > 30 {
             self.frame_queue.pop_front();
+            self.dropped_frames_count += 1;
+        }
+
+        // Обновление реального FPS воспроизведения каждые 500 мс
+        self.rendered_frames_in_sample += 1;
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.fps_sample_time).as_secs_f32();
+        if elapsed >= 0.5 {
+            self.real_playback_fps = (self.rendered_frames_in_sample as f32 / elapsed).round();
+            self.rendered_frames_in_sample = 0;
+            self.fps_sample_time = now;
+            self.is_dropping_frames = self.real_playback_fps < (self.fps as f32 - 1.5) || self.dropped_frames_count > 0;
         }
 
         if let Some(img) = best_img {
@@ -732,7 +771,8 @@ impl VideoPlayer {
                                     let f_num = (pts as f64 * time_base_f * fps).round() as i64;
                                     current_decoded_frame = f_num;
 
-                                    if f_num >= start_playback_frame {
+                                    let is_late = is_playing && f_num < playhead_frame;
+                                    if f_num >= start_playback_frame && !is_late {
                                         if let Some(img) = Self::scale_and_copy_frame(
                                             &mut scaler,
                                             &decoded_frame,
@@ -847,12 +887,16 @@ impl VideoPlayer {
                 rgba_buffer.resize(w * h * 4, 0);
             }
 
-            for y in 0..h {
-                let src_start = y * stride;
-                let dst_start = y * w * 4;
-                if src_start + w * 4 <= data.len() {
-                    rgba_buffer[dst_start..dst_start + w * 4]
-                        .copy_from_slice(&data[src_start..src_start + w * 4]);
+            if stride == w * 4 && data.len() >= w * h * 4 {
+                rgba_buffer[..w * h * 4].copy_from_slice(&data[..w * h * 4]);
+            } else {
+                for y in 0..h {
+                    let src_start = y * stride;
+                    let dst_start = y * w * 4;
+                    if src_start + w * 4 <= data.len() {
+                        rgba_buffer[dst_start..dst_start + w * 4]
+                            .copy_from_slice(&data[src_start..src_start + w * 4]);
+                    }
                 }
             }
 
@@ -1074,6 +1118,18 @@ mod tests {
         let mut hw_frame = ffmpeg_next::util::frame::Video::empty();
         let mut sw_frame = ffmpeg_next::util::frame::Video::empty();
 
+        let mut scaler = ffmpeg_next::software::scaling::Context::get(
+            ffmpeg_next::format::Pixel::NV12,
+            3840,
+            2160,
+            ffmpeg_next::format::Pixel::RGBA,
+            1280,
+            720,
+            ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
+        ).unwrap();
+        let mut rgba_frame = ffmpeg_next::util::frame::Video::empty();
+        let mut rgba_buf = vec![0u8; 1280 * 720 * 4];
+
         let start = std::time::Instant::now();
         let mut decoded = 0;
 
@@ -1089,6 +1145,14 @@ mod tests {
                             );
                             assert_eq!(ret, 0, "Transfer from GPU failed");
                         }
+                        scaler.run(&sw_frame, &mut rgba_frame).unwrap();
+                        let d = rgba_frame.data(0);
+                        let s = rgba_frame.stride(0);
+                        for y in 0..720 {
+                            let src = y * s;
+                            let dst = y * 1280 * 4;
+                            rgba_buf[dst..dst + 1280 * 4].copy_from_slice(&d[src..src + 1280 * 4]);
+                        }
                         decoded += 1;
                         if decoded >= 60 {
                             break;
@@ -1102,7 +1166,7 @@ mod tests {
         }
 
         let el = start.elapsed();
-        println!("GPU VAAPI (RX 9070 XT): 60 frames in {:?} ({:.1} FPS)!", el, 60.0 / el.as_secs_f64());
+        println!("GPU VAAPI + Swscale to 720p: 60 frames in {:?} ({:.1} FPS)!", el, 60.0 / el.as_secs_f64());
         assert!(decoded >= 60);
 
         unsafe {

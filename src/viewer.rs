@@ -135,7 +135,7 @@ impl ViewerState {
         }
     }
 
-    fn render_viewer_toolbar(&mut self, ui: &mut Ui, video_player: &VideoPlayer) {
+    fn render_viewer_toolbar(&mut self, ui: &mut Ui, video_player: &mut VideoPlayer) {
         ui.horizontal(|ui| {
             // Кнопка Скрыть / Раскрыть Source
             if self.single_viewer_mode {
@@ -231,7 +231,7 @@ impl ViewerState {
                 self.show_transform_overlay = !self.show_transform_overlay;
             }
 
-            // 6. Статус аппаратного ускорения GPU (VA-API / CUDA)
+            // 6. Статус аппаратного ускорения GPU и индикатор Drop Frame (DaVinci Resolve)
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (badge_text, badge_color) = if video_player.gpu_accelerated {
                     (format!("⚡ GPU: {}", video_player.gpu_device_name), ResolveColors::ACCENT_ORANGE)
@@ -240,6 +240,48 @@ impl ViewerState {
                 };
                 ui.label(egui::RichText::new(badge_text).size(10.0).strong().color(badge_color))
                     .on_hover_text("Аппаратное ускорение видеодекодирования на GPU (VA-API / CUDA)");
+
+                ui.separator();
+
+                // Индикатор частоты кадров и Drop Frame в стиле DaVinci Resolve
+                let (fps_color, fps_val) = if video_player.is_playing_mode {
+                    if video_player.is_dropping_frames {
+                        (Color32::from_rgb(255, 69, 58), video_player.real_playback_fps) // Красный (Drop Frame)
+                    } else {
+                        (Color32::from_rgb(48, 209, 88), video_player.real_playback_fps) // Зеленый (Nominal Real-time)
+                    }
+                } else {
+                    (ResolveColors::TEXT_MUTED, video_player.fps as f32)
+                };
+
+                let drop_info = if video_player.is_playing_mode && video_player.dropped_frames_count > 0 {
+                    format!("● {:.1} fps (Drop: {})", fps_val, video_player.dropped_frames_count)
+                } else {
+                    format!("● {:.1} fps", fps_val)
+                };
+
+                ui.label(egui::RichText::new(drop_info).size(10.0).strong().color(fps_color))
+                    .on_hover_text("Реальный FPS предпросмотра и индикатор пропуска кадров (DaVinci Resolve Drop Frame Indicator)");
+
+                // Кнопка режима воспроизведения: Real-Time Drop Frame vs Show All Frames
+                let mode_text = if video_player.drop_frames_enabled {
+                    "⏱ Real-Time (Drop)"
+                } else {
+                    "🐢 All Frames (Slow-Mo)"
+                };
+                let mode_btn = egui::Button::new(
+                    egui::RichText::new(mode_text)
+                        .size(10.0)
+                        .color(if video_player.drop_frames_enabled { Color32::WHITE } else { ResolveColors::ACCENT_ORANGE }),
+                )
+                .fill(if video_player.drop_frames_enabled { ResolveColors::BG_HEADER } else { ResolveColors::BG_MAIN });
+
+                if ui.add(mode_btn)
+                    .on_hover_text("Переключение режима: Real-Time Sync (пропуск кадров для сохранения 1.0x скорости звука, как в DaVinci) или Show All Frames (slow-mo)")
+                    .clicked()
+                {
+                    video_player.drop_frames_enabled = !video_player.drop_frames_enabled;
+                }
             });
         });
     }
