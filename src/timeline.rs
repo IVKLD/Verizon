@@ -68,6 +68,7 @@ pub struct DraggedMedia {
     pub is_audio: bool,
     pub has_video: bool,
     pub has_audio: bool,
+    pub audio_tracks_count: usize,
     pub duration_frames: i64,
     pub source_fps: f64,
     pub link_group: Option<u64>,
@@ -166,6 +167,20 @@ impl TimelineState {
             moving_clip: None,
             pending_imports: Vec::new(),
             history: Vec::new(),
+        }
+    }
+
+    /// Динамически гарантировать существование аудиодорожек на таймлайне (A1, A2, A3...)
+    pub fn ensure_audio_track(&mut self, track_index: usize) {
+        while self.tracks.len() <= track_index {
+            let next_audio_num = self.tracks.iter().filter(|t| !t.is_video).count() + 1;
+            self.tracks.push(Track {
+                name: format!("A{}", next_audio_num),
+                is_video: false,
+                is_muted: false,
+                is_locked: false,
+                is_solo: false,
+            });
         }
     }
 

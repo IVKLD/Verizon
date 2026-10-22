@@ -339,7 +339,8 @@ impl TimelineView {
                             timeline.fps = media.source_fps.round().clamp(1.0, 240.0) as u32;
                         }
 
-                        let link_id = if media.has_video && media.has_audio {
+                        let num_audio = media.audio_tracks_count.max(if media.has_audio { 1 } else { 0 });
+                        let link_id = if media.has_video && num_audio > 0 {
                             let id = timeline.next_link_id;
                             timeline.next_link_id += 1;
                             Some(id)
@@ -347,8 +348,8 @@ impl TimelineView {
                             media.link_group
                         };
 
-                        if media.has_video && media.has_audio {
-                            // Создаем связанную пару: Видео на выбранной видеодорожке + Аудио на дорожке A1
+                        if media.has_video && num_audio > 0 {
+                            // Создаем связанную группу: Видео на выбранной видеодорожке + Все дорожки аудио на A1, A2...
                             let video_track = if target_track_idx < 2 { target_track_idx } else { 1 };
                             let v_clip = Clip {
                                 id: timeline.next_clip_id,
@@ -376,30 +377,41 @@ impl TimelineView {
                             timeline.selected_clip_id = Some(v_clip.id);
                             timeline.clips.push(v_clip);
 
-                            let a_clip = Clip {
-                                id: timeline.next_clip_id,
-                                name: media.name.clone(),
-                                track_index: 2, // A1
-                                start_frame: drop_frame,
-                                duration_frames: media.duration_frames,
-                                is_audio: true,
-                                color: ResolveColors::AUDIO_CLIP,
-                                source_path: media.path.clone(),
-                                source_in_frame: 0,
-                                source_in_secs: 0.0,
-                                source_fps: media.source_fps,
-                                link_group: link_id,
-                                zoom_x: 1.0,
-                                zoom_y: 1.0,
-                                position_x: 0.0,
-                                position_y: 0.0,
-                                rotation: 0.0,
-                                opacity: 100.0,
-                                volume_db: 0.0,
-                                pan: 0.0,
-                            };
-                            timeline.next_clip_id += 1;
-                            timeline.clips.push(a_clip);
+                            for a_idx in 0..num_audio {
+                                let track_idx = 2 + a_idx;
+                                timeline.ensure_audio_track(track_idx);
+
+                                let track_name = if num_audio > 1 {
+                                    format!("{} [A{}]", media.name, a_idx + 1)
+                                } else {
+                                    media.name.clone()
+                                };
+
+                                let a_clip = Clip {
+                                    id: timeline.next_clip_id,
+                                    name: track_name,
+                                    track_index: track_idx,
+                                    start_frame: drop_frame,
+                                    duration_frames: media.duration_frames,
+                                    is_audio: true,
+                                    color: ResolveColors::AUDIO_CLIP,
+                                    source_path: media.path.clone(),
+                                    source_in_frame: 0,
+                                    source_in_secs: 0.0,
+                                    source_fps: media.source_fps,
+                                    link_group: link_id,
+                                    zoom_x: 1.0,
+                                    zoom_y: 1.0,
+                                    position_x: 0.0,
+                                    position_y: 0.0,
+                                    rotation: 0.0,
+                                    opacity: 100.0,
+                                    volume_db: 0.0,
+                                    pan: 0.0,
+                                };
+                                timeline.next_clip_id += 1;
+                                timeline.clips.push(a_clip);
+                            }
                         } else {
                             let new_clip = Clip {
                                 id: timeline.next_clip_id,

@@ -81,7 +81,15 @@ impl WaveformManager {
 
         let in_rate = decoder.rate();
         let in_format = decoder.format();
-        let in_channel_layout = decoder.channel_layout();
+        let in_channel_layout = if decoder.channel_layout().is_empty() {
+            if decoder.channels() == 1 {
+                ffmpeg_next::channel_layout::ChannelLayout::MONO
+            } else {
+                ffmpeg_next::channel_layout::ChannelLayout::STEREO
+            }
+        } else {
+            decoder.channel_layout()
+        };
 
         // 8000 Гц моно — молниеносная скорость конвертации и идеальная точность для отображения волноформы
         let out_rate = 8000;
@@ -111,6 +119,9 @@ impl WaveformManager {
             if stream.index() == stream_idx {
                 if decoder.send_packet(&packet).is_ok() {
                     while decoder.receive_frame(&mut decoded_frame).is_ok() {
+                        if decoded_frame.channel_layout().is_empty() {
+                            decoded_frame.set_channel_layout(in_channel_layout);
+                        }
                         if resampler.run(&decoded_frame, &mut resampled_frame).is_ok() {
                             let samples_count = resampled_frame.samples();
                             let data: &[f32] = unsafe {

@@ -16,6 +16,9 @@ use app::NleApp;
 use eframe::egui;
 
 fn main() -> Result<(), eframe::Error> {
+    // Глобальная инициализация кодеков и контейнеров FFmpeg
+    let _ = ffmpeg_next::init();
+
     // Инициализация многопоточного рантайма Tokio для высокопроизводительных фоновых задач
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

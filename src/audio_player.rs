@@ -152,7 +152,15 @@ impl AudioPlayer {
 
         let in_rate = audio_decoder.rate();
         let in_format = audio_decoder.format();
-        let in_channel_layout = audio_decoder.channel_layout();
+        let in_channel_layout = if audio_decoder.channel_layout().is_empty() {
+            if audio_decoder.channels() == 1 {
+                ffmpeg_next::channel_layout::ChannelLayout::MONO
+            } else {
+                ffmpeg_next::channel_layout::ChannelLayout::STEREO
+            }
+        } else {
+            audio_decoder.channel_layout()
+        };
 
         let out_rate = 48000;
         let out_channel_layout = ffmpeg_next::channel_layout::ChannelLayout::STEREO;
@@ -176,6 +184,9 @@ impl AudioPlayer {
             if stream.index() == stream_idx {
                 if audio_decoder.send_packet(&packet).is_ok() {
                     while audio_decoder.receive_frame(&mut decoded_frame).is_ok() {
+                        if decoded_frame.channel_layout().is_empty() {
+                            decoded_frame.set_channel_layout(in_channel_layout);
+                        }
                         if resampler.run(&decoded_frame, &mut resampled_frame).is_ok() {
                             let samples_count = resampled_frame.samples() * 2; // Stereo
                             let data: &[f32] = unsafe {
@@ -193,6 +204,9 @@ impl AudioPlayer {
 
         if audio_decoder.send_eof().is_ok() {
             while audio_decoder.receive_frame(&mut decoded_frame).is_ok() {
+                if decoded_frame.channel_layout().is_empty() {
+                    decoded_frame.set_channel_layout(in_channel_layout);
+                }
                 if resampler.run(&decoded_frame, &mut resampled_frame).is_ok() {
                     let samples_count = resampled_frame.samples() * 2;
                     let data: &[f32] = unsafe {
@@ -297,5 +311,23 @@ impl AudioPlayer {
         } else {
             (0.0, 0.0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_audio_decode_worker_replay_mkv() {
+        let path = Path::new("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
+        if !path.exists() {
+            return;
+        }
+        let res = AudioPlayer::decode_audio_worker(path);
+        assert!(res.is_ok());
+        let (samples, rate) = res.unwrap();
+        assert_eq!(rate, 48000);
+        assert!(!samples.is_empty(), "Samples should not be empty for MKV with PCM audio");
     }
 }
