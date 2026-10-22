@@ -258,7 +258,7 @@ impl VideoPlayer {
         }
         self.dropped_frames_count += dropped;
 
-        while self.frame_queue.len() > 30 {
+        while self.frame_queue.len() > 50 {
             self.frame_queue.pop_front();
             self.dropped_frames_count += 1;
         }
@@ -724,7 +724,7 @@ impl VideoPlayer {
                     };
 
                     let can_continue_forward = current_pts >= 0
-                        && target_pts >= current_pts
+                        && target_pts >= current_pts - tolerance
                         && (target_pts - current_pts) <= gop_max_pts
                         && !waiting_for_keyframe;
 
@@ -755,7 +755,7 @@ impl VideoPlayer {
                                     }
                                     DecoderCommand::Play { start_frame: new_sf } => {
                                         playhead_frame = new_sf;
-                                        if new_sf < current_decoded_frame.saturating_sub(5) || new_sf > current_decoded_frame + 60 {
+                                        if new_sf < current_decoded_frame.saturating_sub(15) || new_sf > current_decoded_frame + 120 {
                                             pending_cmd = Some(DecoderCommand::Play { start_frame: new_sf });
                                             break_stream = true;
                                             break;
@@ -830,7 +830,7 @@ impl VideoPlayer {
                                             }
                                             Ok(DecoderCommand::Play { start_frame: new_sf }) => {
                                                 playhead_frame = new_sf;
-                                                if new_sf < current_decoded_frame.saturating_sub(5) || new_sf > current_decoded_frame + 60 {
+                                                if new_sf < current_decoded_frame.saturating_sub(15) || new_sf > current_decoded_frame + 120 {
                                                     pending_cmd = Some(DecoderCommand::Play { start_frame: new_sf });
                                                     break_stream = true;
                                                     break;
