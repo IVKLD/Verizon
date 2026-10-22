@@ -28,7 +28,7 @@ pub struct VideoPlayer {
     // Неблокирующие каналы общения с фоновым потоком декодера
     command_tx: Option<std::sync::mpsc::Sender<DecoderCommand>>,
     frame_rx: Option<std::sync::mpsc::Receiver<(i64, ColorImage)>>,
-    frame_queue: VecDeque<(i64, ColorImage)>,
+    pub frame_queue: VecDeque<(i64, ColorImage)>,
     pub is_playing_mode: bool,
 
     // Время последнего отправленного запроса (для троттлинга скраббинга)

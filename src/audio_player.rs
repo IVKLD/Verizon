@@ -1,7 +1,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use crate::timeline::TimelineState;
 
@@ -19,6 +19,8 @@ pub struct AudioSharedState {
 pub struct AudioPlayer {
     pub current_path: Option<PathBuf>,
     pub shared_state: Arc<Mutex<AudioSharedState>>,
+    pub vu_l_bits: Arc<AtomicU32>,
+    pub vu_r_bits: Arc<AtomicU32>,
     pub is_loading: Arc<AtomicBool>,
     load_counter: Arc<AtomicU64>,
     _stream: Option<cpal::Stream>,
@@ -41,11 +43,16 @@ impl AudioPlayer {
             current_vu_r: 0.0,
         }));
 
-        let stream = Self::init_cpal_stream(shared_state.clone());
+        let vu_l_bits = Arc::new(AtomicU32::new(0));
+        let vu_r_bits = Arc::new(AtomicU32::new(0));
+
+        let stream = Self::init_cpal_stream(shared_state.clone(), vu_l_bits.clone(), vu_r_bits.clone());
 
         Self {
             current_path: None,
             shared_state,
+            vu_l_bits,
+            vu_r_bits,
             is_loading: Arc::new(AtomicBool::new(false)),
             load_counter: Arc::new(AtomicU64::new(0)),
             _stream: stream,
@@ -55,21 +62,33 @@ impl AudioPlayer {
         }
     }
 
-    fn init_cpal_stream(shared: Arc<Mutex<AudioSharedState>>) -> Option<cpal::Stream> {
+    fn init_cpal_stream(
+        shared: Arc<Mutex<AudioSharedState>>,
+        vu_l: Arc<AtomicU32>,
+        vu_r: Arc<AtomicU32>,
+    ) -> Option<cpal::Stream> {
         let host = cpal::default_host();
         let device = host.default_output_device()?;
         let config = device.default_output_config().ok()?;
 
         let sample_format = config.sample_format();
-        let err_fn = |err| eprintln!("Audio stream error: {}", err);
+        let err_fn = |err: cpal::Error| {
+            let msg = err.to_string();
+            // Underrun/overrun в ALSA/PipeWire являются нефатальными предупреждениями тайминга буфера
+            if !msg.to_lowercase().contains("underrun") && !msg.to_lowercase().contains("overrun") {
+                eprintln!("Audio stream error: {}", msg);
+            }
+        };
 
         let stream = match sample_format {
             cpal::SampleFormat::F32 => {
                 let shared_clone = shared.clone();
+                let vu_l_clone = vu_l.clone();
+                let vu_r_clone = vu_r.clone();
                 device.build_output_stream(
                     config.into(),
                     move |data: &mut [f32], _| {
-                        Self::write_audio_data(data, &shared_clone);
+                        Self::write_audio_data(data, &shared_clone, &vu_l_clone, &vu_r_clone);
                     },
                     err_fn,
                     None,
@@ -77,11 +96,13 @@ impl AudioPlayer {
             }
             cpal::SampleFormat::I16 => {
                 let shared_clone = shared.clone();
+                let vu_l_clone = vu_l.clone();
+                let vu_r_clone = vu_r.clone();
                 device.build_output_stream(
                     config.into(),
                     move |data: &mut [i16], _| {
                         let mut temp = vec![0.0f32; data.len()];
-                        Self::write_audio_data(&mut temp, &shared_clone);
+                        Self::write_audio_data(&mut temp, &shared_clone, &vu_l_clone, &vu_r_clone);
                         for (dst, src) in data.iter_mut().zip(temp) {
                             *dst = (src * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                         }
@@ -98,12 +119,18 @@ impl AudioPlayer {
         Some(stream)
     }
 
-    fn write_audio_data(output: &mut [f32], shared: &Arc<Mutex<AudioSharedState>>) {
-        if let Ok(mut state) = shared.lock() {
+    fn write_audio_data(
+        output: &mut [f32],
+        shared: &Arc<Mutex<AudioSharedState>>,
+        vu_l: &Arc<AtomicU32>,
+        vu_r: &Arc<AtomicU32>,
+    ) {
+        // try_lock устраняет priority inversion и задержки в реальном времени аудиопотока
+        if let Ok(mut state) = shared.try_lock() {
             if !state.is_playing || state.samples.is_empty() {
                 output.fill(0.0);
-                state.current_vu_l = 0.0;
-                state.current_vu_r = 0.0;
+                vu_l.store(0, Ordering::Relaxed);
+                vu_r.store(0, Ordering::Relaxed);
                 return;
             }
 
@@ -138,6 +165,8 @@ impl AudioPlayer {
                 }
             }
 
+            vu_l.store(peak_l.to_bits(), Ordering::Relaxed);
+            vu_r.store(peak_r.to_bits(), Ordering::Relaxed);
             state.current_vu_l = peak_l;
             state.current_vu_r = peak_r;
         } else {
@@ -470,13 +499,11 @@ impl AudioPlayer {
         self.sync_playhead(Some(time_sec), is_playing);
     }
 
-    /// Получить текущие уровни VU-метра для анимации
+    /// Получить текущие уровни VU-метра для анимации (lock-free)
     pub fn get_vu_levels(&self) -> (f32, f32) {
-        if let Ok(state) = self.shared_state.lock() {
-            (state.current_vu_l, state.current_vu_r)
-        } else {
-            (0.0, 0.0)
-        }
+        let l = f32::from_bits(self.vu_l_bits.load(Ordering::Relaxed));
+        let r = f32::from_bits(self.vu_r_bits.load(Ordering::Relaxed));
+        (l, r)
     }
 }
 

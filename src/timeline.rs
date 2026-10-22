@@ -424,6 +424,7 @@ impl TimelineState {
     }
 
     /// Перемещение клипа с учетом магнитного прилипания и связности клипов (Linked Clips)
+    #[allow(dead_code)]
     pub fn move_clip(&mut self, clip_id: u64, raw_start: i64) {
         self.move_clip_to_track(clip_id, raw_start, None);
     }
