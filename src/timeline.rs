@@ -392,6 +392,62 @@ impl TimelineState {
             }
         }
     }
+
+    /// Перейти к предыдущему стыку/резу клипов (Клавиша Up в Resolve)
+    pub fn jump_to_prev_edit_point(&mut self) {
+        let current = self.playhead_frame;
+        let mut candidates = vec![0];
+        for clip in &self.clips {
+            if clip.start_frame < current {
+                candidates.push(clip.start_frame);
+            }
+            if clip.end_frame() < current {
+                candidates.push(clip.end_frame());
+            }
+        }
+        if let Some(in_pt) = self.in_point {
+            if in_pt < current {
+                candidates.push(in_pt);
+            }
+        }
+        if let Some(&prev) = candidates.iter().max() {
+            self.playhead_frame = prev;
+        }
+    }
+
+    /// Перейти к следующему стыку/резу клипов (Клавиша Down в Resolve)
+    pub fn jump_to_next_edit_point(&mut self) {
+        let current = self.playhead_frame;
+        let end = self.timeline_end_frame();
+        let mut candidates = Vec::new();
+        for clip in &self.clips {
+            if clip.start_frame > current {
+                candidates.push(clip.start_frame);
+            }
+            if clip.end_frame() > current {
+                candidates.push(clip.end_frame());
+            }
+        }
+        if let Some(out_pt) = self.out_point {
+            if out_pt > current {
+                candidates.push(out_pt);
+            }
+        }
+        if end > current {
+            candidates.push(end);
+        }
+        if let Some(&next) = candidates.iter().min() {
+            self.playhead_frame = next;
+        }
+    }
+
+    /// Показать весь таймлайн целиком (Shift + Z в Resolve)
+    pub fn zoom_to_fit(&mut self, available_width: f32) {
+        let total_frames = self.timeline_end_frame().max(self.fps as i64 * 10);
+        let optimal_zoom = (available_width / total_frames as f32).clamp(0.05, 50.0);
+        self.zoom_factor = optimal_zoom;
+        self.scroll_x = 0.0;
+    }
 }
 
 #[cfg(test)]

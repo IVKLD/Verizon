@@ -103,7 +103,7 @@ impl ViewerState {
         }
 
         // ВЕРХНИЙ ТУЛБАР МОНИТОРА RESOLVE (Display Modes)
-        self.render_viewer_toolbar(ui);
+        self.render_viewer_toolbar(ui, video_player);
         ui.separator();
 
         // ОБЛАСТЬ МОНИТОРОВ: Одиночный или Двойной режим
@@ -123,7 +123,7 @@ impl ViewerState {
         }
     }
 
-    fn render_viewer_toolbar(&mut self, ui: &mut Ui) {
+    fn render_viewer_toolbar(&mut self, ui: &mut Ui, video_player: &VideoPlayer) {
         ui.horizontal(|ui| {
             // Кнопка Скрыть / Раскрыть Source
             if self.single_viewer_mode {
@@ -218,6 +218,17 @@ impl ViewerState {
             if ui.add(tf_btn).on_hover_text("Интерактивная рамка трансформации клипа на мониторе").clicked() {
                 self.show_transform_overlay = !self.show_transform_overlay;
             }
+
+            // 6. Статус аппаратного ускорения GPU (VA-API / CUDA)
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (badge_text, badge_color) = if video_player.gpu_accelerated {
+                    (format!("⚡ GPU: {}", video_player.gpu_device_name), ResolveColors::ACCENT_ORANGE)
+                } else {
+                    ("⚡ GPU: Idle / CPU".to_string(), ResolveColors::TEXT_MUTED)
+                };
+                ui.label(egui::RichText::new(badge_text).size(10.0).strong().color(badge_color))
+                    .on_hover_text("Аппаратное ускорение видеодекодирования на GPU (VA-API / CUDA)");
+            });
         });
     }
 

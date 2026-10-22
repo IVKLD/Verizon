@@ -297,8 +297,8 @@ impl NleApp {
                 toggle_prefs = true;
             }
 
-            // Масштабирование интерфейса для 4K: Ctrl + / Ctrl - / Ctrl 0
-            if i.modifiers.ctrl || i.modifiers.command {
+            // Масштабирование интерфейса для 4K: Ctrl + Alt + / Ctrl + Alt -
+            if (i.modifiers.ctrl || i.modifiers.command) && i.modifiers.alt {
                 if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
                     scale_change = Some(self.preferences.ui_scale + 0.1);
                 } else if i.key_pressed(egui::Key::Minus) {
@@ -306,6 +306,47 @@ impl NleApp {
                 } else if i.key_pressed(egui::Key::Num0) {
                     scale_change = Some(1.0);
                 }
+            } else if (i.modifiers.ctrl || i.modifiers.command) && !i.modifiers.shift {
+                // Ctrl + / Ctrl - в DaVinci Resolve: Зум таймлайна по плейхеду
+                if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
+                    self.timeline.zoom_factor = (self.timeline.zoom_factor * 1.25).clamp(0.05, 50.0);
+                } else if i.key_pressed(egui::Key::Minus) {
+                    self.timeline.zoom_factor = (self.timeline.zoom_factor * 0.80).clamp(0.05, 50.0);
+                }
+            }
+
+            // Shift + Z: Zoom to Fit (Показать весь проект целиком во всю ширину окна, как в DaVinci Resolve)
+            if i.modifiers.shift && !i.modifiers.ctrl && i.key_pressed(egui::Key::Z) {
+                let w = i.raw.screen_rect.map(|r| r.width()).unwrap_or(1280.0) * 0.70;
+                self.timeline.zoom_to_fit(w);
+            }
+
+            // Навигация по таймлайну (Edit Points и Покадровый переход)
+            if i.key_pressed(egui::Key::ArrowUp) {
+                self.timeline.jump_to_prev_edit_point();
+            }
+            if i.key_pressed(egui::Key::ArrowDown) {
+                self.timeline.jump_to_next_edit_point();
+            }
+            if i.key_pressed(egui::Key::ArrowLeft) {
+                let step = if i.modifiers.shift { self.timeline.fps as i64 } else { 1 };
+                self.timeline.playhead_frame = (self.timeline.playhead_frame - step).max(0);
+            }
+            if i.key_pressed(egui::Key::ArrowRight) {
+                let step = if i.modifiers.shift { self.timeline.fps as i64 } else { 1 };
+                self.timeline.playhead_frame = self.timeline.playhead_frame + step;
+            }
+            if i.key_pressed(egui::Key::Home) {
+                self.timeline.playhead_frame = 0;
+            }
+            if i.key_pressed(egui::Key::End) {
+                self.timeline.playhead_frame = self.timeline.timeline_end_frame();
+            }
+
+            // Alt + X: Сброс In / Out точек
+            if i.modifiers.alt && i.key_pressed(egui::Key::X) {
+                self.timeline.in_point = None;
+                self.timeline.out_point = None;
             }
 
             // J / K / L Shuttle

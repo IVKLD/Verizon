@@ -67,15 +67,41 @@ impl TimelineView {
             }
         }
 
-        // Зум таймлайна колесиком мыши с Ctrl
-        if canvas_rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default())) {
-            let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll_delta != 0.0 {
-                if ui.input(|i| i.modifiers.ctrl) {
-                    let zoom_delta = if scroll_delta > 0.0 { 1.2 } else { 0.8 };
-                    timeline.zoom_factor = (timeline.zoom_factor * zoom_delta).clamp(0.2, 20.0);
-                } else {
-                    timeline.scroll_x = (timeline.scroll_x - scroll_delta * 2.0).max(0.0);
+        // 2. Навигация по таймлайну мышью и хоткеями как в DaVinci Resolve 21:
+        // Alt + Колесико (или Ctrl + Колесико) — плавный зум с центрированием на курсоре мыши
+        // Зажатие колесика мыши (Middle Mouse Button / Hand tool) — панорамирование таймлайна
+        // Обычное колесико — горизонтальный скролл таймлайна
+        if let Some(m_pos) = mouse_pos {
+            if full_rect.contains(m_pos) {
+                // Панорамирование зажатием колесика мыши (MMB Drag)
+                let mmb_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
+                if mmb_down {
+                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::AllScroll);
+                    let delta = ui.input(|i| i.pointer.delta());
+                    if delta.x != 0.0 {
+                        timeline.scroll_x = (timeline.scroll_x - delta.x).max(0.0);
+                    }
+                }
+
+                // Скролл и Зум колесиком мыши
+                let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+
+                if scroll_y != 0.0 {
+                    let is_zoom = ui.input(|i| i.modifiers.alt || i.modifiers.ctrl || i.modifiers.command);
+                    if is_zoom {
+                        // Зум центрированный строго под курсором мыши (как в Resolve 21)
+                        let old_zoom = timeline.zoom_factor;
+                        let zoom_mult = if scroll_y > 0.0 { 1.15 } else { 0.87 };
+                        let new_zoom = (old_zoom * zoom_mult).clamp(0.05, 50.0);
+
+                        let mouse_rel_x = m_pos.x - canvas_rect.min.x;
+                        let target_frame = (mouse_rel_x + timeline.scroll_x) / old_zoom;
+                        timeline.zoom_factor = new_zoom;
+                        timeline.scroll_x = (target_frame * new_zoom - mouse_rel_x).max(0.0);
+                    } else {
+                        // Обычное колесико мыши: горизонтальный скролл таймлайна
+                        timeline.scroll_x = (timeline.scroll_x - scroll_y * 2.0).max(0.0);
+                    }
                 }
             }
         }

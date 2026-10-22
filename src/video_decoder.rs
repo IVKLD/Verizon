@@ -11,6 +11,11 @@ pub struct VideoPlayer {
     pub is_real_video: bool,
     pub last_decoded_frame: i64,
 
+    // Аппаратное ускорение на GPU (VAAPI для AMD/Intel, CUDA для NVIDIA)
+    pub gpu_accelerated: bool,
+    pub gpu_device_name: String,
+    hw_device_ctx: *mut ffmpeg_next::ffi::AVBufferRef,
+
     // FFmpeg структуры
     ictx: Option<ffmpeg_next::format::context::Input>,
     decoder: Option<ffmpeg_next::codec::decoder::Video>,
@@ -21,6 +26,16 @@ pub struct VideoPlayer {
 
     // Преаллоцированный RGBA буфер
     rgba_buffer: Vec<u8>,
+}
+
+impl Drop for VideoPlayer {
+    fn drop(&mut self) {
+        if !self.hw_device_ctx.is_null() {
+            unsafe {
+                ffmpeg_next::ffi::av_buffer_unref(&mut self.hw_device_ctx);
+            }
+        }
+    }
 }
 
 impl VideoPlayer {
@@ -35,6 +50,9 @@ impl VideoPlayer {
             texture: None,
             is_real_video: false,
             last_decoded_frame: -1,
+            gpu_accelerated: false,
+            gpu_device_name: "CPU".to_string(),
+            hw_device_ctx: std::ptr::null_mut(),
             ictx: None,
             decoder: None,
             scaler: None,
@@ -59,7 +77,49 @@ impl VideoPlayer {
         let mut context_decoder = ffmpeg_next::codec::context::Context::from_parameters(input_stream.parameters())
             .map_err(|e| e.to_string())?;
 
-        // Включение многопоточного декодирования (Multi-threaded 4K Decoding) на всех ядрах CPU
+        // 1. Аппаратное декодирование на GPU (VAAPI для AMD Radeon RX 9070 XT / Intel, CUDA для NVIDIA)
+        if !self.hw_device_ctx.is_null() {
+            unsafe {
+                ffmpeg_next::ffi::av_buffer_unref(&mut self.hw_device_ctx);
+            }
+        }
+
+        let mut hw_device_ctx: *mut ffmpeg_next::ffi::AVBufferRef = std::ptr::null_mut();
+        let mut is_gpu = false;
+        let mut gpu_name = "CPU Multi-threaded".to_string();
+
+        unsafe {
+            let vaapi_path = std::ffi::CString::new("/dev/dri/renderD128").unwrap();
+            let ret = ffmpeg_next::ffi::av_hwdevice_ctx_create(
+                &mut hw_device_ctx,
+                ffmpeg_next::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                vaapi_path.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+            );
+            if ret == 0 && !hw_device_ctx.is_null() {
+                let codec_ctx_ptr = context_decoder.as_mut_ptr();
+                (*codec_ctx_ptr).hw_device_ctx = ffmpeg_next::ffi::av_buffer_ref(hw_device_ctx);
+                is_gpu = true;
+                gpu_name = "AMD Radeon VAAPI".to_string();
+            } else {
+                let ret_cuda = ffmpeg_next::ffi::av_hwdevice_ctx_create(
+                    &mut hw_device_ctx,
+                    ffmpeg_next::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    0,
+                );
+                if ret_cuda == 0 && !hw_device_ctx.is_null() {
+                    let codec_ctx_ptr = context_decoder.as_mut_ptr();
+                    (*codec_ctx_ptr).hw_device_ctx = ffmpeg_next::ffi::av_buffer_ref(hw_device_ctx);
+                    is_gpu = true;
+                    gpu_name = "NVIDIA NVDEC".to_string();
+                }
+            }
+        }
+
+        // 2. Включение многопоточного декодирования (Multi-threaded Decoding) на всех ядрах CPU как fallback
         let num_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(8)
@@ -108,6 +168,9 @@ impl VideoPlayer {
         self.height = scaled_h;
         self.fps = fps;
         self.total_frames = total_frames;
+        self.gpu_accelerated = is_gpu;
+        self.gpu_device_name = gpu_name;
+        self.hw_device_ctx = hw_device_ctx;
         self.ictx = Some(ictx);
         self.decoder = Some(video_decoder);
         self.scaler = Some(scaler);
@@ -207,6 +270,7 @@ impl VideoPlayer {
         }
 
         let mut decoded_frame = ffmpeg_next::util::frame::Video::empty();
+        let mut sw_frame = ffmpeg_next::util::frame::Video::empty();
         let mut rgba_frame = ffmpeg_next::util::frame::Video::empty();
         let w = self.width as usize;
         let h = self.height as usize;
@@ -216,8 +280,16 @@ impl VideoPlayer {
             if let Some(pts) = decoded_frame.pts() {
                 self.current_pts = pts;
                 if pts >= target_pts - tolerance {
-                    if scaler.run(&decoded_frame, &mut rgba_frame).is_ok() {
-                        return self.copy_frame_to_image(&rgba_frame, w, h);
+                    if let Some(img) = Self::scale_and_copy_frame(
+                        scaler,
+                        &decoded_frame,
+                        &mut sw_frame,
+                        &mut rgba_frame,
+                        w,
+                        h,
+                        &mut self.rgba_buffer,
+                    ) {
+                        return Some(img);
                     }
                 }
             }
@@ -231,8 +303,16 @@ impl VideoPlayer {
                         if let Some(pts) = decoded_frame.pts() {
                             self.current_pts = pts;
                             if pts >= target_pts - tolerance {
-                                if scaler.run(&decoded_frame, &mut rgba_frame).is_ok() {
-                                    return self.copy_frame_to_image(&rgba_frame, w, h);
+                                if let Some(img) = Self::scale_and_copy_frame(
+                                    scaler,
+                                    &decoded_frame,
+                                    &mut sw_frame,
+                                    &mut rgba_frame,
+                                    w,
+                                    h,
+                                    &mut self.rgba_buffer,
+                                ) {
+                                    return Some(img);
                                 }
                             }
                         }
@@ -244,24 +324,69 @@ impl VideoPlayer {
         None
     }
 
-    fn copy_frame_to_image(&mut self, rgba_frame: &ffmpeg_next::util::frame::Video, w: usize, h: usize) -> Option<ColorImage> {
-        let data = rgba_frame.data(0);
-        let stride = rgba_frame.stride(0);
+    fn scale_and_copy_frame(
+        scaler: &mut ffmpeg_next::software::scaling::Context,
+        decoded_frame: &ffmpeg_next::util::frame::Video,
+        sw_frame: &mut ffmpeg_next::util::frame::Video,
+        rgba_frame: &mut ffmpeg_next::util::frame::Video,
+        w: usize,
+        h: usize,
+        rgba_buffer: &mut Vec<u8>,
+    ) -> Option<ColorImage> {
+        let frame_to_scale = unsafe {
+            let fmt = (*decoded_frame.as_ptr()).format;
+            if fmt == ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32
+                || fmt == ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_CUDA as i32
+            {
+                if ffmpeg_next::ffi::av_hwframe_transfer_data(sw_frame.as_mut_ptr(), decoded_frame.as_ptr(), 0) == 0 {
+                    &*sw_frame
+                } else {
+                    decoded_frame
+                }
+            } else {
+                decoded_frame
+            }
+        };
 
-        if self.rgba_buffer.len() != w * h * 4 {
-            self.rgba_buffer.resize(w * h * 4, 0);
-        }
-
-        for y in 0..h {
-            let src_start = y * stride;
-            let dst_start = y * w * 4;
-            if src_start + w * 4 <= data.len() {
-                self.rgba_buffer[dst_start..dst_start + w * 4]
-                    .copy_from_slice(&data[src_start..src_start + w * 4]);
+        // Адаптация формата конвертера при аппаратном декодировании (NV12 -> RGBA)
+        if scaler.input().format != frame_to_scale.format()
+            || scaler.input().width != frame_to_scale.width()
+            || scaler.input().height != frame_to_scale.height()
+        {
+            if let Ok(new_scaler) = ffmpeg_next::software::scaling::Context::get(
+                frame_to_scale.format(),
+                frame_to_scale.width(),
+                frame_to_scale.height(),
+                ffmpeg_next::format::Pixel::RGBA,
+                w as u32,
+                h as u32,
+                ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
+            ) {
+                *scaler = new_scaler;
             }
         }
 
-        Some(ColorImage::from_rgba_unmultiplied([w, h], &self.rgba_buffer))
+        if scaler.run(frame_to_scale, rgba_frame).is_ok() {
+            let data = rgba_frame.data(0);
+            let stride = rgba_frame.stride(0);
+
+            if rgba_buffer.len() != w * h * 4 {
+                rgba_buffer.resize(w * h * 4, 0);
+            }
+
+            for y in 0..h {
+                let src_start = y * stride;
+                let dst_start = y * w * 4;
+                if src_start + w * 4 <= data.len() {
+                    rgba_buffer[dst_start..dst_start + w * 4]
+                        .copy_from_slice(&data[src_start..src_start + w * 4]);
+                }
+            }
+
+            Some(ColorImage::from_rgba_unmultiplied([w, h], rgba_buffer))
+        } else {
+            None
+        }
     }
 
     /// Чистый экран ожидания медиа
