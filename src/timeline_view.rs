@@ -16,7 +16,7 @@ impl TimelineView {
         ui.separator();
 
         // 2. Основная область: Заголовки треков слева + Сетка таймлайна справа
-        let header_width = 110.0;
+        let header_width = 140.0;
         let ruler_height = 24.0;
         let track_height = 44.0;
         let total_tracks = timeline.tracks.len();
@@ -35,10 +35,6 @@ impl TimelineView {
         // Область заголовков треков
         let headers_rect = Rect::from_min_size(full_rect.min, vec2(header_width, full_rect.height()));
         painter.rect_filled(headers_rect, CornerRadius::ZERO, ResolveColors::BG_PANEL);
-        painter.line_segment(
-            [pos2(headers_rect.max.x, full_rect.min.y), pos2(headers_rect.max.x, full_rect.max.y)],
-            Stroke::new(1.0, ResolveColors::BORDER),
-        );
 
         // Область холста таймлайна (справа от заголовков)
         let canvas_rect = Rect::from_min_size(
@@ -51,6 +47,13 @@ impl TimelineView {
             pos2(canvas_rect.min.x, ruler_rect.max.y),
             canvas_rect.max,
         );
+
+        // Создаем изолированные области рисования (Clipping Painters), чтобы ни один элемент
+        // с таймлайна (клипы, звуковая волна, сетка, плейхед) физически не мог наложиться на панель треков слева
+        let ruler_painter = painter.with_clip_rect(ruler_rect);
+        let tracks_painter = painter.with_clip_rect(tracks_canvas_rect);
+        let canvas_painter = painter.with_clip_rect(canvas_rect);
+        let headers_painter = painter.with_clip_rect(headers_rect);
 
         let mouse_pos = ui.input(|i| i.pointer.hover_pos());
 
@@ -129,17 +132,13 @@ impl TimelineView {
             }
         }
 
-        // 3. Отрисовка Ruler (Линейки времени)
-        Self::draw_ruler(&painter, ruler_rect, timeline);
+        // 3. Отрисовка Ruler (Линейки времени) строго с изоляцией ruler_painter
+        Self::draw_ruler(&ruler_painter, ruler_rect, timeline);
 
-        // 4. Отрисовка дорожек (Tracks) и заголовков
-        for (i, track) in timeline.tracks.iter().enumerate() {
+        // 4. Отрисовка полос дорожек таймлайна (строго внутри tracks_canvas_rect)
+        for (i, _track) in timeline.tracks.iter().enumerate() {
             let y_top = ruler_rect.max.y + (i as f32 * track_height);
             let track_row_rect = Rect::from_min_size(pos2(canvas_rect.min.x, y_top), vec2(canvas_rect.width(), track_height));
-            let header_row_rect = Rect::from_min_size(pos2(full_rect.min.x, y_top), vec2(header_width, track_height));
-
-            // Заголовок дорожки
-            Self::draw_track_header(&painter, header_row_rect, track, i);
 
             // Фон полосы дорожки
             let bg_color = if i % 2 == 0 {
@@ -147,8 +146,8 @@ impl TimelineView {
             } else {
                 Color32::from_rgb(0x1c, 0x1d, 0x20)
             };
-            painter.rect_filled(track_row_rect, CornerRadius::ZERO, bg_color);
-            painter.line_segment(
+            tracks_painter.rect_filled(track_row_rect, CornerRadius::ZERO, bg_color);
+            tracks_painter.line_segment(
                 [pos2(track_row_rect.min.x, track_row_rect.max.y), pos2(track_row_rect.max.x, track_row_rect.max.y)],
                 Stroke::new(1.0, ResolveColors::BORDER),
             );
@@ -189,28 +188,32 @@ impl TimelineView {
                 false
             };
 
-            Self::draw_clip(&painter, clip_rect, clip, is_selected, timeline, waveform_mgr, ui.ctx());
+            // Отрисовка с tracks_painter (изоляция от левой панели треков)
+            Self::draw_clip(&tracks_painter, clip_rect, canvas_rect, clip, is_selected, timeline, waveform_mgr, ui.ctx());
 
-            // Интерактивность клипа зависит от активного инструмента
+            // Интерактивность клипа: строго ограничена видимой областью холста
             if timeline.active_tool == Tool::Selection {
-                let clip_resp = ui.interact(
-                    clip_rect,
-                    ui.id().with(format!("clip_{}", clip.id)),
-                    egui::Sense::click_and_drag(),
-                );
+                let interact_rect = clip_rect.intersect(tracks_canvas_rect);
+                if interact_rect.is_positive() {
+                    let clip_resp = ui.interact(
+                        interact_rect,
+                        ui.id().with(format!("clip_{}", clip.id)),
+                        egui::Sense::click_and_drag(),
+                    );
 
-                if clip_resp.hovered() {
-                    hovered_clip_id = Some(clip.id);
-                }
+                    if clip_resp.hovered() {
+                        hovered_clip_id = Some(clip.id);
+                    }
 
-                if clip_resp.clicked() {
-                    clicked_clip_id = Some(clip.id);
-                }
+                    if clip_resp.clicked() {
+                        clicked_clip_id = Some(clip.id);
+                    }
 
-                // Инициализация перетаскивания клипа при зажатии ЛКМ
-                if clip_resp.drag_started() || (clip_resp.dragged() && timeline.moving_clip.is_none()) {
-                    if let Some(m_pos) = mouse_pos {
-                        start_drag_request = Some((clip.id, m_pos.x, clip.start_frame));
+                    // Инициализация перетаскивания клипа при зажатии ЛКМ
+                    if clip_resp.drag_started() || (clip_resp.dragged() && timeline.moving_clip.is_none()) {
+                        if let Some(m_pos) = mouse_pos {
+                            start_drag_request = Some((clip.id, m_pos.x, clip.start_frame));
+                        }
                     }
                 }
             }
@@ -267,7 +270,7 @@ impl TimelineView {
                     }
 
                     // Красная вертикальная линия лезвия через всю высоту дорожек
-                    painter.line_segment(
+                    tracks_painter.line_segment(
                         [pos2(cut_x, tracks_canvas_rect.min.y), pos2(cut_x, tracks_canvas_rect.max.y)],
                         Stroke::new(2.0, Color32::from_rgb(0xff, 0x3b, 0x30)),
                     );
@@ -336,18 +339,18 @@ impl TimelineView {
                     let ghost_rect = Rect::from_min_size(pos2(ghost_x, ghost_y + 2.0), vec2(ghost_w, track_height - 4.0));
 
                     // Полупрозрачный оранжевый фантом на дорожке под курсором
-                    painter.rect_filled(
+                    tracks_painter.rect_filled(
                         ghost_rect,
                         CornerRadius::same(2),
                         Color32::from_rgba_unmultiplied(232, 124, 36, 120),
                     );
-                    painter.rect_stroke(
+                    tracks_painter.rect_stroke(
                         ghost_rect,
                         CornerRadius::same(2),
                         Stroke::new(2.0, ResolveColors::ACCENT_ORANGE),
                         StrokeKind::Inside,
                     );
-                    painter.text(
+                    tracks_painter.text(
                         pos2(ghost_rect.min.x + 6.0, ghost_rect.center().y),
                         egui::Align2::LEFT_CENTER,
                         format!("➕ Drop: {}", media.name),
@@ -482,8 +485,41 @@ impl TimelineView {
             timeline.dragged_media = None;
         }
 
-        // 7. Отрисовка фирменного оранжевого Playhead Resolve
-        Self::draw_playhead(&painter, canvas_rect, ruler_rect, timeline);
+        // 7. Отрисовка фирменного оранжевого Playhead Resolve (строго в пределах холста)
+        Self::draw_playhead(&canvas_painter, canvas_rect, ruler_rect, timeline);
+
+        // 8. Отрисовка интерактивных заголовков треков в фирменном стиле DaVinci Resolve 21
+        let corner_header_rect = Rect::from_min_size(full_rect.min, vec2(header_width, ruler_height));
+        headers_painter.rect_filled(corner_header_rect, CornerRadius::ZERO, Color32::from_rgb(0x19, 0x1b, 0x1e));
+        headers_painter.line_segment(
+            [pos2(corner_header_rect.min.x, corner_header_rect.max.y), pos2(corner_header_rect.max.x, corner_header_rect.max.y)],
+            Stroke::new(1.0, ResolveColors::BORDER),
+        );
+        headers_painter.text(
+            pos2(corner_header_rect.min.x + 10.0, corner_header_rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            "TRACKS",
+            egui::FontId::monospace(10.0),
+            ResolveColors::TEXT_MUTED,
+        );
+
+        let mut audio_dirty_requested = false;
+        for (i, track) in timeline.tracks.iter_mut().enumerate() {
+            let y_top = ruler_rect.max.y + (i as f32 * track_height);
+            let header_row_rect = Rect::from_min_size(pos2(full_rect.min.x, y_top), vec2(header_width, track_height));
+            if Self::render_interactive_track_header(ui, &headers_painter, header_row_rect, track, i) {
+                audio_dirty_requested = true;
+            }
+        }
+        if audio_dirty_requested {
+            timeline.audio_dirty = true;
+        }
+
+        // Вертикальная разделительная линия между панелью заголовков и холстом
+        painter.line_segment(
+            [pos2(headers_rect.max.x, full_rect.min.y), pos2(headers_rect.max.x, full_rect.max.y)],
+            Stroke::new(1.5, ResolveColors::BORDER_LIGHT),
+        );
     }
 
     fn render_toolbar(ui: &mut Ui, timeline: &mut TimelineState) {
@@ -634,37 +670,114 @@ impl TimelineView {
         }
     }
 
-    fn draw_track_header(painter: &egui::Painter, rect: Rect, track: &crate::timeline::Track, _index: usize) {
-        painter.rect_filled(rect, CornerRadius::ZERO, Color32::from_rgb(0x1e, 0x20, 0x24));
-        painter.line_segment([pos2(rect.min.x, rect.max.y), pos2(rect.max.x, rect.max.y)], Stroke::new(1.0, ResolveColors::BORDER));
+    fn render_interactive_track_header(
+        ui: &mut Ui,
+        painter: &egui::Painter,
+        rect: Rect,
+        track: &mut crate::timeline::Track,
+        index: usize,
+    ) -> bool {
+        let mut audio_changed = false;
 
-        // Цветовой индикатор трека слева
-        let badge_color = if track.is_video { ResolveColors::VIDEO_CLIP } else { ResolveColors::AUDIO_CLIP };
-        let badge_rect = Rect::from_min_size(rect.min, vec2(3.0, rect.height()));
-        painter.rect_filled(badge_rect, CornerRadius::ZERO, badge_color);
+        // Фон строки заголовка
+        let bg_color = Color32::from_rgb(0x1a, 0x1b, 0x1e);
+        painter.rect_filled(rect, CornerRadius::ZERO, bg_color);
+        painter.line_segment(
+            [pos2(rect.min.x, rect.max.y), pos2(rect.max.x, rect.max.y)],
+            Stroke::new(1.0, ResolveColors::BORDER),
+        );
 
-        // Название трека
+        // Индикатор типа дорожки (узкая полоска слева)
+        let indicator_color = if track.is_video { ResolveColors::VIDEO_CLIP } else { ResolveColors::AUDIO_CLIP };
+        painter.rect_filled(Rect::from_min_size(rect.min, vec2(3.0, rect.height())), CornerRadius::ZERO, indicator_color);
+
+        // Кнопка назначения дорожки DaVinci Destination Patching: [V1], [A1]
+        let dest_rect = Rect::from_min_size(pos2(rect.min.x + 8.0, rect.center().y - 10.0), vec2(28.0, 20.0));
+        let dest_stroke = if !track.is_muted {
+            Stroke::new(1.0, ResolveColors::ACCENT_ORANGE)
+        } else {
+            Stroke::new(1.0, ResolveColors::BORDER_LIGHT)
+        };
+        painter.rect_filled(dest_rect, CornerRadius::same(2), Color32::from_rgb(0x14, 0x15, 0x17));
+        painter.rect_stroke(dest_rect, CornerRadius::same(2), dest_stroke, StrokeKind::Inside);
         painter.text(
-            pos2(rect.min.x + 8.0, rect.center().y),
-            egui::Align2::LEFT_CENTER,
+            dest_rect.center(),
+            egui::Align2::CENTER_CENTER,
             &track.name,
+            egui::FontId::monospace(10.0),
+            if !track.is_muted { Color32::WHITE } else { ResolveColors::TEXT_MUTED },
+        );
+
+        // Название дорожки
+        let full_name = if track.is_video {
+            format!("Video {}", index + 1)
+        } else {
+            format!("Audio {}", index.saturating_sub(1))
+        };
+        painter.text(
+            pos2(rect.min.x + 42.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            full_name,
             egui::FontId::proportional(11.0),
             ResolveColors::TEXT_PRIMARY,
         );
 
-        // Иконки трека (Lock / Mute)
-        painter.text(
-            pos2(rect.max.x - 28.0, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            if track.is_video { "🎬" } else { "🔊" },
-            egui::FontId::proportional(10.0),
-            ResolveColors::TEXT_MUTED,
-        );
+        // Кнопки управления справа:
+        if track.is_video {
+            // Кнопка Lock 🔒
+            let lock_rect = Rect::from_min_size(pos2(rect.max.x - 22.0, rect.center().y - 9.0), vec2(18.0, 18.0));
+            let lock_resp = ui.interact(lock_rect, ui.id().with(format!("lock_track_{}", index)), egui::Sense::click());
+            if lock_resp.clicked() {
+                track.is_locked = !track.is_locked;
+            }
+            let lock_color = if track.is_locked { ResolveColors::ACCENT_ORANGE } else { ResolveColors::TEXT_MUTED };
+            painter.text(lock_rect.center(), egui::Align2::CENTER_CENTER, if track.is_locked { "🔒" } else { "🔓" }, egui::FontId::proportional(10.0), lock_color);
+
+            // Кнопка включения/выключения видеодорожки (Eye / Mute)
+            let eye_rect = Rect::from_min_size(pos2(rect.max.x - 42.0, rect.center().y - 9.0), vec2(18.0, 18.0));
+            let eye_resp = ui.interact(eye_rect, ui.id().with(format!("eye_track_{}", index)), egui::Sense::click());
+            if eye_resp.clicked() {
+                track.is_muted = !track.is_muted;
+            }
+            let eye_color = if !track.is_muted { ResolveColors::TEXT_PRIMARY } else { Color32::from_rgb(100, 100, 100) };
+            painter.text(eye_rect.center(), egui::Align2::CENTER_CENTER, if !track.is_muted { "👁" } else { "⊘" }, egui::FontId::proportional(10.0), eye_color);
+        } else {
+            // Аудиодорожка: Solo [S], Mute [M], Lock 🔒
+            let lock_rect = Rect::from_min_size(pos2(rect.max.x - 18.0, rect.center().y - 8.0), vec2(15.0, 16.0));
+            let lock_resp = ui.interact(lock_rect, ui.id().with(format!("lock_track_{}", index)), egui::Sense::click());
+            if lock_resp.clicked() {
+                track.is_locked = !track.is_locked;
+            }
+            painter.text(lock_rect.center(), egui::Align2::CENTER_CENTER, if track.is_locked { "🔒" } else { "🔓" }, egui::FontId::proportional(9.0), if track.is_locked { ResolveColors::ACCENT_ORANGE } else { ResolveColors::TEXT_MUTED });
+
+            let mute_rect = Rect::from_min_size(pos2(rect.max.x - 36.0, rect.center().y - 8.0), vec2(16.0, 16.0));
+            let mute_resp = ui.interact(mute_rect, ui.id().with(format!("mute_track_{}", index)), egui::Sense::click());
+            if mute_resp.clicked() {
+                track.is_muted = !track.is_muted;
+                audio_changed = true;
+            }
+            let mute_bg = if track.is_muted { ResolveColors::VU_RED } else { Color32::from_rgb(0x23, 0x26, 0x2b) };
+            painter.rect_filled(mute_rect, CornerRadius::same(2), mute_bg);
+            painter.text(mute_rect.center(), egui::Align2::CENTER_CENTER, "M", egui::FontId::monospace(9.0), if track.is_muted { Color32::WHITE } else { ResolveColors::TEXT_MUTED });
+
+            let solo_rect = Rect::from_min_size(pos2(rect.max.x - 54.0, rect.center().y - 8.0), vec2(16.0, 16.0));
+            let solo_resp = ui.interact(solo_rect, ui.id().with(format!("solo_track_{}", index)), egui::Sense::click());
+            if solo_resp.clicked() {
+                track.is_solo = !track.is_solo;
+                audio_changed = true;
+            }
+            let solo_bg = if track.is_solo { ResolveColors::VU_YELLOW } else { Color32::from_rgb(0x23, 0x26, 0x2b) };
+            painter.rect_filled(solo_rect, CornerRadius::same(2), solo_bg);
+            painter.text(solo_rect.center(), egui::Align2::CENTER_CENTER, "S", egui::FontId::monospace(9.0), if track.is_solo { Color32::BLACK } else { ResolveColors::TEXT_MUTED });
+        }
+
+        audio_changed
     }
 
     fn draw_clip(
         painter: &egui::Painter,
         rect: Rect,
+        canvas_rect: Rect,
         clip: &Clip,
         is_selected: bool,
         timeline: &TimelineState,
@@ -686,70 +799,75 @@ impl TimelineView {
         painter.rect_filled(rect, CornerRadius::same(2), fill_color);
         painter.rect_stroke(rect, CornerRadius::same(2), stroke, StrokeKind::Inside);
 
+        // Верхняя фирменная полоска клипа Resolve (Darker Header Strip)
+        let header_h = 13.0_f32.min(rect.height() * 0.35);
+        let clip_header_rect = Rect::from_min_size(rect.min, vec2(rect.width(), header_h));
+        painter.rect_filled(clip_header_rect, CornerRadius::same(2), Color32::from_rgba_unmultiplied(0, 0, 0, 40));
+
         // Для аудиоклипов: реальная асинхронная расшифровка звуковой волны (Waveform)
-        // Наглядно показывает, где есть звук, а где тишина (нет звука)
         if clip.is_audio && rect.width() > 10.0 {
-            let mid_y = rect.center().y;
-            let half_h = (rect.height() * 0.42).max(2.0);
+            let mid_y = rect.center().y + 4.0;
+            let half_h = (rect.height() * 0.35).max(2.0);
 
-            if let Some(path) = &clip.source_path {
-                if let Some(peaks) = waveform_mgr.get_waveform_stream(path, clip.source_audio_stream) {
-                    let pts_per_sec = 100.0;
-                    let sec_per_px = 1.0 / (timeline.zoom_factor * timeline.fps as f32);
+            let visible_start_x = (rect.min.x + 2.0).max(canvas_rect.min.x);
+            let visible_end_x = (rect.max.x - 2.0).min(canvas_rect.max.x);
 
-                    let mut x = rect.min.x + 2.0;
-                    let step_px = 2.0;
-                    while x < rect.max.x - 2.0 {
-                        let rel_x = x - rect.min.x;
-                        let sec_in_clip = rel_x as f64 * sec_per_px as f64;
-                        let total_source_sec = clip.source_in_secs + sec_in_clip;
-                        let sample_idx = (total_source_sec * pts_per_sec).round() as usize;
+            if visible_end_x > visible_start_x {
+                if let Some(path) = &clip.source_path {
+                    if let Some(peaks) = waveform_mgr.get_waveform_stream(path, clip.source_audio_stream) {
+                        let pts_per_sec = 100.0;
+                        let sec_per_px = 1.0 / (timeline.zoom_factor * timeline.fps as f32);
 
-                        let amp = peaks.get(sample_idx).copied().unwrap_or(0.0);
+                        let mut x = visible_start_x;
+                        let step_px = 2.0;
+                        while x < visible_end_x {
+                            let rel_x = x - rect.min.x;
+                            let sec_in_clip = rel_x as f64 * sec_per_px as f64;
+                            let total_source_sec = clip.source_in_secs + sec_in_clip;
+                            let sample_idx = (total_source_sec * pts_per_sec).round() as usize;
 
-                        if amp > 0.005 {
-                            let bar_h = (amp * half_h).max(1.0);
-                            painter.line_segment(
-                                [pos2(x, mid_y - bar_h), pos2(x, mid_y + bar_h)],
-                                Stroke::new(1.5, Color32::from_rgb(0x38, 0xd4, 0x8a)), // Свежий зеленый цвет Resolve Audio Waveform
-                            );
-                        } else {
-                            // Тонкая линия тишины (наглядно видно, что звука в этом фрагменте нет)
-                            painter.line_segment(
-                                [pos2(x, mid_y), pos2(x + step_px, mid_y)],
-                                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 45)),
-                            );
+                            let amp = peaks.get(sample_idx).copied().unwrap_or(0.0);
+
+                            if amp > 0.005 {
+                                let bar_h = (amp * half_h).max(1.0);
+                                painter.line_segment(
+                                    [pos2(x, mid_y - bar_h), pos2(x, mid_y + bar_h)],
+                                    Stroke::new(1.5, Color32::from_rgb(0x38, 0xd4, 0x8a)), // Зеленый цвет Resolve Audio Waveform
+                                );
+                            } else {
+                                painter.line_segment(
+                                    [pos2(x, mid_y), pos2(x + step_px, mid_y)],
+                                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 45)),
+                                );
+                            }
+                            x += step_px;
                         }
-                        x += step_px;
+                    } else {
+                        waveform_mgr.request_waveform_stream(path, clip.source_audio_stream, ctx.clone());
+                        painter.line_segment(
+                            [pos2(visible_start_x, mid_y), pos2(visible_end_x, mid_y)],
+                            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 50)),
+                        );
                     }
                 } else {
-                    // Запрос асинхронного извлечения в Tokio
-                    waveform_mgr.request_waveform_stream(path, clip.source_audio_stream, ctx.clone());
-
-                    // Центральная тонкая линия до завершения расшифровки
                     painter.line_segment(
-                        [pos2(rect.min.x + 2.0, mid_y), pos2(rect.max.x - 2.0, mid_y)],
+                        [pos2(visible_start_x, mid_y), pos2(visible_end_x, mid_y)],
                         Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 50)),
                     );
                 }
-            } else {
-                // Если клип без источника — центральная линия
-                painter.line_segment(
-                    [pos2(rect.min.x + 2.0, mid_y), pos2(rect.max.x - 2.0, mid_y)],
-                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 50)),
-                );
             }
         }
 
-        // Название клипа
-        if rect.width() > 30.0 {
+        // Название клипа: прижимаем к левому видимому краю полосы (как в DaVinci Resolve)
+        let label_left = (rect.min.x + 6.0).max(canvas_rect.min.x + 6.0);
+        if rect.max.x - label_left > 20.0 {
             let label = if clip.link_group.is_some() {
                 format!("🔗 {}", clip.name)
             } else {
                 clip.name.clone()
             };
             painter.text(
-                pos2(rect.min.x + 4.0, rect.min.y + 4.0),
+                pos2(label_left, rect.min.y + 2.0),
                 egui::Align2::LEFT_TOP,
                 label,
                 egui::FontId::proportional(10.0),

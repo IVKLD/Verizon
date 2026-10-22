@@ -627,6 +627,64 @@ impl NleApp {
             });
     }
 
+    fn render_bottom_page_bar(&mut self, ui: &mut Ui) {
+        Panel::bottom("resolve_bottom_page_bar")
+            .frame(
+                egui::Frame::new()
+                    .fill(ResolveColors::BG_MAIN)
+                    .stroke(Stroke::new(1.0, ResolveColors::BORDER))
+                    .inner_margin(Margin::symmetric(10, 4)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // Статус Wayland слева
+                    ui.label(
+                        egui::RichText::new("WAYLAND NATIVE")
+                            .size(9.0)
+                            .monospace()
+                            .color(ResolveColors::TEXT_MUTED),
+                    );
+
+                    ui.separator();
+
+                    // Центрированные кнопки рабочих пространств DaVinci Resolve 21
+                    ui.add_space((ui.available_width() * 0.28).max(0.0));
+
+                    let pages = [
+                        (Page::Media, "📁 Media"),
+                        (Page::Cut, "✂ Cut"),
+                        (Page::Edit, "🎞 Edit"),
+                        (Page::Color, "🎨 Color"),
+                        (Page::Deliver, "🚀 Deliver"),
+                    ];
+
+                    for (p, label) in pages {
+                        let is_active = self.current_page == p;
+                        let text = egui::RichText::new(label)
+                            .size(11.0)
+                            .color(if is_active { ResolveColors::ACCENT_ORANGE } else { ResolveColors::TEXT_MUTED });
+                        let btn = egui::Button::new(text)
+                            .fill(if is_active { ResolveColors::BG_HEADER } else { egui::Color32::TRANSPARENT })
+                            .stroke(if is_active { Stroke::new(1.0, ResolveColors::ACCENT_ORANGE.gamma_multiply(0.5)) } else { Stroke::NONE });
+                        if ui.add(btn).clicked() {
+                            self.current_page = p;
+                        }
+                    }
+
+                    // Правая часть нижнего бара: таймкод проекта
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let tc = crate::timecode::Timecode::new(self.timeline.playhead_frame, self.timeline.fps).to_smpte();
+                        ui.label(
+                            egui::RichText::new(format!("TC: {}", tc))
+                                .size(10.0)
+                                .monospace()
+                                .color(ResolveColors::TEXT_PRIMARY),
+                        );
+                    });
+                });
+            });
+    }
+
     fn render_preferences_window(&mut self, ctx: &Context) {
         if !self.show_preferences_window {
             return;
@@ -768,8 +826,9 @@ impl eframe::App for NleApp {
         // 4. Обработка хоткеев DaVinci
         self.handle_keyboard_shortcuts(&ctx);
 
-        // 5. Верхний бар и Меню
+        // 5. Верхний бар меню и Нижний бар переключения страниц DaVinci Resolve
         self.render_top_bar(ui);
+        self.render_bottom_page_bar(ui);
 
         // 6. Отображение активной страницы (Media / Edit)
         match self.current_page {
