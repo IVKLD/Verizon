@@ -132,12 +132,17 @@ impl TimelineView {
             }
         }
 
+        // Ограничение вертикального скролла дорожек
+        let total_tracks_h = total_tracks as f32 * track_height;
+        let max_scroll_y = (total_tracks_h - (tracks_canvas_rect.height() - 20.0)).max(0.0);
+        timeline.scroll_y = timeline.scroll_y.clamp(0.0, max_scroll_y);
+
         // 3. Отрисовка Ruler (Линейки времени) строго с изоляцией ruler_painter
         Self::draw_ruler(&ruler_painter, ruler_rect, timeline);
 
-        // 4. Отрисовка полос дорожек таймлайна (строго внутри tracks_canvas_rect)
+        // 4. Отрисовка полос дорожек таймлайна с учетом вертикального скролла scroll_y
         for (i, _track) in timeline.tracks.iter().enumerate() {
-            let y_top = ruler_rect.max.y + (i as f32 * track_height);
+            let y_top = ruler_rect.max.y + (i as f32 * track_height) - timeline.scroll_y;
             let track_row_rect = Rect::from_min_size(pos2(canvas_rect.min.x, y_top), vec2(canvas_rect.width(), track_height));
 
             // Фон полосы дорожки
@@ -153,16 +158,17 @@ impl TimelineView {
             );
         }
 
-        // 5. Отрисовка и высокоточная интерактивность клипов на дорожках
+        // 5. Отрисовка и высокоточная интерактивность клипов на дорожках (Trimming и Moving)
         let mut hovered_clip_id = None;
         let mut clicked_clip_id = None;
         let mut start_drag_request = None;
+        let mut start_trim_request = None;
 
         for clip in &timeline.clips {
             if clip.track_index >= timeline.tracks.len() {
                 continue;
             }
-            let track_y = ruler_rect.max.y + (clip.track_index as f32 * track_height);
+            let track_y = ruler_rect.max.y + (clip.track_index as f32 * track_height) - timeline.scroll_y;
             let clip_x1 = canvas_rect.min.x + (clip.start_frame as f32 * timeline.zoom_factor) - timeline.scroll_x;
             let clip_width = (clip.duration_frames as f32 * timeline.zoom_factor).max(4.0);
             let clip_rect = Rect::from_min_size(
@@ -192,45 +198,109 @@ impl TimelineView {
             Self::draw_clip(&tracks_painter, clip_rect, canvas_rect, clip, is_selected, timeline, waveform_mgr, ui.ctx());
 
             // Интерактивность клипа: строго ограничена видимой областью холста
-            if timeline.active_tool == Tool::Selection {
+            if timeline.active_tool == Tool::Selection || timeline.active_tool == Tool::Trim {
                 let interact_rect = clip_rect.intersect(tracks_canvas_rect);
                 if interact_rect.is_positive() {
+                    let trim_handle_w = 8.0_f32.min(interact_rect.width() * 0.25);
+                    let left_handle = Rect::from_min_size(interact_rect.min, vec2(trim_handle_w, interact_rect.height()));
+                    let right_handle = Rect::from_min_size(pos2(interact_rect.max.x - trim_handle_w, interact_rect.min.y), vec2(trim_handle_w, interact_rect.height()));
+
+                    let is_hovered = mouse_pos.map(|m| interact_rect.contains(m)).unwrap_or(false);
+                    if is_hovered {
+                        hovered_clip_id = Some(clip.id);
+                        if let Some(m_pos) = mouse_pos {
+                            if left_handle.contains(m_pos) {
+                                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeEast);
+                            } else if right_handle.contains(m_pos) {
+                                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeWest);
+                            }
+                        }
+                    }
+
                     let clip_resp = ui.interact(
                         interact_rect,
                         ui.id().with(format!("clip_{}", clip.id)),
                         egui::Sense::click_and_drag(),
                     );
 
-                    if clip_resp.hovered() {
-                        hovered_clip_id = Some(clip.id);
-                    }
-
                     if clip_resp.clicked() {
                         clicked_clip_id = Some(clip.id);
                     }
 
-                    // Инициализация перетаскивания клипа при зажатии ЛКМ
-                    if clip_resp.drag_started() || (clip_resp.dragged() && timeline.moving_clip.is_none()) {
+                    // Начало действия: Trimming (если зажали возле края) или Moving (если зажали по центру)
+                    if clip_resp.drag_started() && timeline.moving_clip.is_none() && timeline.trim_session.is_none() {
                         if let Some(m_pos) = mouse_pos {
-                            start_drag_request = Some((clip.id, m_pos.x, clip.start_frame));
+                            if left_handle.contains(m_pos) {
+                                start_trim_request = Some(crate::timeline::TrimSession {
+                                    clip_id: clip.id,
+                                    edge: crate::timeline::TrimEdge::Start,
+                                    mouse_start_x: m_pos.x,
+                                    init_start_frame: clip.start_frame,
+                                    init_duration_frames: clip.duration_frames,
+                                    init_source_in_frame: clip.source_in_frame,
+                                    init_source_in_secs: clip.source_in_secs,
+                                });
+                            } else if right_handle.contains(m_pos) {
+                                start_trim_request = Some(crate::timeline::TrimSession {
+                                    clip_id: clip.id,
+                                    edge: crate::timeline::TrimEdge::End,
+                                    mouse_start_x: m_pos.x,
+                                    init_start_frame: clip.start_frame,
+                                    init_duration_frames: clip.duration_frames,
+                                    init_source_in_frame: clip.source_in_frame,
+                                    init_source_in_secs: clip.source_in_secs,
+                                });
+                            } else {
+                                start_drag_request = Some((clip.id, m_pos.x, m_pos.y, clip.start_frame, clip.track_index));
+                            }
                         }
                     }
                 }
             }
         }
 
-        if let Some((id, mouse_x, start_fr)) = start_drag_request {
+        if let Some(trim) = start_trim_request {
             timeline.push_history();
-            timeline.moving_clip = Some((id, mouse_x, start_fr));
+            timeline.trim_session = Some(trim);
+        }
+        if let Some(req) = start_drag_request {
+            timeline.push_history();
+            timeline.moving_clip = Some(req);
         }
 
-        // Обновление позиции перетаскиваемого клипа (и всех связанных с ним)
-        if let Some((drag_id, start_mouse_x, init_start_frame)) = timeline.moving_clip {
+        // Обновление сессии подрезки краев клипа (DaVinci Resolve Edge Trimming)
+        if let Some(trim) = timeline.trim_session {
+            if let Some(m_pos) = mouse_pos {
+                let dx = m_pos.x - trim.mouse_start_x;
+                let delta_frames = (dx / timeline.zoom_factor).round() as i64;
+                match trim.edge {
+                    crate::timeline::TrimEdge::Start => {
+                        let target_start = trim.init_start_frame + delta_frames;
+                        timeline.trim_clip_start_session(&trim, target_start);
+                    }
+                    crate::timeline::TrimEdge::End => {
+                        let target_end = trim.init_start_frame + trim.init_duration_frames + delta_frames;
+                        timeline.trim_clip_end_session(&trim, target_end);
+                    }
+                }
+            }
+            if ui.input(|i| i.pointer.any_released() || !i.pointer.primary_down()) {
+                timeline.trim_session = None;
+            }
+        }
+
+        // Обновление позиции перетаскиваемого клипа (по кадрам и между дорожками)
+        if let Some((drag_id, start_mouse_x, start_mouse_y, init_start_frame, init_track)) = timeline.moving_clip {
             if let Some(m_pos) = mouse_pos {
                 let dx = m_pos.x - start_mouse_x;
+                let dy = m_pos.y - start_mouse_y;
                 let delta_frames = (dx / timeline.zoom_factor).round() as i64;
+                let delta_tracks = (dy / track_height).round() as isize;
+
                 let target_start = (init_start_frame + delta_frames).max(0);
-                timeline.move_clip(drag_id, target_start);
+                let target_track = (init_track as isize + delta_tracks).clamp(0, timeline.tracks.len().saturating_sub(1) as isize) as usize;
+
+                timeline.move_clip_to_track(drag_id, target_start, Some(target_track));
             }
             if ui.input(|i| i.pointer.any_released() || !i.pointer.primary_down()) {
                 timeline.moving_clip = None;
@@ -295,7 +365,7 @@ impl TimelineView {
 
         // В области дорожек клик по пустому месту ТОЛЬКО снимает выделение с клипа
         // (Управление курсором плейхеда происходит ИСКЛЮЧИТЕЛЬНО на линейке с цифрами как в DaVinci Resolve)
-        if timeline.active_tool == Tool::Selection && timeline.moving_clip.is_none() && hovered_clip_id.is_none() && timeline.dragged_media.is_none() {
+        if (timeline.active_tool == Tool::Selection || timeline.active_tool == Tool::Trim) && timeline.moving_clip.is_none() && hovered_clip_id.is_none() && timeline.dragged_media.is_none() {
             let canvas_sense = ui.interact(tracks_canvas_rect, ui.id().with("empty_tracks_canvas"), egui::Sense::click());
             if canvas_sense.clicked() {
                 timeline.selected_clip_id = None;
@@ -305,7 +375,7 @@ impl TimelineView {
         // Индикация курсора мыши для перемещения клипов
         if timeline.moving_clip.is_some() {
             ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
-        } else if hovered_clip_id.is_some() && timeline.active_tool == Tool::Selection {
+        } else if hovered_clip_id.is_some() && (timeline.active_tool == Tool::Selection || timeline.active_tool == Tool::Trim) {
             ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
         }
 
@@ -319,7 +389,7 @@ impl TimelineView {
         if let Some(media) = &timeline.dragged_media.clone() {
             if let Some(m_pos) = mouse_pos {
                 if canvas_rect.contains(m_pos) {
-                    let rel_y = m_pos.y - ruler_rect.max.y;
+                    let rel_y = m_pos.y - ruler_rect.max.y + timeline.scroll_y;
                     let target_track_idx = ((rel_y / track_height).floor() as usize).min(timeline.tracks.len().saturating_sub(1));
                     let rel_x = m_pos.x - canvas_rect.min.x + timeline.scroll_x;
                     let raw_frame = (rel_x / timeline.zoom_factor).max(0.0) as i64;
@@ -333,7 +403,7 @@ impl TimelineView {
                         }
                     }
 
-                    let ghost_y = ruler_rect.max.y + (target_track_idx as f32 * track_height);
+                    let ghost_y = ruler_rect.max.y + (target_track_idx as f32 * track_height) - timeline.scroll_y;
                     let ghost_x = canvas_rect.min.x + (drop_frame as f32 * timeline.zoom_factor) - timeline.scroll_x;
                     let ghost_w = (media.duration_frames as f32 * timeline.zoom_factor).max(12.0);
                     let ghost_rect = Rect::from_min_size(pos2(ghost_x, ghost_y + 2.0), vec2(ghost_w, track_height - 4.0));
@@ -496,18 +566,45 @@ impl TimelineView {
             Stroke::new(1.0, ResolveColors::BORDER),
         );
         headers_painter.text(
-            pos2(corner_header_rect.min.x + 10.0, corner_header_rect.center().y),
+            pos2(corner_header_rect.min.x + 8.0, corner_header_rect.center().y),
             egui::Align2::LEFT_CENTER,
             "TRACKS",
             egui::FontId::monospace(10.0),
             ResolveColors::TEXT_MUTED,
         );
 
+        // Кнопки добавления дорожек +V и +A
+        let btn_v_rect = Rect::from_min_size(pos2(corner_header_rect.max.x - 48.0, corner_header_rect.center().y - 8.0), vec2(20.0, 16.0));
+        let btn_a_rect = Rect::from_min_size(pos2(corner_header_rect.max.x - 24.0, corner_header_rect.center().y - 8.0), vec2(20.0, 16.0));
+
+        let v_resp = ui.interact(btn_v_rect, ui.id().with("add_video_track_btn"), egui::Sense::click());
+        if v_resp.clicked() {
+            timeline.add_video_track();
+        }
+        let v_bg = if v_resp.hovered() { ResolveColors::VIDEO_CLIP } else { Color32::from_rgb(0x23, 0x26, 0x2b) };
+        headers_painter.rect_filled(btn_v_rect, CornerRadius::same(2), v_bg);
+        headers_painter.text(btn_v_rect.center(), egui::Align2::CENTER_CENTER, "+V", egui::FontId::monospace(9.0), Color32::WHITE);
+
+        let a_resp = ui.interact(btn_a_rect, ui.id().with("add_audio_track_btn"), egui::Sense::click());
+        if a_resp.clicked() {
+            timeline.add_audio_track();
+        }
+        let a_bg = if a_resp.hovered() { ResolveColors::AUDIO_CLIP } else { Color32::from_rgb(0x23, 0x26, 0x2b) };
+        headers_painter.rect_filled(btn_a_rect, CornerRadius::same(2), a_bg);
+        headers_painter.text(btn_a_rect.center(), egui::Align2::CENTER_CENTER, "+A", egui::FontId::monospace(9.0), Color32::WHITE);
+
+        // Область заголовков дорожек (скроллируется вертикально синхронно с холстом)
+        let headers_tracks_rect = Rect::from_min_max(
+            pos2(full_rect.min.x, ruler_rect.max.y),
+            pos2(full_rect.min.x + header_width, full_rect.max.y),
+        );
+        let headers_tracks_painter = ui.painter().with_clip_rect(headers_tracks_rect);
+
         let mut audio_dirty_requested = false;
         for (i, track) in timeline.tracks.iter_mut().enumerate() {
-            let y_top = ruler_rect.max.y + (i as f32 * track_height);
+            let y_top = ruler_rect.max.y + (i as f32 * track_height) - timeline.scroll_y;
             let header_row_rect = Rect::from_min_size(pos2(full_rect.min.x, y_top), vec2(header_width, track_height));
-            if Self::render_interactive_track_header(ui, &headers_painter, header_row_rect, track, i) {
+            if Self::render_interactive_track_header(ui, &headers_tracks_painter, header_row_rect, track, i) {
                 audio_dirty_requested = true;
             }
         }
@@ -531,6 +628,14 @@ impl TimelineView {
             ).fill(if arrow_active { ResolveColors::ACCENT_ORANGE } else { ResolveColors::BG_HEADER });
             if ui.add(arrow_btn).on_hover_text("Инструмент выделения [A]").clicked() {
                 timeline.active_tool = Tool::Selection;
+            }
+
+            let trim_active = timeline.active_tool == Tool::Trim;
+            let trim_btn = egui::Button::new(
+                egui::RichText::new("][ Trim (T)").size(11.0).color(if trim_active { Color32::WHITE } else { ResolveColors::TEXT_PRIMARY }),
+            ).fill(if trim_active { ResolveColors::ACCENT_ORANGE } else { ResolveColors::BG_HEADER });
+            if ui.add(trim_btn).on_hover_text("Инструмент подрезки краев клипов [T]").clicked() {
+                timeline.active_tool = Tool::Trim;
             }
 
             let blade_active = timeline.active_tool == Tool::Blade;
@@ -798,6 +903,35 @@ impl TimelineView {
 
         painter.rect_filled(rect, CornerRadius::same(2), fill_color);
         painter.rect_stroke(rect, CornerRadius::same(2), stroke, StrokeKind::Inside);
+
+        // Визуальные скобки выделения и подрезки DaVinci Resolve [ ]
+        if is_selected && rect.width() > 16.0 {
+            let b_stroke = Stroke::new(2.5, ResolveColors::ACCENT_ORANGE);
+            let b_len = 6.0;
+            // Левая скобка [
+            painter.line_segment([pos2(rect.min.x + 1.0, rect.min.y + 1.0), pos2(rect.min.x + 1.0, rect.max.y - 1.0)], b_stroke);
+            painter.line_segment([pos2(rect.min.x + 1.0, rect.min.y + 1.0), pos2(rect.min.x + 1.0 + b_len, rect.min.y + 1.0)], b_stroke);
+            painter.line_segment([pos2(rect.min.x + 1.0, rect.max.y - 1.0), pos2(rect.min.x + 1.0 + b_len, rect.max.y - 1.0)], b_stroke);
+
+            // Правая скобка ]
+            painter.line_segment([pos2(rect.max.x - 1.0, rect.min.y + 1.0), pos2(rect.max.x - 1.0, rect.max.y - 1.0)], b_stroke);
+            painter.line_segment([pos2(rect.max.x - 1.0 - b_len, rect.min.y + 1.0), pos2(rect.max.x - 1.0, rect.min.y + 1.0)], b_stroke);
+            painter.line_segment([pos2(rect.max.x - 1.0 - b_len, rect.max.y - 1.0), pos2(rect.max.x - 1.0, rect.max.y - 1.0)], b_stroke);
+        }
+
+        // Подсветка активной границы при подрезке (Trimming Session)
+        if let Some(trim) = &timeline.trim_session {
+            if trim.clip_id == clip.id {
+                let active_x = match trim.edge {
+                    crate::timeline::TrimEdge::Start => rect.min.x,
+                    crate::timeline::TrimEdge::End => rect.max.x,
+                };
+                painter.line_segment(
+                    [pos2(active_x, rect.min.y - 2.0), pos2(active_x, rect.max.y + 2.0)],
+                    Stroke::new(3.0, Color32::WHITE),
+                );
+            }
+        }
 
         // Верхняя фирменная полоска клипа Resolve (Darker Header Strip)
         let header_h = 13.0_f32.min(rect.height() * 0.35);

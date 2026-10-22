@@ -5,8 +5,24 @@ use std::path::PathBuf;
 pub enum Tool {
     Selection, // Клавиша 'A' (Стрелка для перемещения и выделения)
     Blade,     // Клавиша 'B' (Лезвие для нарезки клипов)
-    #[allow(dead_code)]
     Trim,      // Клавиша 'T' (Подрезка краев)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimEdge {
+    Start,
+    End,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TrimSession {
+    pub clip_id: u64,
+    pub edge: TrimEdge,
+    pub mouse_start_x: f32,
+    pub init_start_frame: i64,
+    pub init_duration_frames: i64,
+    pub init_source_in_frame: i64,
+    pub init_source_in_secs: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -104,8 +120,11 @@ pub struct TimelineState {
     // Активно перетаскиваемый клип (Drag & Drop)
     pub dragged_media: Option<DraggedMedia>,
 
-    // Текущая сессия перемещения клипа на таймлайне: (clip_id, mouse_start_x, clip_initial_start_frame)
-    pub moving_clip: Option<(u64, f32, i64)>,
+    // Текущая сессия перемещения клипа на таймлайне: (clip_id, mouse_start_x, mouse_start_y, clip_initial_start_frame, initial_track_index)
+    pub moving_clip: Option<(u64, f32, f32, i64, usize)>,
+
+    // Текущая сессия подрезки краев клипа (DaVinci Resolve Edge Trimming)
+    pub trim_session: Option<TrimSession>,
 
     // Очередь импорта медиа
     pub pending_imports: Vec<PathBuf>,
@@ -172,6 +191,7 @@ impl TimelineState {
             frame_accumulator: 0.0,
             dragged_media: None,
             moving_clip: None,
+            trim_session: None,
             pending_imports: Vec::new(),
             history: Vec::new(),
             audio_dirty: true,
@@ -190,6 +210,39 @@ impl TimelineState {
                 is_solo: false,
             });
         }
+    }
+
+    /// Добавить новую видеодорожку (V3, V4...)
+    pub fn add_video_track(&mut self) {
+        let video_count = self.tracks.iter().filter(|t| t.is_video).count();
+        let new_track = Track {
+            name: format!("V{}", video_count + 1),
+            is_video: true,
+            is_muted: false,
+            is_locked: false,
+            is_solo: false,
+        };
+        let first_audio = self.tracks.iter().position(|t| !t.is_video).unwrap_or(self.tracks.len());
+        self.tracks.insert(first_audio, new_track);
+        for c in &mut self.clips {
+            if c.track_index >= first_audio {
+                c.track_index += 1;
+            }
+        }
+        self.audio_dirty = true;
+    }
+
+    /// Добавить новую аудиодорожку (A2, A3...)
+    pub fn add_audio_track(&mut self) {
+        let audio_count = self.tracks.iter().filter(|t| !t.is_video).count();
+        self.tracks.push(Track {
+            name: format!("A{}", audio_count + 1),
+            is_video: false,
+            is_muted: false,
+            is_locked: false,
+            is_solo: false,
+        });
+        self.audio_dirty = true;
     }
 
     #[allow(dead_code)]
@@ -321,8 +374,62 @@ impl TimelineState {
         }
     }
 
+    /// Удаление со сдвигом последующих клипов (DaVinci Resolve Ripple Delete [Shift+Delete / Shift+Backspace])
+    pub fn ripple_delete_selected_clip(&mut self) {
+        if let Some(selected_id) = self.selected_clip_id {
+            self.push_history();
+
+            // Определяем все удаляемые клипы (с учетом связи A/V)
+            let link_grp = self.clips.iter().find(|c| c.id == selected_id).and_then(|c| c.link_group);
+            let to_delete: Vec<Clip> = if self.linked_selection && link_grp.is_some() {
+                self.clips.iter().filter(|c| c.link_group == link_grp).cloned().collect()
+            } else {
+                self.clips.iter().filter(|c| c.id == selected_id).cloned().collect()
+            };
+
+            if to_delete.is_empty() {
+                return;
+            }
+
+            let min_start = to_delete.iter().map(|c| c.start_frame).min().unwrap_or(0);
+            let max_end = to_delete.iter().map(|c| c.end_frame()).max().unwrap_or(0);
+            let gap_duration = max_end - min_start;
+
+            if gap_duration > 0 {
+                // Удаляем клипы
+                if self.linked_selection && link_grp.is_some() {
+                    self.clips.retain(|c| c.link_group != link_grp);
+                } else {
+                    self.clips.retain(|c| c.id != selected_id);
+                }
+
+                // Сдвигаем все последующие клипы влево на ширину удаленного интервала
+                for clip in &mut self.clips {
+                    if clip.start_frame >= max_end {
+                        clip.start_frame -= gap_duration;
+                    }
+                }
+
+                // Корректируем плейхед
+                if self.playhead_frame >= max_end {
+                    self.playhead_frame = (self.playhead_frame - gap_duration).max(0);
+                } else if self.playhead_frame > min_start {
+                    self.playhead_frame = min_start;
+                }
+            }
+
+            self.selected_clip_id = None;
+            self.audio_dirty = true;
+        }
+    }
+
     /// Перемещение клипа с учетом магнитного прилипания и связности клипов (Linked Clips)
     pub fn move_clip(&mut self, clip_id: u64, raw_start: i64) {
+        self.move_clip_to_track(clip_id, raw_start, None);
+    }
+
+    /// Перемещение клипа по времени и между дорожками (Tracks)
+    pub fn move_clip_to_track(&mut self, clip_id: u64, raw_start: i64, new_track: Option<usize>) {
         let clip_idx = match self.clips.iter().position(|c| c.id == clip_id) {
             Some(idx) => idx,
             None => return,
@@ -357,21 +464,161 @@ impl TimelineState {
         }
 
         let delta_frames = target_frame - old_start;
+        let link_grp = self.clips[clip_idx].link_group;
+
+        // Перемещение по дорожкам (Track Index) с проверкой типа (видео на видео, аудио на аудио)
+        if let Some(target_t) = new_track {
+            if target_t < self.tracks.len() {
+                let is_vid = !self.clips[clip_idx].is_audio;
+                let track_is_vid = self.tracks[target_t].is_video;
+                if is_vid == track_is_vid {
+                    self.clips[clip_idx].track_index = target_t;
+                }
+            }
+        }
+
+        if delta_frames != 0 {
+            if self.linked_selection && link_grp.is_some() {
+                // Перемещаем ВСЕ связанные клипы (Видео + Аудио) синхронно!
+                for clip in &mut self.clips {
+                    if clip.link_group == link_grp {
+                        clip.start_frame = (clip.start_frame + delta_frames).max(0);
+                    }
+                }
+            } else {
+                self.clips[clip_idx].start_frame = target_frame;
+            }
+        }
+        self.audio_dirty = true;
+    }
+
+    /// Подрезка начала клипа (Trim In) с сохранением A/V синхронизации
+    #[allow(dead_code)]
+    pub fn trim_clip_start(&mut self, clip_id: u64, raw_start: i64) {
+        let clip_idx = match self.clips.iter().position(|c| c.id == clip_id) {
+            Some(idx) => idx,
+            None => return,
+        };
+
+        let link_grp = self.clips[clip_idx].link_group;
+        let old_start = self.clips[clip_idx].start_frame;
+        let old_duration = self.clips[clip_idx].duration_frames;
+        let max_start = old_start + old_duration - 1; // Минимум 1 кадр остается
+        let target_start = raw_start.clamp(0, max_start);
+        let delta_frames = target_start - old_start;
+
         if delta_frames == 0 {
             return;
         }
 
-        let link_grp = self.clips[clip_idx].link_group;
+        let apply_trim = |clip: &mut Clip| {
+            let fps = clip.source_fps.max(1.0);
+            clip.start_frame += delta_frames;
+            clip.duration_frames = (clip.duration_frames - delta_frames).max(1);
+            clip.source_in_frame = (clip.source_in_frame + delta_frames).max(0);
+            clip.source_in_secs = (clip.source_in_secs + delta_frames as f64 / fps).max(0.0);
+        };
+
         if self.linked_selection && link_grp.is_some() {
-            // Перемещаем ВСЕ связанные клипы (Видео + Аудио) синхронно!
             for clip in &mut self.clips {
                 if clip.link_group == link_grp {
-                    clip.start_frame = (clip.start_frame + delta_frames).max(0);
+                    apply_trim(clip);
                 }
             }
         } else {
-            self.clips[clip_idx].start_frame = target_frame;
+            apply_trim(&mut self.clips[clip_idx]);
         }
+
+        self.audio_dirty = true;
+    }
+
+    /// Подрезка начала клипа (Trim In) с привязкой к начальному состоянию сессии
+    pub fn trim_clip_start_session(&mut self, session: &TrimSession, target_start: i64) {
+        let clip_idx = match self.clips.iter().position(|c| c.id == session.clip_id) {
+            Some(idx) => idx,
+            None => return,
+        };
+
+        let link_grp = self.clips[clip_idx].link_group;
+        // Нельзя подрезать левее начала исходного файла медиа
+        let min_start = (session.init_start_frame - session.init_source_in_frame).max(0);
+        let max_start = session.init_start_frame + session.init_duration_frames - 1;
+        let clamped_start = target_start.clamp(min_start, max_start);
+        let delta_frames = clamped_start - session.init_start_frame;
+
+        let apply_trim = |clip: &mut Clip| {
+            let fps = clip.source_fps.max(1.0);
+            clip.start_frame = clamped_start;
+            clip.duration_frames = session.init_duration_frames - delta_frames;
+            clip.source_in_frame = session.init_source_in_frame + delta_frames;
+            clip.source_in_secs = session.init_source_in_secs + (delta_frames as f64 / fps);
+        };
+
+        if self.linked_selection && link_grp.is_some() {
+            for clip in &mut self.clips {
+                if clip.link_group == link_grp {
+                    apply_trim(clip);
+                }
+            }
+        } else {
+            apply_trim(&mut self.clips[clip_idx]);
+        }
+
+        self.audio_dirty = true;
+    }
+
+    /// Подрезка конца клипа (Trim Out) с привязкой к начальному состоянию сессии
+    pub fn trim_clip_end_session(&mut self, session: &TrimSession, target_end: i64) {
+        let clip_idx = match self.clips.iter().position(|c| c.id == session.clip_id) {
+            Some(idx) => idx,
+            None => return,
+        };
+
+        let link_grp = self.clips[clip_idx].link_group;
+        let min_end = session.init_start_frame + 1;
+        let clamped_end = target_end.max(min_end);
+        let new_duration = clamped_end - session.init_start_frame;
+
+        if self.linked_selection && link_grp.is_some() {
+            for clip in &mut self.clips {
+                if clip.link_group == link_grp {
+                    clip.duration_frames = new_duration;
+                }
+            }
+        } else {
+            self.clips[clip_idx].duration_frames = new_duration;
+        }
+
+        self.audio_dirty = true;
+    }
+
+    /// Подрезка конца клипа (Trim Out)
+    #[allow(dead_code)]
+    pub fn trim_clip_end(&mut self, clip_id: u64, raw_end: i64) {
+        let clip_idx = match self.clips.iter().position(|c| c.id == clip_id) {
+            Some(idx) => idx,
+            None => return,
+        };
+
+        let link_grp = self.clips[clip_idx].link_group;
+        let start_frame = self.clips[clip_idx].start_frame;
+        let target_end = raw_end.max(start_frame + 1);
+        let new_duration = target_end - start_frame;
+
+        if new_duration == self.clips[clip_idx].duration_frames {
+            return;
+        }
+
+        if self.linked_selection && link_grp.is_some() {
+            for clip in &mut self.clips {
+                if clip.link_group == link_grp {
+                    clip.duration_frames = new_duration;
+                }
+            }
+        } else {
+            self.clips[clip_idx].duration_frames = new_duration;
+        }
+
         self.audio_dirty = true;
     }
 
@@ -701,5 +948,189 @@ mod tests {
         // Плейхед должен остаться строго на кадре 50!
         assert_eq!(tl.playhead_frame, 50);
         assert_eq!(tl.clips.len(), 2);
+    }
+
+    #[test]
+    fn test_ripple_delete_closes_gap_and_shifts_following_clips() {
+        let mut tl = TimelineState::new_empty();
+        tl.fps = 24;
+
+        // Clip 1: [0..50)
+        tl.clips.push(Clip {
+            id: 1,
+            name: "Clip 1".to_string(),
+            track_index: 1,
+            start_frame: 0,
+            duration_frames: 50,
+            is_audio: false,
+            color: Color32::BLUE,
+            source_path: None,
+            source_in_frame: 0,
+            source_in_secs: 0.0,
+            source_fps: 24.0,
+            link_group: None,
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            position_x: 0.0,
+            position_y: 0.0,
+            rotation: 0.0,
+            opacity: 100.0,
+            volume_db: 0.0,
+            pan: 0.0,
+            source_audio_stream: 0,
+        });
+
+        // Clip 2: [50..100) (Будет удален через Ripple Delete)
+        tl.clips.push(Clip {
+            id: 2,
+            name: "Clip 2".to_string(),
+            track_index: 1,
+            start_frame: 50,
+            duration_frames: 50,
+            is_audio: false,
+            color: Color32::RED,
+            source_path: None,
+            source_in_frame: 0,
+            source_in_secs: 0.0,
+            source_fps: 24.0,
+            link_group: None,
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            position_x: 0.0,
+            position_y: 0.0,
+            rotation: 0.0,
+            opacity: 100.0,
+            volume_db: 0.0,
+            pan: 0.0,
+            source_audio_stream: 0,
+        });
+
+        // Clip 3: [100..180)
+        tl.clips.push(Clip {
+            id: 3,
+            name: "Clip 3".to_string(),
+            track_index: 1,
+            start_frame: 100,
+            duration_frames: 80,
+            is_audio: false,
+            color: Color32::GREEN,
+            source_path: None,
+            source_in_frame: 0,
+            source_in_secs: 0.0,
+            source_fps: 24.0,
+            link_group: None,
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            position_x: 0.0,
+            position_y: 0.0,
+            rotation: 0.0,
+            opacity: 100.0,
+            volume_db: 0.0,
+            pan: 0.0,
+            source_audio_stream: 0,
+        });
+
+        // Выделяем Clip 2 и делаем Ripple Delete
+        tl.selected_clip_id = Some(2);
+        tl.playhead_frame = 120;
+        tl.ripple_delete_selected_clip();
+
+        assert_eq!(tl.clips.len(), 2);
+        // Clip 1 остался на месте [0..50)
+        assert_eq!(tl.clips[0].id, 1);
+        assert_eq!(tl.clips[0].start_frame, 0);
+
+        // Clip 3 сдвинулся влево на 50 кадров: теперь начинается на кадре 50 вместо 100!
+        assert_eq!(tl.clips[1].id, 3);
+        assert_eq!(tl.clips[1].start_frame, 50);
+        assert_eq!(tl.clips[1].duration_frames, 80);
+
+        // Плейхед тоже сдвинулся со 120 на 70 (120 - 50)
+        assert_eq!(tl.playhead_frame, 70);
+    }
+
+    #[test]
+    fn test_trim_session_preserves_audio_sync_and_clamping() {
+        let mut tl = TimelineState::new_empty();
+        tl.fps = 24;
+        tl.linked_selection = true;
+
+        // Создаем связанную пару Video + Audio:
+        // исходный файл уже отрезан на 24 кадра (1 сек)
+        tl.clips.push(Clip {
+            id: 10,
+            name: "Video".to_string(),
+            track_index: 1,
+            start_frame: 100,
+            duration_frames: 50,
+            is_audio: false,
+            color: Color32::BLUE,
+            source_path: None,
+            source_in_frame: 24,
+            source_in_secs: 1.0,
+            source_fps: 24.0,
+            link_group: Some(77),
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            position_x: 0.0,
+            position_y: 0.0,
+            rotation: 0.0,
+            opacity: 100.0,
+            volume_db: 0.0,
+            pan: 0.0,
+            source_audio_stream: 0,
+        });
+
+        tl.clips.push(Clip {
+            id: 11,
+            name: "Audio".to_string(),
+            track_index: 2,
+            start_frame: 100,
+            duration_frames: 50,
+            is_audio: true,
+            color: Color32::GREEN,
+            source_path: None,
+            source_in_frame: 24,
+            source_in_secs: 1.0,
+            source_fps: 24.0,
+            link_group: Some(77),
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            position_x: 0.0,
+            position_y: 0.0,
+            rotation: 0.0,
+            opacity: 100.0,
+            volume_db: 0.0,
+            pan: 0.0,
+            source_audio_stream: 0,
+        });
+
+        let session = TrimSession {
+            clip_id: 10,
+            edge: TrimEdge::Start,
+            mouse_start_x: 500.0,
+            init_start_frame: 100,
+            init_duration_frames: 50,
+            init_source_in_frame: 24,
+            init_source_in_secs: 1.0,
+        };
+
+        // Подрезаем на 10 кадров вперед (In-point = 110)
+        tl.trim_clip_start_session(&session, 110);
+        assert_eq!(tl.clips[0].start_frame, 110);
+        assert_eq!(tl.clips[0].duration_frames, 40);
+        assert_eq!(tl.clips[0].source_in_frame, 34);
+        // Связанное аудио синхронно подрезалось:
+        assert_eq!(tl.clips[1].start_frame, 110);
+        assert_eq!(tl.clips[1].duration_frames, 40);
+        assert_eq!(tl.clips[1].source_in_frame, 34);
+
+        // Пытаемся подрезать левее начала исходного файла (In-point = 50, когда source_in_frame всего 24)
+        tl.trim_clip_start_session(&session, 50);
+        // Не может быть левее 100 - 24 = 76!
+        assert_eq!(tl.clips[0].start_frame, 76);
+        assert_eq!(tl.clips[0].source_in_frame, 0);
+        assert_eq!(tl.clips[1].start_frame, 76);
+        assert_eq!(tl.clips[1].source_in_frame, 0);
     }
 }

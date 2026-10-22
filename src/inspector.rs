@@ -177,18 +177,24 @@ impl InspectorState {
                                     .spacing([8.0, 6.0])
                                     .show(ui, |ui| {
                                         ui.label(egui::RichText::new("Volume").size(11.0).color(ResolveColors::TEXT_MUTED));
-                                        ui.add(Slider::new(&mut clip.volume_db, -48.0..=12.0).suffix(" dB"));
-                                        if ui.button("⟲").clicked() {
+                                        let v_ch = ui.add(Slider::new(&mut clip.volume_db, -48.0..=12.0).suffix(" dB")).changed();
+                                        let v_rst = ui.button("⟲").clicked();
+                                        if v_rst {
                                             clip.volume_db = 0.0;
                                         }
                                         ui.end_row();
 
                                         ui.label(egui::RichText::new("Pan").size(11.0).color(ResolveColors::TEXT_MUTED));
-                                        ui.add(Slider::new(&mut clip.pan, -100.0..=100.0).suffix("%"));
-                                        if ui.button("⟲").clicked() {
+                                        let p_ch = ui.add(Slider::new(&mut clip.pan, -100.0..=100.0).suffix("%")).changed();
+                                        let p_rst = ui.button("⟲").clicked();
+                                        if p_rst {
                                             clip.pan = 0.0;
                                         }
                                         ui.end_row();
+
+                                        if v_ch || v_rst || p_ch || p_rst {
+                                            timeline.audio_dirty = true;
+                                        }
                                     });
                             });
                         }

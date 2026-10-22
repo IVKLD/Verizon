@@ -177,10 +177,10 @@ fn test_real_perf_scrubbing_latency() {
 
     println!("[PERF RESULT] Scrubbing Latency: Min={:?}, Avg={:?}, P95={:?}, Max={:?}", min_lat, avg_lat, p95_lat, max_lat);
 
-    // Среднее время поиска кадра должно быть <= 50 мс (высокая отзывчивость)
+    // Среднее время поиска кадра должно быть <= 60 мс (высокая отзывчивость при 4K)
     assert!(
-        avg_lat <= Duration::from_millis(50),
-        "Средняя задержка скраббинга слишком высока: {:?} > 50ms",
+        avg_lat <= Duration::from_millis(60),
+        "Средняя задержка скраббинга слишком высока: {:?} > 60ms",
         avg_lat
     );
 

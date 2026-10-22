@@ -437,9 +437,12 @@ impl NleApp {
                 }
             }
 
-            // Инструменты: A (Arrow), B (Blade)
+            // Инструменты: A (Arrow), T (Trim), B (Blade)
             if i.key_pressed(egui::Key::A) {
                 self.timeline.active_tool = Tool::Selection;
+            }
+            if i.key_pressed(egui::Key::T) {
+                self.timeline.active_tool = Tool::Trim;
             }
             if i.key_pressed(egui::Key::B) {
                 if i.modifiers.ctrl {
@@ -474,9 +477,14 @@ impl NleApp {
                 }
             }
 
-            // Delete selected clip
+            // Delete: Shift+Delete/Shift+Backspace = Ripple Delete (схлопывание пустоты)
+            // Обычный Delete/Backspace = Lift (удаление с сохранением зазора)
             if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
-                self.timeline.delete_selected_clip();
+                if i.modifiers.shift {
+                    self.timeline.ripple_delete_selected_clip();
+                } else {
+                    self.timeline.delete_selected_clip();
+                }
             }
 
             // Undo: Ctrl + Z
