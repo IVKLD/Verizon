@@ -1,24 +1,76 @@
+use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use crate::timeline::TimelineState;
 
-pub struct AudioSharedState {
-    pub samples: Vec<f32>,
-    pub sample_rate: u32,
-    pub channels: u16,
-    pub current_sample_pos: usize,
-    pub is_playing: bool,
-    pub volume: f32,
-    pub current_vu_l: f32,
-    pub current_vu_r: f32,
+/// Один звуковой сегмент на таймлайне (клип A-дорожки) в координатах interleaved-сэмплов (L,R,L,R...)
+pub struct MixSegment {
+    pub samples: Arc<Vec<f32>>,
+    /// Позиция начала сегмента на таймлайне (в interleaved-сэмплах, чётная)
+    pub start: usize,
+    /// Смещение внутри исходного PCM-потока (в interleaved-сэмплах, чётное)
+    pub in_off: usize,
+    /// Длина сегмента (в interleaved-сэмплах)
+    pub len: usize,
+    pub gain_l: f32,
+    pub gain_r: f32,
 }
+
+/// Иммутабельный снимок аудио-таймлайна. Публикуется через ArcSwap (lock-free, wait-free чтение).
+/// Пересборка стоит O(число клипов) — микросекунды, без копирования PCM.
+#[derive(Default)]
+pub struct MixSnapshot {
+    pub segments: Vec<MixSegment>,
+    pub total_len: usize,
+}
+
+impl MixSnapshot {
+    /// Микширует окно [pos, pos + out.len()) прямо в `out` (real-time safe: без аллокаций и блокировок)
+    pub fn mix_block(&self, pos: usize, out: &mut [f32]) {
+        out.fill(0.0);
+        let end = pos + out.len();
+        for seg in &self.segments {
+            let seg_end = seg.start + seg.len;
+            let lo = pos.max(seg.start);
+            let hi = end.min(seg_end);
+            if lo >= hi {
+                continue;
+            }
+            let src_base = seg.in_off + (lo - seg.start);
+            let dst = &mut out[lo - pos..hi - pos];
+            let pcm = &seg.samples;
+            for (k, d) in dst.iter_mut().enumerate() {
+                let src = src_base + k;
+                // Чётность относительно начала таймлайна: чётный индекс = L, нечётный = R
+                let gain = if (lo + k) & 1 == 0 { seg.gain_l } else { seg.gain_r };
+                if let Some(s) = pcm.get(src) {
+                    *d += *s * gain;
+                }
+            }
+        }
+        for s in out.iter_mut() {
+            *s = s.clamp(-1.0, 1.0);
+        }
+    }
+}
+
+/// Состояние аудио-движка, разделяемое между GUI-потоком и real-time коллбэком CPAL.
+/// Всё lock-free: ArcSwap для снимка таймлайна и атомики для транспорта.
+pub struct AudioEngineState {
+    pub snapshot: ArcSwap<MixSnapshot>,
+    pub pos: AtomicUsize,
+    pub is_playing: AtomicBool,
+    pub volume_bits: AtomicU32,
+}
+
+pub const AUDIO_RATE: u32 = 48000;
 
 pub struct AudioPlayer {
     pub current_path: Option<PathBuf>,
-    pub shared_state: Arc<Mutex<AudioSharedState>>,
+    pub engine: Arc<AudioEngineState>,
     pub vu_l_bits: Arc<AtomicU32>,
     pub vu_r_bits: Arc<AtomicU32>,
     pub is_loading: Arc<AtomicBool>,
@@ -32,25 +84,21 @@ pub struct AudioPlayer {
 
 impl AudioPlayer {
     pub fn new() -> Self {
-        let shared_state = Arc::new(Mutex::new(AudioSharedState {
-            samples: Vec::new(),
-            sample_rate: 48000,
-            channels: 2,
-            current_sample_pos: 0,
-            is_playing: false,
-            volume: 1.0,
-            current_vu_l: 0.0,
-            current_vu_r: 0.0,
-        }));
+        let engine = Arc::new(AudioEngineState {
+            snapshot: ArcSwap::from_pointee(MixSnapshot::default()),
+            pos: AtomicUsize::new(0),
+            is_playing: AtomicBool::new(false),
+            volume_bits: AtomicU32::new(1.0f32.to_bits()),
+        });
 
         let vu_l_bits = Arc::new(AtomicU32::new(0));
         let vu_r_bits = Arc::new(AtomicU32::new(0));
 
-        let stream = Self::init_cpal_stream(shared_state.clone(), vu_l_bits.clone(), vu_r_bits.clone());
+        let stream = Self::init_cpal_stream(engine.clone(), vu_l_bits.clone(), vu_r_bits.clone());
 
         Self {
             current_path: None,
-            shared_state,
+            engine,
             vu_l_bits,
             vu_r_bits,
             is_loading: Arc::new(AtomicBool::new(false)),
@@ -63,7 +111,7 @@ impl AudioPlayer {
     }
 
     fn init_cpal_stream(
-        shared: Arc<Mutex<AudioSharedState>>,
+        engine: Arc<AudioEngineState>,
         vu_l: Arc<AtomicU32>,
         vu_r: Arc<AtomicU32>,
     ) -> Option<cpal::Stream> {
@@ -82,28 +130,32 @@ impl AudioPlayer {
 
         let stream = match sample_format {
             cpal::SampleFormat::F32 => {
-                let shared_clone = shared.clone();
+                let engine_clone = engine.clone();
                 let vu_l_clone = vu_l.clone();
                 let vu_r_clone = vu_r.clone();
                 device.build_output_stream(
                     config.into(),
                     move |data: &mut [f32], _| {
-                        Self::write_audio_data(data, &shared_clone, &vu_l_clone, &vu_r_clone);
+                        Self::write_audio_data(data, &engine_clone, &vu_l_clone, &vu_r_clone);
                     },
                     err_fn,
                     None,
                 )
             }
             cpal::SampleFormat::I16 => {
-                let shared_clone = shared.clone();
+                let engine_clone = engine.clone();
                 let vu_l_clone = vu_l.clone();
                 let vu_r_clone = vu_r.clone();
+                // Буфер преобразования переиспользуется между вызовами коллбэка (без аллокаций в real-time)
+                let mut temp: Vec<f32> = Vec::new();
                 device.build_output_stream(
                     config.into(),
                     move |data: &mut [i16], _| {
-                        let mut temp = vec![0.0f32; data.len()];
-                        Self::write_audio_data(&mut temp, &shared_clone, &vu_l_clone, &vu_r_clone);
-                        for (dst, src) in data.iter_mut().zip(temp) {
+                        if temp.len() != data.len() {
+                            temp.resize(data.len(), 0.0);
+                        }
+                        Self::write_audio_data(&mut temp, &engine_clone, &vu_l_clone, &vu_r_clone);
+                        for (dst, src) in data.iter_mut().zip(temp.iter()) {
                             *dst = (src * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                         }
                     },
@@ -119,59 +171,50 @@ impl AudioPlayer {
         Some(stream)
     }
 
+    /// Real-time коллбэк: полностью lock-free (ArcSwap::load + атомики). Нет мьютексов, нет аллокаций.
     fn write_audio_data(
         output: &mut [f32],
-        shared: &Arc<Mutex<AudioSharedState>>,
+        engine: &Arc<AudioEngineState>,
         vu_l: &Arc<AtomicU32>,
         vu_r: &Arc<AtomicU32>,
     ) {
-        // try_lock устраняет priority inversion и задержки в реальном времени аудиопотока
-        if let Ok(mut state) = shared.try_lock() {
-            if !state.is_playing || state.samples.is_empty() {
-                output.fill(0.0);
-                vu_l.store(0, Ordering::Relaxed);
-                vu_r.store(0, Ordering::Relaxed);
-                return;
-            }
-
-            let volume = state.volume;
-            let total = state.samples.len();
-            let mut peak_l: f32 = 0.0;
-            let mut peak_r: f32 = 0.0;
-
-            for frame in output.chunks_mut(2) {
-                if state.current_sample_pos < total {
-                    let s_l = state.samples[state.current_sample_pos] * volume;
-                    frame[0] = s_l;
-                    if s_l.abs() > peak_l {
-                        peak_l = s_l.abs();
-                    }
-                    state.current_sample_pos += 1;
-                } else {
-                    frame[0] = 0.0;
-                }
-
-                if frame.len() > 1 {
-                    if state.current_sample_pos < total {
-                        let s_r = state.samples[state.current_sample_pos] * volume;
-                        frame[1] = s_r;
-                        if s_r.abs() > peak_r {
-                            peak_r = s_r.abs();
-                        }
-                        state.current_sample_pos += 1;
-                    } else {
-                        frame[1] = 0.0;
-                    }
-                }
-            }
-
-            vu_l.store(peak_l.to_bits(), Ordering::Relaxed);
-            vu_r.store(peak_r.to_bits(), Ordering::Relaxed);
-            state.current_vu_l = peak_l;
-            state.current_vu_r = peak_r;
-        } else {
+        if !engine.is_playing.load(Ordering::Acquire) {
             output.fill(0.0);
+            vu_l.store(0, Ordering::Relaxed);
+            vu_r.store(0, Ordering::Relaxed);
+            return;
         }
+
+        let snapshot = engine.snapshot.load();
+        let pos_raw = engine.pos.load(Ordering::Acquire);
+        let pos = pos_raw & !1;
+        snapshot.mix_block(pos, output);
+
+        let volume = f32::from_bits(engine.volume_bits.load(Ordering::Relaxed));
+        let mut peak_l: f32 = 0.0;
+        let mut peak_r: f32 = 0.0;
+        for (i, s) in output.iter_mut().enumerate() {
+            *s *= volume;
+            let a = s.abs();
+            if i & 1 == 0 {
+                if a > peak_l {
+                    peak_l = a;
+                }
+            } else if a > peak_r {
+                peak_r = a;
+            }
+        }
+
+        // CAS: если GUI-поток перемотал плейхед во время микширования — не затираем его seek
+        let _ = engine.pos.compare_exchange(
+            pos_raw,
+            pos + output.len(),
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+
+        vu_l.store(peak_l.to_bits(), Ordering::Relaxed);
+        vu_r.store(peak_r.to_bits(), Ordering::Relaxed);
     }
 
     /// Фоновый декодер первого аудиопотока через FFmpeg (обратная совместимость)
@@ -342,14 +385,14 @@ impl AudioPlayer {
         None
     }
 
-    /// Полная сборка и сведение мастер-аудиомикса таймлайна (Multi-Track Timeline Audio Mixer)
+    /// Мгновенная сборка снимка аудио-таймлайна (Multi-Track Mixer): O(число клипов), без копирования PCM.
+    /// Само микширование выполняется в real-time коллбэке только для текущего окна ~10 мс.
     /// Поддерживает неограниченное число аудиодорожек (A1, A2, A3...), Mute/Solo, громкость (volume_db), панораму (pan)
     pub fn rebuild_timeline_audio(&mut self, timeline: &TimelineState) {
-        let max_end_frame = timeline.clips.iter().map(|c| c.end_frame()).max().unwrap_or(0);
-        let total_samples = ((max_end_frame as f64 / timeline.fps.max(1) as f64) * 48000.0).round() as usize * 2;
-        let mut mixed = vec![0.0f32; total_samples.max(48000 * 2)];
-
+        let fps = timeline.fps.max(1) as f64;
         let has_solo = timeline.tracks.iter().any(|t| !t.is_video && t.is_solo);
+        let mut segments: Vec<MixSegment> = Vec::with_capacity(timeline.clips.len());
+        let mut total_len = 0usize;
 
         for c in &timeline.clips {
             if !c.is_audio {
@@ -380,44 +423,34 @@ impl AudioPlayer {
             let pan_l = ((1.0 - c.pan) / 2.0).clamp(0.0, 1.0);
             let pan_r = ((1.0 + c.pan) / 2.0).clamp(0.0, 1.0);
 
-            let start_sample = ((c.start_frame as f64 / timeline.fps.max(1) as f64) * 48000.0).round() as usize * 2;
-            let in_sample = (c.source_in_secs * 48000.0).round() as usize * 2;
-            let dur_samples = ((c.duration_frames as f64 / timeline.fps.max(1) as f64) * 48000.0).round() as usize * 2;
+            let start = ((c.start_frame.max(0) as f64 / fps) * AUDIO_RATE as f64).round() as usize * 2;
+            let in_off = (c.source_in_secs.max(0.0) * AUDIO_RATE as f64).round() as usize * 2;
+            let len = ((c.duration_frames.max(0) as f64 / fps) * AUDIO_RATE as f64).round() as usize * 2;
 
-            for i in (0..dur_samples).step_by(2) {
-                let src_l = in_sample + i;
-                let src_r = in_sample + i + 1;
-                let dst_l = start_sample + i;
-                let dst_r = start_sample + i + 1;
-
-                if dst_r >= mixed.len() {
-                    break;
-                }
-
-                let s_l = if src_l < clip_samples.len() { clip_samples[src_l] } else { 0.0 };
-                let s_r = if src_r < clip_samples.len() { clip_samples[src_r] } else { s_l };
-
-                mixed[dst_l] += s_l * vol_linear * pan_l;
-                mixed[dst_r] += s_r * vol_linear * pan_r;
-            }
+            total_len = total_len.max(start + len);
+            segments.push(MixSegment {
+                samples: clip_samples,
+                start,
+                in_off,
+                len,
+                gain_l: vol_linear * pan_l,
+                gain_r: vol_linear * pan_r,
+            });
         }
 
-        // Защитный мягкий лимитер для предотвращения клиппинга
-        for s in &mut mixed {
-            *s = s.clamp(-1.0, 1.0);
-        }
-
-        if let Ok(mut state) = self.shared_state.lock() {
-            state.samples = mixed;
-            state.sample_rate = 48000;
-            state.channels = 2;
-            state.is_playing = timeline.is_playing;
-            let target_sample = ((timeline.playhead_frame as f64 / timeline.fps.max(1) as f64) * 48000.0).round() as usize * 2;
-            state.current_sample_pos = target_sample.min(state.samples.len());
-        }
+        self.engine.snapshot.store(Arc::new(MixSnapshot { segments, total_len }));
     }
 
-    /// Загрузить аудио из медиафайла асинхронно через фоновый поток (для одиночного файла)
+    /// Офлайн-рендер окна мастер-микса (для тестов и экспорта): [start_sample, start_sample + len) interleaved
+    #[allow(dead_code)]
+    pub fn render_mix_window(&self, start_sample: usize, len: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; len];
+        self.engine.snapshot.load().mix_block(start_sample & !1, &mut out);
+        out
+    }
+
+    /// Загрузить аудио из медиафайла асинхронно через фоновый поток (прогрев кэша PCM).
+    /// Сведение выполняется снимком таймлайна, как только поток расшифрован (см. has_new_decoded_audio).
     pub fn load_audio_from_file(&mut self, path: &Path) -> Result<(), String> {
         if self.current_path.as_deref() == Some(path) {
             return Ok(());
@@ -427,7 +460,6 @@ impl AudioPlayer {
         self.is_loading.store(true, Ordering::SeqCst);
 
         let path_buf = path.to_path_buf();
-        let shared = self.shared_state.clone();
         let is_loading = self.is_loading.clone();
         let load_id = self.load_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let load_counter = self.load_counter.clone();
@@ -435,19 +467,9 @@ impl AudioPlayer {
 
         std::thread::spawn(move || {
             match Self::decode_audio_stream_worker(&path_buf, 0) {
-                Ok((samples, out_rate)) => {
-                    let arc_samples = Arc::new(samples);
+                Ok((samples, _out_rate)) => {
                     if let Ok(mut c) = cache.lock() {
-                        c.insert((path_buf.clone(), 0), arc_samples.clone());
-                    }
-
-                    if load_counter.load(Ordering::SeqCst) == load_id {
-                        if let Ok(mut state) = shared.lock() {
-                            state.samples = (*arc_samples).clone();
-                            state.sample_rate = out_rate;
-                            state.channels = 2;
-                            state.current_sample_pos = 0;
-                        }
+                        c.insert((path_buf.clone(), 0), Arc::new(samples));
                     }
                 }
                 Err(e) => {
@@ -462,33 +484,29 @@ impl AudioPlayer {
         Ok(())
     }
 
-    /// Синхронизация текущей позиции звука с плейхедом таймлайна без щелчков и заиканий
+    /// Синхронизация текущей позиции звука с плейхедом таймлайна без щелчков и заиканий (lock-free)
     pub fn sync_playhead(&self, current_time_seconds: Option<f64>, is_playing: bool) {
-        if self.is_loading.load(Ordering::SeqCst) {
-            return;
-        }
+        let engine = &self.engine;
+        let was_playing = engine.is_playing.swap(is_playing, Ordering::AcqRel);
 
-        if let Ok(mut state) = self.shared_state.lock() {
-            let was_playing = state.is_playing;
-            state.is_playing = is_playing;
-
-            if let Some(time_sec) = current_time_seconds {
-                let sample_rate = state.sample_rate as f64;
-                let target_sample = (time_sec * sample_rate * state.channels as f64).max(0.0) as usize;
-
-                if !was_playing && is_playing {
-                    state.current_sample_pos = target_sample.min(state.samples.len());
-                } else if !is_playing {
-                    state.current_sample_pos = target_sample.min(state.samples.len());
+        match current_time_seconds {
+            Some(time_sec) => {
+                let rate = AUDIO_RATE as f64;
+                let target_sample = ((time_sec.max(0.0) * rate).round() as usize) * 2;
+                if !was_playing || !is_playing {
+                    engine.pos.store(target_sample, Ordering::Release);
                 } else {
-                    let diff = (state.current_sample_pos as isize - target_sample as isize).abs();
-                    let threshold = (sample_rate * 0.10 * state.channels as f64) as isize;
+                    let cur = engine.pos.load(Ordering::Acquire);
+                    let diff = (cur as isize - target_sample as isize).abs();
+                    let threshold = (rate * 0.10 * 2.0) as isize;
                     if diff > threshold {
-                        state.current_sample_pos = target_sample.min(state.samples.len());
+                        engine.pos.store(target_sample, Ordering::Release);
                     }
                 }
-            } else {
-                state.current_sample_pos = state.samples.len();
+            }
+            None => {
+                let total = engine.snapshot.load().total_len;
+                engine.pos.store(total, Ordering::Release);
             }
         }
     }

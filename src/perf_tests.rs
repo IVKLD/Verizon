@@ -609,10 +609,8 @@ fn test_real_perf_multitrack_audio_mixer() {
     let initial_decode_latency = start_initial.elapsed();
     println!("  -> Initial multi-stream decode into cache: {:?}", initial_decode_latency);
 
-    let (master_samples, sample_count) = {
-        let state = audio_player.shared_state.lock().unwrap();
-        (state.samples.clone(), state.samples.len())
-    };
+    let master_samples = audio_player.render_mix_window(0, 48000 * 2 * 2);
+    let sample_count = master_samples.len();
 
     assert!(sample_count >= 48000 * 2 * 2, "Должно быть сведено не менее 2 секунд стереозвука");
 
@@ -628,7 +626,7 @@ fn test_real_perf_multitrack_audio_mixer() {
     let cached_mix_latency = start_cached_mix.elapsed();
     println!("  -> Cached interactive timeline mix latency: {:?}", cached_mix_latency);
 
-    let muted_a1_samples = audio_player.shared_state.lock().unwrap().samples.clone();
+    let muted_a1_samples = audio_player.render_mix_window(0, 48000 * 2 * 2);
     let energy_muted_a1: f32 = muted_a1_samples.iter().take(48000).map(|s| s.abs()).sum();
     println!("  -> Energy with A1 muted: {:.2}", energy_muted_a1);
     assert!(energy_muted_a1 > 0.0, "При заглушенном A1 дорожка A2 должна продолжать играть!");
@@ -685,3 +683,217 @@ fn test_davinci_jkl_shuttle_state_machine() {
     assert!(!timeline.is_playing);
 }
 
+
+/// Собирает таймлайн из реального файла: V1 + A1 + A2 на всю длительность медиа
+fn build_real_timeline(path: &PathBuf, audio_player: &AudioPlayer) -> TimelineState {
+    let mut timeline = TimelineState::new_empty();
+    timeline.fps = 60;
+    timeline.ensure_audio_track(2);
+    timeline.ensure_audio_track(3);
+    timeline.linked_selection = true;
+
+    // Прогреваем кэш аудиопотоков (в приложении это делает фоновый декодер)
+    let a1 = audio_player.ensure_audio_stream_cached_sync(path, 0).expect("audio 1");
+    audio_player.ensure_audio_stream_cached_sync(path, 1).expect("audio 2");
+    let dur_frames = ((a1.len() / 2) as f64 / 48000.0 * 60.0).round() as i64;
+
+    let mk = |id: u64, track: usize, is_audio: bool, stream: usize| Clip {
+        id,
+        name: format!("clip{}", id),
+        track_index: track,
+        start_frame: 0,
+        duration_frames: dur_frames,
+        is_audio,
+        color: egui::Color32::GRAY,
+        source_path: Some(path.clone()),
+        source_in_frame: 0,
+        source_in_secs: 0.0,
+        source_fps: 60.0,
+        link_group: Some(1),
+        zoom_x: 1.0,
+        zoom_y: 1.0,
+        position_x: 0.0,
+        position_y: 0.0,
+        rotation: 0.0,
+        opacity: 100.0,
+        volume_db: 0.0,
+        pan: 0.0,
+        source_audio_stream: stream,
+    };
+    timeline.clips.push(mk(1, 1, false, 0));
+    timeline.clips.push(mk(2, 2, true, 0));
+    timeline.clips.push(mk(3, 3, true, 1));
+    timeline.next_clip_id = 4;
+    timeline.next_link_id = 2;
+    timeline
+}
+
+/// 8. РЕАЛЬНЫЙ сценарий пользователя: Razor по длинному клипу, затем перетаскивание клипа мышью.
+/// Каждый кадр перетаскивания (144 Hz) = move_clip_to_track + пересборка аудио. Бюджет кадра: 6.9 мс.
+#[test]
+fn test_real_perf_razor_then_drag_clip_ui_budget() {
+    let Some(path) = get_test_file() else { return; };
+    let mut audio_player = AudioPlayer::new();
+    let mut timeline = build_real_timeline(&path, &audio_player);
+
+    println!("\n========================================================");
+    println!(" [PERF BENCHMARK] 8. RAZOR + DRAG CLIP (UI THREAD BUDGET)");
+    println!("========================================================");
+
+    // Razor: 12 разрезов по всей длине
+    let total = timeline.timeline_end_frame();
+    let t0 = Instant::now();
+    for i in 1..=12 {
+        let cut = total * i / 13;
+        let ids: Vec<u64> = timeline.clips.iter().filter(|c| cut > c.start_frame && cut < c.end_frame()).map(|c| c.id).collect();
+        for id in ids {
+            timeline.blade_cut_at(id, cut);
+        }
+    }
+    println!("  -> 12 blade cuts: {:?}, clips now: {}", t0.elapsed(), timeline.clips.len());
+    audio_player.rebuild_timeline_audio(&timeline);
+    timeline.audio_dirty = false;
+
+    // Перетаскиваем второй видеоклип (со связанными A1/A2) 240 «кадров мыши»
+    let drag_id = timeline.clips.iter().filter(|c| !c.is_audio).nth(1).unwrap().id;
+    let init = timeline.clips.iter().find(|c| c.id == drag_id).unwrap().start_frame;
+    let mut times: Vec<Duration> = Vec::new();
+    for step in 0..240 {
+        let t = Instant::now();
+        timeline.move_clip_to_track(drag_id, init + step * 7, Some(1));
+        if timeline.audio_dirty {
+            audio_player.rebuild_timeline_audio(&timeline);
+            timeline.audio_dirty = false;
+        }
+        times.push(t.elapsed());
+    }
+    times.sort();
+    let avg: Duration = times.iter().sum::<Duration>() / times.len() as u32;
+    let p95 = times[times.len() * 95 / 100];
+    let max = *times.last().unwrap();
+    println!("  -> Drag frame cost: avg={:?} p95={:?} max={:?}", avg, p95, max);
+    assert!(max < Duration::from_millis(4), "Кадр перетаскивания клипа съедает {:?} — UI зависает", max);
+    println!(">>> STATUS: [PASS] Перетаскивание после Razor укладывается в бюджет кадра!\n");
+}
+
+/// Прогоняет N кадров UI таймлайна через настоящий egui pipeline (layout + paint + tessellation)
+/// и возвращает время каждого кадра. Сценарий: быстрое движение курсора по таймлайну и скраб по линейке.
+fn bench_timeline_ui_frames(timeline: &mut TimelineState, wf: &crate::waveform::WaveformManager, frames: usize) -> Vec<Duration> {
+    let ctx = Context::default();
+    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 700.0));
+    let mut times = Vec::new();
+    for i in 0..frames {
+        // Быстрый зигзаг курсора: по линейке (y≈40) и по дорожкам (y≈120..300) с нажатой кнопкой на скраббинге
+        let x = 160.0 + ((i * 37) % 2300) as f32;
+        let on_ruler = (i / 60) % 2 == 0;
+        let y = if on_ruler { 70.0 } else { 120.0 + ((i * 11) % 180) as f32 };
+        let mut events = vec![egui::Event::PointerMoved(egui::pos2(x, y))];
+        if on_ruler {
+            events.push(egui::Event::PointerButton {
+                pos: egui::pos2(x, y),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            });
+        } else if i % 60 == 0 {
+            events.push(egui::Event::PointerButton {
+                pos: egui::pos2(x, y),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            });
+        }
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(i as f64 / 144.0),
+            events,
+            ..Default::default()
+        };
+        let t = Instant::now();
+        let out = ctx.run_ui(raw, |ui| {
+            crate::timeline_view::TimelineView::render(ui, timeline, wf);
+        });
+        let shape_count = out.shapes.len();
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        if i == 100 { let verts: usize = prims.iter().map(|p| match &p.primitive { egui::epaint::Primitive::Mesh(m) => m.vertices.len(), _ => 0 }).sum(); println!("     [probe] shapes={} vertices={}", shape_count, verts); }
+        std::hint::black_box(&prims);
+        if i >= 10 {
+            times.push(t.elapsed());
+        }
+    }
+    times
+}
+
+/// 9. РЕАЛЬНАЯ стоимость кадра UI таймлайна (CPU: layout + рисование волны + тесселяция) при быстром движении курсора.
+/// Бюджет 144 Hz = 6.9 мс. Выше — курсор «лагает».
+#[test]
+fn test_real_perf_timeline_ui_frame_cost_fast_cursor() {
+    let Some(path) = get_test_file() else { return; };
+    let audio_player = AudioPlayer::new();
+    let mut timeline = build_real_timeline(&path, &audio_player);
+
+    let wf = crate::waveform::WaveformManager::new();
+    wf.insert_waveform(&path, 0, crate::waveform::WaveformManager::extract_audio_peaks_stream(&path, 0).unwrap());
+    wf.insert_waveform(&path, 1, crate::waveform::WaveformManager::extract_audio_peaks_stream(&path, 1).unwrap());
+
+    println!("\n========================================================");
+    println!(" [PERF BENCHMARK] 9. TIMELINE UI FRAME COST (FAST CURSOR)");
+    println!("========================================================");
+
+    // Razor 12 раз -> 39 клипов
+    let total = timeline.timeline_end_frame();
+    for i in 1..=12 {
+        let cut = total * i / 13;
+        let ids: Vec<u64> = timeline.clips.iter().filter(|c| cut > c.start_frame && cut < c.end_frame()).map(|c| c.id).collect();
+        for id in ids {
+            timeline.blade_cut_at(id, cut);
+        }
+    }
+
+    for (label, zoom) in [("zoom-out (весь проект)", 0.07_f32), ("zoom-in (волна детально)", 3.0_f32)] {
+        timeline.zoom_factor = zoom;
+        timeline.scroll_x = 0.0;
+        let mut times = bench_timeline_ui_frames(&mut timeline, &wf, 600);
+        times.sort();
+        let avg: Duration = times.iter().sum::<Duration>() / times.len() as u32;
+        let p95 = times[times.len() * 95 / 100];
+        let max = *times.last().unwrap();
+        println!("  -> {:<26} avg={:?} p95={:?} max={:?}", label, avg, p95, max);
+        assert!(p95 < Duration::from_micros(6900), "UI таймлайна не укладывается в 144 Hz: p95={:?} ({})", p95, label);
+    }
+    println!(">>> STATUS: [PASS] Таймлайн держит 144 Hz при быстром движении курсора!\n");
+}
+
+/// 10. Корректность аудио после Razor и перемещения: звук непрерывен на склейке и следует за клипом
+#[test]
+fn test_real_audio_continuity_after_razor_and_move() {
+    let Some(path) = get_test_file() else { return; };
+    let mut audio_player = AudioPlayer::new();
+    let mut timeline = build_real_timeline(&path, &audio_player);
+    audio_player.rebuild_timeline_audio(&timeline);
+
+    // Окно 0.5 сек вокруг будущего разреза на 20-й секунде
+    let cut_frame = 20 * 60;
+    let cut_sample = 20 * 48000 * 2;
+    let win_start = cut_sample - 24000 * 2;
+    let before = audio_player.render_mix_window(win_start, 48000 * 2);
+    assert!(before.iter().map(|s| s.abs()).sum::<f32>() > 1.0, "в окне должен быть звук");
+
+    let ids: Vec<u64> = timeline.clips.iter().filter(|c| cut_frame > c.start_frame && cut_frame < c.end_frame()).map(|c| c.id).collect();
+    for id in ids {
+        timeline.blade_cut_at(id, cut_frame);
+    }
+    audio_player.rebuild_timeline_audio(&timeline);
+    let after = audio_player.render_mix_window(win_start, 48000 * 2);
+    assert_eq!(before, after, "Razor не должен менять звук: склейка обязана быть сэмпл-в-сэмпл непрерывной");
+
+    // Двигаем правую половину на 10 секунд вперёд: аудио должно уехать вместе с клипом
+    let right_video = timeline.clips.iter().find(|c| !c.is_audio && c.start_frame == cut_frame).unwrap().id;
+    timeline.snapping_enabled = false;
+    timeline.move_clip_to_track(right_video, cut_frame + 600, Some(1));
+    audio_player.rebuild_timeline_audio(&timeline);
+    let gap = audio_player.render_mix_window(cut_sample + 5 * 48000 * 2, 4800 * 2);
+    assert!(gap.iter().all(|s| *s == 0.0), "В образовавшейся паузе должна быть тишина");
+    let moved = audio_player.render_mix_window(cut_sample + 10 * 48000 * 2, 48000 * 2);
+    assert!(moved.iter().map(|s| s.abs()).sum::<f32>() > 1.0, "Звук должен переехать вместе с клипом");
+}

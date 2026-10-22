@@ -40,6 +40,11 @@ fn main() -> Result<(), eframe::Error> {
             .with_min_inner_size([1024.0, 600.0])
             .with_active(true)
             .with_transparent(false),
+        // Нативный Wayland + Vulkan: минимальная задержка present (1 кадр в очереди) вместо HIGH_THROUGHPUT (2 кадра)
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            surface: eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY,
+            ..Default::default()
+        },
         ..Default::default()
     };
 

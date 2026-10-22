@@ -893,7 +893,7 @@ impl VideoPlayer {
         rgba_frame: &mut ffmpeg_next::util::frame::Video,
         w: usize,
         h: usize,
-        rgba_buffer: &mut Vec<u8>,
+        _rgba_buffer: &mut Vec<u8>,
     ) -> Option<ColorImage> {
         let frame_to_scale = unsafe {
             let fmt = (*decoded_frame.as_ptr()).format;
@@ -930,32 +930,19 @@ impl VideoPlayer {
             let data = rgba_frame.data(0);
             let stride = rgba_frame.stride(0);
 
-            if rgba_buffer.len() != w * h * 4 {
-                rgba_buffer.resize(w * h * 4, 0);
-            }
-
-            if stride == w * 4 && data.len() >= w * h * 4 {
-                rgba_buffer[..w * h * 4].copy_from_slice(&data[..w * h * 4]);
+            // Безопасная однопроходная конвертация RGBA8 -> Color32 (один memcpy, без unsafe и без промежуточного клона)
+            let pixels: Vec<egui::Color32> = if stride == w * 4 && data.len() >= w * h * 4 {
+                bytemuck::pod_collect_to_vec::<u8, egui::Color32>(&data[..w * h * 4])
             } else {
+                let mut px: Vec<egui::Color32> = Vec::with_capacity(w * h);
                 for y in 0..h {
                     let src_start = y * stride;
-                    let dst_start = y * w * 4;
-                    if src_start + w * 4 <= data.len() {
-                        rgba_buffer[dst_start..dst_start + w * 4]
-                            .copy_from_slice(&data[src_start..src_start + w * 4]);
+                    if src_start + w * 4 > data.len() {
+                        return None;
                     }
+                    px.extend(bytemuck::pod_collect_to_vec::<u8, egui::Color32>(&data[src_start..src_start + w * 4]));
                 }
-            }
-
-            // Zero-copy прямое приведение RGBA буфера в Vec<Color32>
-            // Полностью устраняет 921,600 float-операций и повторных аллокаций на каждый кадр
-            let pixels: Vec<egui::Color32> = unsafe {
-                let mut v = rgba_buffer.clone();
-                let ptr = v.as_mut_ptr() as *mut egui::Color32;
-                let len = v.len() / 4;
-                let cap = v.capacity() / 4;
-                std::mem::forget(v);
-                Vec::from_raw_parts(ptr, len, cap)
+                px
             };
 
             Some(ColorImage { size: [w, h], source_size: egui::vec2(w as f32, h as f32), pixels })

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Default)]
 pub struct WaveformManager {
-    cache: Arc<Mutex<HashMap<(PathBuf, usize), Vec<f32>>>>,
+    cache: Arc<Mutex<HashMap<(PathBuf, usize), Arc<Vec<f32>>>>>,
     pending: Arc<Mutex<HashSet<(PathBuf, usize)>>>,
 }
 
@@ -17,14 +17,23 @@ impl WaveformManager {
     }
 
     /// Получить кэшированную волновую форму для конкретного аудиопотока
-    pub fn get_waveform_stream(&self, path: &Path, audio_track_index: usize) -> Option<Vec<f32>> {
+    /// Возвращает Arc: отрисовка клипа каждый кадр не копирует массив пиков (zero-copy)
+    pub fn get_waveform_stream(&self, path: &Path, audio_track_index: usize) -> Option<Arc<Vec<f32>>> {
         let key = (path.to_path_buf(), audio_track_index);
         self.cache.lock().ok()?.get(&key).cloned()
     }
 
+    /// Принудительно положить пики в кэш (тесты / предзагрузка)
+    #[allow(dead_code)]
+    pub fn insert_waveform(&self, path: &Path, audio_track_index: usize, peaks: Vec<f32>) {
+        if let Ok(mut c) = self.cache.lock() {
+            c.insert((path.to_path_buf(), audio_track_index), Arc::new(peaks));
+        }
+    }
+
     /// Получить кэшированную волновую форму (первая дорожка по умолчанию)
     #[allow(dead_code)]
-    pub fn get_waveform(&self, path: &Path) -> Option<Vec<f32>> {
+    pub fn get_waveform(&self, path: &Path) -> Option<Arc<Vec<f32>>> {
         self.get_waveform_stream(path, 0)
     }
 
@@ -61,7 +70,7 @@ impl WaveformManager {
 
             if let Ok(Ok(peaks)) = result {
                 if let Ok(mut c) = cache.lock() {
-                    c.insert(key.clone(), peaks);
+                    c.insert(key.clone(), Arc::new(peaks));
                 }
                 ctx.request_repaint();
             }
