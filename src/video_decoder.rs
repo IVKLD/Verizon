@@ -28,6 +28,7 @@ pub struct VideoPlayer {
     // Неблокирующие каналы общения с фоновым потоком декодера
     command_tx: Option<std::sync::mpsc::Sender<DecoderCommand>>,
     frame_rx: Option<std::sync::mpsc::Receiver<(i64, ColorImage)>>,
+    worker_handle: Option<std::thread::JoinHandle<()>>,
     pub frame_queue: VecDeque<(i64, ColorImage)>,
     pub is_playing_mode: bool,
 
@@ -48,9 +49,12 @@ pub struct VideoPlayer {
 
 impl Drop for VideoPlayer {
     fn drop(&mut self) {
-        // Завершаем фоновый рабочий поток декодирования при удалении плеера
+        // Корректно завершаем и дожидаемся фонового рабочего потока для мгновенного освобождения GPU VAAPI контекста
         self.command_tx = None;
         self.frame_rx = None;
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -71,6 +75,7 @@ impl VideoPlayer {
             gpu_device_name: "Vulkan (wgpu) + Multi-Threaded Engine".to_string(),
             command_tx: None,
             frame_rx: None,
+            worker_handle: None,
             frame_queue: VecDeque::new(),
             is_playing_mode: false,
             last_request_time: std::time::Instant::now(),
@@ -89,6 +94,9 @@ impl VideoPlayer {
         // Завершаем предыдущий фоновый воркер если был открыт другой файл
         self.command_tx = None;
         self.frame_rx = None;
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
         self.frame_queue.clear();
         self.is_playing_mode = false;
 
@@ -147,7 +155,7 @@ impl VideoPlayer {
         let egui_ctx = ctx.clone();
         let file_path = path.to_path_buf();
 
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             Self::run_decoder_worker(
                 file_path,
                 scaled_w,
@@ -158,6 +166,7 @@ impl VideoPlayer {
                 egui_ctx,
             );
         });
+        self.worker_handle = Some(handle);
 
         // Запрашиваем начальный 0-й кадр
         let _ = cmd_tx.send(DecoderCommand::Seek { target_frame: 0 });
@@ -352,6 +361,9 @@ impl VideoPlayer {
     /// Принудительный запрос кадра (когда скраббинг завершен)
     pub fn force_seek_frame(&mut self, target_frame: i64, ctx: &Context) {
         self.poll_frames(ctx);
+        if target_frame == self.last_decoded_frame && self.texture.is_some() {
+            return;
+        }
         if self.is_real_video {
             self.last_request_time = std::time::Instant::now();
             if let Some(tx) = &self.command_tx {
@@ -433,9 +445,9 @@ impl VideoPlayer {
             Err(_) => return,
         };
 
-        context_decoder.set_flags(ffmpeg_next::codec::flag::Flags::LOW_DELAY);
         unsafe {
             (*context_decoder.as_mut_ptr()).flags2 |= ffmpeg_next::ffi::AV_CODEC_FLAG2_FAST as i32;
+            (*context_decoder.as_mut_ptr()).thread_type = (ffmpeg_next::ffi::FF_THREAD_FRAME | ffmpeg_next::ffi::FF_THREAD_SLICE) as i32;
         }
 
         // Аппаратное ускорение на GPU (VAAPI для AMD Radeon RX 9070 XT)
@@ -457,23 +469,23 @@ impl VideoPlayer {
             }
         }
 
-        // Настройка многопоточного декодера для использования всех ядер процессора (Ryzen 9 9950X: 16 ядер / 32 потока)
-        let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(16)
-            .min(32);
-
-        context_decoder.set_threading(ffmpeg_next::codec::threading::Config {
-            kind: ffmpeg_next::codec::threading::Type::Frame,
-            count: num_threads,
-        });
-
         if !hw_device_ctx.is_null() {
             unsafe {
                 let c_ptr = context_decoder.as_mut_ptr();
                 (*c_ptr).hw_device_ctx = ffmpeg_next::ffi::av_buffer_ref(hw_device_ctx);
                 (*c_ptr).get_format = Some(get_vaapi_format);
             }
+        } else {
+            // Если аппаратный GPU VAAPI недоступен — используем многопоточный декодер CPU (все 32 потока)
+            let num_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(16)
+                .min(32);
+
+            context_decoder.set_threading(ffmpeg_next::codec::threading::Config {
+                kind: ffmpeg_next::codec::threading::Type::Frame,
+                count: num_threads,
+            });
         }
 
         let mut video_decoder = match context_decoder.decoder().video() {

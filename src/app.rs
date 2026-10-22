@@ -339,6 +339,10 @@ impl NleApp {
             if i.key_pressed(egui::Key::Space) {
                 self.timeline.is_playing = !self.timeline.is_playing;
                 self.timeline.playback_speed = 1.0;
+                if self.timeline.is_playing {
+                    self.timeline.frame_accumulator = 0.0;
+                    self.last_frame_time = std::time::Instant::now();
+                }
             }
 
             // Ctrl+I: Import Media
@@ -408,6 +412,8 @@ impl NleApp {
                 if !self.timeline.is_playing {
                     self.timeline.is_playing = true;
                     self.timeline.playback_speed = -1.0;
+                    self.timeline.frame_accumulator = 0.0;
+                    self.last_frame_time = std::time::Instant::now();
                 } else if self.timeline.playback_speed > 0.0 {
                     self.timeline.playback_speed = -1.0;
                 } else if self.timeline.playback_speed == -1.0 {
@@ -426,6 +432,8 @@ impl NleApp {
                 if !self.timeline.is_playing {
                     self.timeline.is_playing = true;
                     self.timeline.playback_speed = 1.0;
+                    self.timeline.frame_accumulator = 0.0;
+                    self.last_frame_time = std::time::Instant::now();
                 } else if self.timeline.playback_speed < 0.0 {
                     self.timeline.playback_speed = 1.0;
                 } else if self.timeline.playback_speed == 1.0 {
@@ -564,6 +572,10 @@ impl NleApp {
                         let play_str = if self.timeline.is_playing { "⏸ Pause [Space]" } else { "▶ Play [Space]" };
                         if ui.button(play_str).clicked() {
                             self.timeline.is_playing = !self.timeline.is_playing;
+                            if self.timeline.is_playing {
+                                self.timeline.frame_accumulator = 0.0;
+                                self.last_frame_time = std::time::Instant::now();
+                            }
                             ui.close();
                         }
                         if ui.button("[ I ] Mark In").clicked() {

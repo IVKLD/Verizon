@@ -587,6 +587,7 @@ impl ViewerState {
             if ui.button(egui::RichText::new("⏪").size(13.0)).on_hover_text("Shuttle Reverse [J]").clicked() {
                 timeline.playback_speed = -2.0;
                 timeline.is_playing = true;
+                timeline.frame_accumulator = 0.0;
             }
 
             // Step Back 1 Frame (Left Arrow)
@@ -605,6 +606,9 @@ impl ViewerState {
             if ui.add(play_btn).on_hover_text("Play / Pause [Space]").clicked() {
                 timeline.is_playing = !timeline.is_playing;
                 timeline.playback_speed = 1.0;
+                if timeline.is_playing {
+                    timeline.frame_accumulator = 0.0;
+                }
             }
 
             // Step Forward 1 Frame (Right Arrow)
@@ -617,6 +621,7 @@ impl ViewerState {
             if ui.button(egui::RichText::new("⏩").size(13.0)).on_hover_text("Shuttle Forward [L]").clicked() {
                 timeline.playback_speed = 2.0;
                 timeline.is_playing = true;
+                timeline.frame_accumulator = 0.0;
             }
 
             // In / Out Buttons
