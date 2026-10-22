@@ -1,5 +1,6 @@
 use egui::{Context, Id, Margin, Panel, Stroke, Ui, WidgetText};
 use egui_dock::{DockArea, DockState, NodeIndex, Style as DockStyle, TabViewer};
+use std::path::PathBuf;
 
 use crate::audio_player::AudioPlayer;
 use crate::inspector::InspectorState;
@@ -224,22 +225,67 @@ impl NleApp {
         self.save_dock_layout();
     }
 
+    fn decode_uri_path(raw: &str) -> Option<PathBuf> {
+        let clean = raw.trim().trim_start_matches("file://");
+        let decoded = Self::percent_decode(clean);
+        let p_dec = PathBuf::from(&decoded);
+        if p_dec.exists() {
+            return Some(p_dec);
+        }
+        let p_raw = PathBuf::from(clean);
+        if p_raw.exists() {
+            return Some(p_raw);
+        }
+        None
+    }
+
+    fn percent_decode(input: &str) -> String {
+        let mut bytes = Vec::new();
+        let mut chars = input.bytes();
+        while let Some(b) = chars.next() {
+            if b == b'%' {
+                if let (Some(h1), Some(h2)) = (chars.next(), chars.next()) {
+                    if let Ok(val) = u8::from_str_radix(std::str::from_utf8(&[h1, h2]).unwrap_or(""), 16) {
+                        bytes.push(val);
+                        continue;
+                    }
+                }
+            }
+            bytes.push(b);
+        }
+        String::from_utf8(bytes).unwrap_or_else(|_| input.to_string())
+    }
+
     fn handle_drag_and_drop(&mut self, ctx: &Context) {
         // 1. Прямой сброс файлов из файлового менеджера Nautilus (Drag & Drop)
         let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
         if !dropped_files.is_empty() {
             let mut total_imported = 0;
             for file in dropped_files {
-                let path = file.path();
-                let count = self.media_pool.import_path(path);
-                total_imported += count;
+                let p = file.path();
+                let maybe_path = if !p.as_os_str().is_empty() && p.exists() {
+                    Some(p.to_path_buf())
+                } else if let Ok(bytes) = file.bytes() {
+                    if let Ok(text) = std::str::from_utf8(&bytes) {
+                        Self::decode_uri_path(text)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
-                // СРАЗУ ПОМЕЩАЕМ СБРОШЕННЫЙ ФАЙЛ НА ДОРОЖКУ ТАЙМЛАЙНА!
-                self.media_pool.insert_selected_to_timeline(&mut self.timeline);
+                if let Some(path) = maybe_path {
+                    let count = self.media_pool.import_path(&path);
+                    total_imported += count;
 
-                if MediaPoolState::is_media_file(path) {
-                    let _ = self.video_player.open_file(path, ctx);
-                    let _ = self.audio_player.load_audio_from_file(path);
+                    // СРАЗУ ПОМЕЩАЕМ СБРОШЕННЫЙ ФАЙЛ НА ДОРОЖКУ ТАЙМЛАЙНА!
+                    self.media_pool.insert_selected_to_timeline(&mut self.timeline);
+
+                    if MediaPoolState::is_media_file(&path) {
+                        let _ = self.video_player.open_file(&path, ctx);
+                        let _ = self.audio_player.load_audio_from_file(&path);
+                    }
                 }
             }
             if total_imported > 0 {
@@ -250,19 +296,21 @@ impl NleApp {
             }
         }
 
-        // 2. Вставка из буфера обмена (Ctrl+V) файлов, скопированных в Nautilus
+        // 2. Вставка из буфера обмена (Ctrl+V) файлов, скопированных в Nautilus / Dolphin
         for event in &ctx.input(|i| i.events.clone()) {
             if let egui::Event::Paste(text) = event {
                 for line in text.lines() {
-                    let clean = line.trim().trim_start_matches("file://");
-                    let path = std::path::Path::new(clean);
-                    if path.exists() {
-                        let count = self.media_pool.import_path(path);
+                    let line = line.trim();
+                    if line.starts_with('#') || line.is_empty() {
+                        continue;
+                    }
+                    if let Some(path) = Self::decode_uri_path(line) {
+                        let count = self.media_pool.import_path(&path);
                         if count > 0 {
                             self.media_pool.insert_selected_to_timeline(&mut self.timeline);
-                            if MediaPoolState::is_media_file(path) {
-                                let _ = self.video_player.open_file(path, ctx);
-                                let _ = self.audio_player.load_audio_from_file(path);
+                            if MediaPoolState::is_media_file(&path) {
+                                let _ = self.video_player.open_file(&path, ctx);
+                                let _ = self.audio_player.load_audio_from_file(&path);
                             }
                             self.notification = Some((
                                 format!("✅ Вставлен клип на дорожку (Ctrl+V): {}", path.file_name().and_then(|n| n.to_str()).unwrap_or("")),
@@ -750,5 +798,20 @@ impl eframe::App for NleApp {
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {
         self.save_preferences();
         self.save_dock_layout();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_uri_path_with_spaces() {
+        let uri = "file:///mnt/kdenlive-cache/epic-movie/Replay%202026-10-13%2021-12-56.mkv";
+        let path = NleApp::decode_uri_path(uri);
+        assert!(path.is_some(), "URI with %20 must decode to valid path");
+        let p = path.unwrap();
+        assert_eq!(p.to_str().unwrap(), "/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
+        assert!(p.exists(), "Target file on disk must exist");
     }
 }

@@ -306,8 +306,14 @@ impl VideoPlayer {
             let pts_delta = target_pts - current_pts;
 
             if current_pts < 0 || pts_delta < -tolerance || pts_delta > one_sec_pts {
-                let av_timestamp = (target_frame as f64 / fps * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
-                let _ = ictx.seek(av_timestamp, ..av_timestamp);
+                unsafe {
+                    ffmpeg_next::ffi::av_seek_frame(
+                        ictx.as_mut_ptr(),
+                        stream_idx as i32,
+                        target_pts,
+                        ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
+                    );
+                }
                 let _ = video_decoder.flush();
                 current_pts = -1;
             }
