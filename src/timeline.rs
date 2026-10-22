@@ -575,4 +575,41 @@ mod tests {
         assert_eq!(tl.clips[0].start_frame, 30);
         assert_eq!(tl.clips[1].start_frame, 30);
     }
+
+    #[test]
+    fn test_blade_cut_does_not_modify_playhead() {
+        let mut tl = TimelineState::new_empty();
+        tl.fps = 24;
+        tl.playhead_frame = 50;
+
+        tl.clips.push(Clip {
+            id: 1,
+            name: "Clip".to_string(),
+            track_index: 1,
+            start_frame: 0,
+            duration_frames: 100,
+            is_audio: false,
+            color: Color32::BLUE,
+            source_path: None,
+            source_in_frame: 0,
+            source_in_secs: 0.0,
+            source_fps: 24.0,
+            link_group: None,
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            position_x: 0.0,
+            position_y: 0.0,
+            rotation: 0.0,
+            opacity: 100.0,
+            volume_db: 0.0,
+            pan: 0.0,
+        });
+
+        // Режем на кадре 25
+        assert!(tl.blade_cut_at(1, 25));
+
+        // Плейхед должен остаться строго на кадре 50!
+        assert_eq!(tl.playhead_frame, 50);
+        assert_eq!(tl.clips.len(), 2);
+    }
 }

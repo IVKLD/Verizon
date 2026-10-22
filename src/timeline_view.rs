@@ -105,7 +105,6 @@ impl TimelineView {
         // 5. Отрисовка и высокоточная интерактивность клипов на дорожках
         let mut hovered_clip_id = None;
         let mut clicked_clip_id = None;
-        let mut cut_request = None;
         let mut start_drag_request = None;
 
         for clip in &timeline.clips {
@@ -140,45 +139,26 @@ impl TimelineView {
 
             Self::draw_clip(&painter, clip_rect, clip, is_selected, timeline, waveform_mgr, ui.ctx());
 
-            // Четкая регистрация клика и перетаскивания клипа
-            let clip_resp = ui.interact(
-                clip_rect,
-                ui.id().with(format!("clip_{}", clip.id)),
-                egui::Sense::click_and_drag(),
-            );
+            // Интерактивность клипа зависит от активного инструмента
+            if timeline.active_tool == Tool::Selection {
+                let clip_resp = ui.interact(
+                    clip_rect,
+                    ui.id().with(format!("clip_{}", clip.id)),
+                    egui::Sense::click_and_drag(),
+                );
 
-            if clip_resp.hovered() {
-                hovered_clip_id = Some(clip.id);
-            }
+                if clip_resp.hovered() {
+                    hovered_clip_id = Some(clip.id);
+                }
 
-            if clip_resp.clicked() {
-                if timeline.active_tool == Tool::Blade {
-                    if let Some(m_pos) = mouse_pos {
-                        let rel_frame = ((m_pos.x - canvas_rect.min.x + timeline.scroll_x) / timeline.zoom_factor).round() as i64;
-                        cut_request = Some((clip.id, rel_frame));
-                    }
-                } else {
+                if clip_resp.clicked() {
                     clicked_clip_id = Some(clip.id);
                 }
-            }
 
-            // Инициализация перетаскивания клипа при зажатии ЛКМ
-            if timeline.active_tool == Tool::Selection {
+                // Инициализация перетаскивания клипа при зажатии ЛКМ
                 if clip_resp.drag_started() || (clip_resp.dragged() && timeline.moving_clip.is_none()) {
                     if let Some(m_pos) = mouse_pos {
                         start_drag_request = Some((clip.id, m_pos.x, clip.start_frame));
-                    }
-                }
-            }
-
-            // Лезвие (Blade) hover линия
-            if timeline.active_tool == Tool::Blade {
-                if let Some(m_pos) = mouse_pos {
-                    if clip_rect.contains(m_pos) {
-                        painter.line_segment(
-                            [pos2(m_pos.x, clip_rect.min.y), pos2(m_pos.x, clip_rect.max.y)],
-                            Stroke::new(2.0, Color32::from_rgb(0xff, 0x44, 0x44)),
-                        );
                     }
                 }
             }
@@ -202,15 +182,71 @@ impl TimelineView {
             }
         }
 
-        // Клик по пустой области дорожек (где нет клипов) — перемещение плейхеда
-        if timeline.moving_clip.is_none() && hovered_clip_id.is_none() && timeline.dragged_media.is_none() {
+        // РЕЖИМ 1: Инструмент Blade (Лезвие / Razor) — нарезка клипов БЕЗ перемещения таймлайна
+        if timeline.active_tool == Tool::Blade {
+            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Crosshair);
+
+            if let Some(m_pos) = mouse_pos {
+                if tracks_canvas_rect.contains(m_pos) {
+                    let mut cut_x = m_pos.x;
+                    let rel_x = m_pos.x - canvas_rect.min.x + timeline.scroll_x;
+                    let mut cut_frame = (rel_x / timeline.zoom_factor).round() as i64;
+
+                    // Магнитное прилипание лезвия к плейхеду и границам клипов
+                    if timeline.snapping_enabled {
+                        let snap_thresh = (12.0 / timeline.zoom_factor).max(2.0) as i64;
+                        if (cut_frame - timeline.playhead_frame).abs() <= snap_thresh {
+                            cut_frame = timeline.playhead_frame;
+                            cut_x = canvas_rect.min.x + (cut_frame as f32 * timeline.zoom_factor) - timeline.scroll_x;
+                        } else {
+                            for clip in &timeline.clips {
+                                if (cut_frame - clip.start_frame).abs() <= snap_thresh {
+                                    cut_frame = clip.start_frame;
+                                    cut_x = canvas_rect.min.x + (cut_frame as f32 * timeline.zoom_factor) - timeline.scroll_x;
+                                    break;
+                                }
+                                if (cut_frame - clip.end_frame()).abs() <= snap_thresh {
+                                    cut_frame = clip.end_frame();
+                                    cut_x = canvas_rect.min.x + (cut_frame as f32 * timeline.zoom_factor) - timeline.scroll_x;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Красная вертикальная линия лезвия через всю высоту дорожек
+                    painter.line_segment(
+                        [pos2(cut_x, tracks_canvas_rect.min.y), pos2(cut_x, tracks_canvas_rect.max.y)],
+                        Stroke::new(2.0, Color32::from_rgb(0xff, 0x3b, 0x30)),
+                    );
+
+                    // Регистрация клика лезвия по дорожкам: режем клипы, НЕ трогая плейхед и таймлайн!
+                    let blade_sense = ui.interact(tracks_canvas_rect, ui.id().with("blade_canvas_interact"), egui::Sense::click());
+                    if blade_sense.clicked() || (tracks_canvas_rect.contains(m_pos) && ui.input(|i| i.pointer.primary_clicked())) {
+                        let target_ids: Vec<u64> = timeline
+                            .clips
+                            .iter()
+                            .filter(|c| cut_frame > c.start_frame && cut_frame < c.end_frame())
+                            .map(|c| c.id)
+                            .collect();
+
+                        for id in target_ids {
+                            timeline.blade_cut_at(id, cut_frame);
+                        }
+                    }
+                }
+            }
+        }
+
+        // РЕЖИМ 2: Инструмент Selection (Стрелка) — клик по пустой области перемещает плейхед
+        if timeline.active_tool == Tool::Selection && timeline.moving_clip.is_none() && hovered_clip_id.is_none() && timeline.dragged_media.is_none() {
             let canvas_sense = ui.interact(tracks_canvas_rect, ui.id().with("empty_tracks_canvas"), egui::Sense::click_and_drag());
             if canvas_sense.clicked() || canvas_sense.dragged() {
                 if let Some(m_pos) = mouse_pos {
                     let rel_x = m_pos.x - canvas_rect.min.x + timeline.scroll_x;
                     let target_frame = (rel_x / timeline.zoom_factor).max(0.0) as i64;
                     timeline.playhead_frame = target_frame;
-                    if canvas_sense.clicked() && timeline.active_tool != Tool::Blade {
+                    if canvas_sense.clicked() {
                         timeline.selected_clip_id = None;
                     }
                 }
@@ -220,9 +256,6 @@ impl TimelineView {
         // Применение действий с клипами
         if let Some(id) = clicked_clip_id {
             timeline.selected_clip_id = Some(id);
-        }
-        if let Some((id, cut_frame)) = cut_request {
-            timeline.blade_cut_at(id, cut_frame);
         }
 
         // 6. ОБРАБОТКА И ОТРИСОВКА ПЕРЕТАСКИВАНИЯ НА ДОРОЖКУ (DRAG & DROP ONTO TRACK)
