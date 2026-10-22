@@ -1,5 +1,6 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub struct AudioSharedState {
@@ -16,6 +17,8 @@ pub struct AudioSharedState {
 pub struct AudioPlayer {
     pub current_path: Option<PathBuf>,
     pub shared_state: Arc<Mutex<AudioSharedState>>,
+    pub is_loading: Arc<AtomicBool>,
+    load_counter: Arc<AtomicU64>,
     _stream: Option<cpal::Stream>,
 }
 
@@ -37,6 +40,8 @@ impl AudioPlayer {
         Self {
             current_path: None,
             shared_state,
+            is_loading: Arc::new(AtomicBool::new(false)),
+            load_counter: Arc::new(AtomicU64::new(0)),
             _stream: stream,
         }
     }
@@ -131,12 +136,8 @@ impl AudioPlayer {
         }
     }
 
-    /// Загрузить аудио из медиафайла через FFmpeg
-    pub fn load_audio_from_file(&mut self, path: &Path) -> Result<(), String> {
-        if self.current_path.as_deref() == Some(path) {
-            return Ok(());
-        }
-
+    /// Фоновый декодер аудиофайла через FFmpeg
+    fn decode_audio_worker(path: &Path) -> Result<(Vec<f32>, u32), String> {
         let mut ictx = ffmpeg_next::format::input(path).map_err(|e| e.to_string())?;
 
         let audio_stream = ictx
@@ -190,19 +191,75 @@ impl AudioPlayer {
             }
         }
 
-        if let Ok(mut state) = self.shared_state.lock() {
-            state.samples = all_samples;
-            state.sample_rate = out_rate;
-            state.channels = 2;
-            state.current_sample_pos = 0;
+        if audio_decoder.send_eof().is_ok() {
+            while audio_decoder.receive_frame(&mut decoded_frame).is_ok() {
+                if resampler.run(&decoded_frame, &mut resampled_frame).is_ok() {
+                    let samples_count = resampled_frame.samples() * 2;
+                    let data: &[f32] = unsafe {
+                        std::slice::from_raw_parts(
+                            resampled_frame.data(0).as_ptr() as *const f32,
+                            samples_count,
+                        )
+                    };
+                    all_samples.extend_from_slice(data);
+                }
+            }
+        }
+
+        Ok((all_samples, out_rate))
+    }
+
+    /// Загрузить аудио из медиафайла асинхронно через фоновый поток без блокировки UI
+    pub fn load_audio_from_file(&mut self, path: &Path) -> Result<(), String> {
+        if self.current_path.as_deref() == Some(path) {
+            return Ok(());
         }
 
         self.current_path = Some(path.to_path_buf());
+        self.is_loading.store(true, Ordering::SeqCst);
+
+        // Сбрасываем старые семплы перед асинхронной загрузкой нового файла
+        if let Ok(mut state) = self.shared_state.lock() {
+            state.samples.clear();
+            state.current_sample_pos = 0;
+        }
+
+        let path_buf = path.to_path_buf();
+        let shared = self.shared_state.clone();
+        let is_loading = self.is_loading.clone();
+        let load_id = self.load_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let load_counter = self.load_counter.clone();
+
+        std::thread::spawn(move || {
+            match Self::decode_audio_worker(&path_buf) {
+                Ok((samples, out_rate)) => {
+                    if load_counter.load(Ordering::SeqCst) == load_id {
+                        if let Ok(mut state) = shared.lock() {
+                            state.samples = samples;
+                            state.sample_rate = out_rate;
+                            state.channels = 2;
+                            state.current_sample_pos = 0;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Background audio decode error: {}", e);
+                }
+            }
+            if load_counter.load(Ordering::SeqCst) == load_id {
+                is_loading.store(false, Ordering::SeqCst);
+            }
+        });
+
         Ok(())
     }
 
     /// Синхронизация текущей позиции звука с плейхедом таймлайна без щелчков и заиканий
     pub fn sync_playhead(&self, current_time_seconds: Option<f64>, is_playing: bool) {
+        if self.is_loading.load(Ordering::SeqCst) {
+            return;
+        }
+
         if let Ok(mut state) = self.shared_state.lock() {
             let was_playing = state.is_playing;
             state.is_playing = is_playing;

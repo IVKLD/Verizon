@@ -381,43 +381,76 @@ impl TimelineView {
 
     fn draw_ruler(painter: &egui::Painter, rect: Rect, timeline: &TimelineState) {
         painter.rect_filled(rect, CornerRadius::ZERO, Color32::from_rgb(0x1a, 0x1b, 0x1e));
-        painter.line_segment([pos2(rect.min.x, rect.max.y), pos2(rect.max.x, rect.max.y)], Stroke::new(1.0, ResolveColors::BORDER));
+        painter.line_segment(
+            [pos2(rect.min.x, rect.max.y), pos2(rect.max.x, rect.max.y)],
+            Stroke::new(1.0, ResolveColors::BORDER),
+        );
 
         let frames_per_sec = timeline.fps as f32;
         let sec_width = frames_per_sec * timeline.zoom_factor;
 
-        let start_sec = (timeline.scroll_x / sec_width).floor() as i64;
-        let end_sec = ((timeline.scroll_x + rect.width()) / sec_width).ceil() as i64;
+        // Адаптивный шаг меток: расстояние между таймкодами всегда >= 80px, никакого наложения и мыла
+        let min_spacing = 80.0;
+        let step_seconds = if sec_width >= min_spacing {
+            1
+        } else if sec_width * 2.0 >= min_spacing {
+            2
+        } else if sec_width * 5.0 >= min_spacing {
+            5
+        } else if sec_width * 10.0 >= min_spacing {
+            10
+        } else if sec_width * 30.0 >= min_spacing {
+            30
+        } else if sec_width * 60.0 >= min_spacing {
+            60
+        } else if sec_width * 300.0 >= min_spacing {
+            300
+        } else {
+            600
+        };
 
-        for s in start_sec..=end_sec {
-            let x = rect.min.x + (s as f32 * sec_width) - timeline.scroll_x;
-            if x < rect.min.x || x > rect.max.x {
-                continue;
+        let start_sec = ((timeline.scroll_x / sec_width).floor() as i64 / step_seconds).max(0) * step_seconds;
+        let end_sec = (((timeline.scroll_x + rect.width()) / sec_width).ceil() as i64 / step_seconds + 1) * step_seconds;
+
+        let mut s = start_sec;
+        while s <= end_sec {
+            let raw_x = rect.min.x + (s as f32 * sec_width) - timeline.scroll_x;
+            let x = raw_x.round(); // Целочисленная привязка к пикселям (Pixel-Perfect) устраняет размытие
+
+            if x >= rect.min.x && x <= rect.max.x {
+                // Большая засечка секунды
+                painter.line_segment(
+                    [pos2(x, rect.max.y - 10.0), pos2(x, rect.max.y)],
+                    Stroke::new(1.0, ResolveColors::BORDER_LIGHT),
+                );
+
+                // Четкий контрастный таймкод
+                let tc = Timecode::from_seconds(s as f64, timeline.fps).to_smpte();
+                painter.text(
+                    pos2(x + 4.0, (rect.min.y + 4.0).round()),
+                    egui::Align2::LEFT_TOP,
+                    tc,
+                    egui::FontId::monospace(10.0),
+                    ResolveColors::TEXT_PRIMARY,
+                );
             }
 
-            // Большая засечка секунды
-            painter.line_segment([pos2(x, rect.max.y - 12.0), pos2(x, rect.max.y)], Stroke::new(1.0, ResolveColors::BORDER_LIGHT));
-
-            // Таймкод текст
-            let tc = Timecode::from_seconds(s as f64, timeline.fps).to_smpte();
-            painter.text(
-                pos2(x + 4.0, rect.min.y + 4.0),
-                egui::Align2::LEFT_TOP,
-                tc,
-                egui::FontId::monospace(9.0),
-                ResolveColors::TEXT_MUTED,
-            );
-
-            // Мелкие засечки кадров
-            if sec_width > 40.0 {
-                let sub_ticks = 4;
-                for sub in 1..sub_ticks {
-                    let sub_x = x + (sub as f32 * sec_width / sub_ticks as f32);
+            // Промежуточные мелкие засечки
+            let sub_count = if step_seconds == 1 { 4 } else { 5 };
+            let sub_step_px = (step_seconds as f32 * sec_width) / sub_count as f32;
+            if sub_step_px >= 8.0 {
+                for sub in 1..sub_count {
+                    let sub_x = (raw_x + sub as f32 * sub_step_px).round();
                     if sub_x >= rect.min.x && sub_x <= rect.max.x {
-                        painter.line_segment([pos2(sub_x, rect.max.y - 6.0), pos2(sub_x, rect.max.y)], Stroke::new(1.0, ResolveColors::BORDER));
+                        painter.line_segment(
+                            [pos2(sub_x, rect.max.y - 5.0), pos2(sub_x, rect.max.y)],
+                            Stroke::new(1.0, ResolveColors::BORDER),
+                        );
                     }
                 }
             }
+
+            s += step_seconds;
         }
     }
 

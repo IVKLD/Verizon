@@ -56,8 +56,20 @@ impl VideoPlayer {
 
         let stream_idx = input_stream.index();
         let time_base = input_stream.time_base();
-        let context_decoder = ffmpeg_next::codec::context::Context::from_parameters(input_stream.parameters())
+        let mut context_decoder = ffmpeg_next::codec::context::Context::from_parameters(input_stream.parameters())
             .map_err(|e| e.to_string())?;
+
+        // Включение многопоточного декодирования (Multi-threaded 4K Decoding) на всех ядрах CPU
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+            .min(16);
+
+        context_decoder.set_threading(ffmpeg_next::codec::threading::Config {
+            kind: ffmpeg_next::codec::threading::Type::Frame,
+            count: num_threads,
+        });
+
         let video_decoder = context_decoder.decoder().video().map_err(|e| e.to_string())?;
 
         let width = video_decoder.width();
