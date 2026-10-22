@@ -84,16 +84,20 @@ impl ViewerState {
                 let time_secs = offset as f64 / timeline.fps as f64;
                 let total_source_secs = clip.source_in_secs + time_secs;
                 let source_frame = (total_source_secs * clip.source_fps).round() as i64;
-                if ui.input(|i| i.pointer.any_released()) {
+                if timeline.is_playing {
+                    video_player.update_playback(source_frame, true, ctx);
+                } else if ui.input(|i| i.pointer.any_released()) {
                     video_player.force_seek_frame(source_frame, ctx);
                 } else {
-                    video_player.seek_and_decode(source_frame, ctx);
+                    video_player.update_playback(source_frame, false, ctx);
                 }
             } else {
-                if ui.input(|i| i.pointer.any_released()) {
+                if timeline.is_playing {
+                    video_player.update_playback(timeline.playhead_frame, true, ctx);
+                } else if ui.input(|i| i.pointer.any_released()) {
                     video_player.force_seek_frame(timeline.playhead_frame, ctx);
                 } else {
-                    video_player.seek_and_decode(timeline.playhead_frame, ctx);
+                    video_player.update_playback(timeline.playhead_frame, false, ctx);
                 }
             }
         } else {
