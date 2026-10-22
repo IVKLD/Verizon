@@ -137,7 +137,7 @@ impl AudioPlayer {
     }
 
     /// Фоновый декодер аудиофайла через FFmpeg
-    fn decode_audio_worker(path: &Path) -> Result<(Vec<f32>, u32), String> {
+    pub fn decode_audio_worker(path: &Path) -> Result<(Vec<f32>, u32), String> {
         let mut ictx = ffmpeg_next::format::input(path).map_err(|e| e.to_string())?;
 
         let audio_stream = ictx

@@ -46,6 +46,14 @@ pub struct VideoPlayer {
     pub rendered_frames_in_sample: u32,
 }
 
+impl Drop for VideoPlayer {
+    fn drop(&mut self) {
+        // Завершаем фоновый рабочий поток декодирования при удалении плеера
+        self.command_tx = None;
+        self.frame_rx = None;
+    }
+}
+
 impl VideoPlayer {
     pub fn new() -> Self {
         let _ = ffmpeg_next::init();
@@ -115,6 +123,11 @@ impl VideoPlayer {
         } else {
             (orig_w, orig_h)
         };
+
+        // Сбрасываем и корректно завершаем предыдущий фоновый воркер (если файл уже был открыт)
+        self.command_tx = None;
+        self.frame_rx = None;
+        self.frame_queue.clear();
 
         self.current_path = Some(path.to_path_buf());
         self.width = scaled_w;
@@ -250,8 +263,17 @@ impl VideoPlayer {
             self.dropped_frames_count += 1;
         }
 
+        if let Some(img) = best_img {
+            self.rendered_frames_in_sample += 1;
+            if let Some(tex) = &mut self.texture {
+                tex.set(img, TextureOptions::LINEAR);
+            } else {
+                self.texture = Some(ctx.load_texture("video_frame", img, TextureOptions::LINEAR));
+            }
+            self.last_decoded_frame = best_frame;
+        }
+
         // Обновление реального FPS воспроизведения каждые 500 мс
-        self.rendered_frames_in_sample += 1;
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(self.fps_sample_time).as_secs_f32();
         if elapsed >= 0.5 {
@@ -259,15 +281,6 @@ impl VideoPlayer {
             self.rendered_frames_in_sample = 0;
             self.fps_sample_time = now;
             self.is_dropping_frames = self.real_playback_fps < (self.fps as f32 - 1.5) || self.dropped_frames_count > 0;
-        }
-
-        if let Some(img) = best_img {
-            if let Some(tex) = &mut self.texture {
-                tex.set(img, TextureOptions::LINEAR);
-            } else {
-                self.texture = Some(ctx.load_texture("video_frame", img, TextureOptions::LINEAR));
-            }
-            self.last_decoded_frame = best_frame;
         }
     }
 
@@ -599,36 +612,42 @@ impl VideoPlayer {
 
                     if found_image.is_none() {
                         for (st, packet) in ictx.packets() {
-                            if let Ok(mut newer) = cmd_rx.try_recv() {
-                                while let Ok(even_newer) = cmd_rx.try_recv() {
-                                    newer = even_newer;
-                                }
-                                match newer {
-                                    DecoderCommand::Seek { target_frame: newer_target } => {
-                                        target_frame = newer_target;
-                                        let new_target_pts = if time_base_f > 0.0 {
-                                            (target_frame as f64 / fps / time_base_f).round() as i64
-                                        } else {
-                                            target_frame
-                                        };
-                                        if new_target_pts >= current_pts && (new_target_pts - current_pts) <= gop_max_pts {
-                                            target_pts = new_target_pts;
-                                        } else {
-                                            pending_cmd = Some(DecoderCommand::Seek { target_frame });
+                            match cmd_rx.try_recv() {
+                                Ok(mut newer) => {
+                                    while let Ok(even_newer) = cmd_rx.try_recv() {
+                                        newer = even_newer;
+                                    }
+                                    match newer {
+                                        DecoderCommand::Seek { target_frame: newer_target } => {
+                                            target_frame = newer_target;
+                                            let new_target_pts = if time_base_f > 0.0 {
+                                                (target_frame as f64 / fps / time_base_f).round() as i64
+                                            } else {
+                                                target_frame
+                                            };
+                                            if new_target_pts >= current_pts && (new_target_pts - current_pts) <= gop_max_pts {
+                                                target_pts = new_target_pts;
+                                            } else {
+                                                pending_cmd = Some(DecoderCommand::Seek { target_frame });
+                                                break;
+                                            }
+                                        }
+                                        DecoderCommand::Play { start_frame } => {
+                                            pending_cmd = Some(DecoderCommand::Play { start_frame });
                                             break;
                                         }
-                                    }
-                                    DecoderCommand::Play { start_frame } => {
-                                        pending_cmd = Some(DecoderCommand::Play { start_frame });
-                                        break;
-                                    }
-                                    DecoderCommand::Pause => {
-                                        break;
-                                    }
-                                    DecoderCommand::UpdatePlayhead { playhead_frame: pf } => {
-                                        playhead_frame = pf;
+                                        DecoderCommand::Pause => {
+                                            break;
+                                        }
+                                        DecoderCommand::UpdatePlayhead { playhead_frame: pf } => {
+                                            playhead_frame = pf;
+                                        }
                                     }
                                 }
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    break 'worker_loop;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {}
                             }
 
                             if st.index() == stream_idx {
@@ -657,7 +676,9 @@ impl VideoPlayer {
                                                 h,
                                                 &mut rgba_buffer,
                                             ) {
-                                                let _ = frame_tx.send((target_frame, kf_img));
+                                                if frame_tx.send((target_frame, kf_img)).is_err() {
+                                                    break 'worker_loop;
+                                                }
                                                 egui_ctx.request_repaint();
                                                 keyframe_sent = true;
                                             }
@@ -686,7 +707,9 @@ impl VideoPlayer {
                     }
 
                     if let Some(img) = found_image {
-                        let _ = frame_tx.send((target_frame, img));
+                        if frame_tx.send((target_frame, img)).is_err() {
+                            break 'worker_loop;
+                        }
                         egui_ctx.request_repaint();
                     }
                 }
@@ -723,32 +746,44 @@ impl VideoPlayer {
 
                     for (st, packet) in ictx.packets() {
                         let mut break_stream = false;
+                        let mut should_exit_worker = false;
 
-                        while let Ok(cmd) = cmd_rx.try_recv() {
-                            match cmd {
-                                DecoderCommand::UpdatePlayhead { playhead_frame: pf } => {
-                                    playhead_frame = pf;
-                                }
-                                DecoderCommand::Play { start_frame: new_sf } => {
-                                    playhead_frame = new_sf;
-                                    if new_sf < current_decoded_frame.saturating_sub(5) || new_sf > current_decoded_frame + 60 {
-                                        pending_cmd = Some(DecoderCommand::Play { start_frame: new_sf });
+                        loop {
+                            match cmd_rx.try_recv() {
+                                Ok(cmd) => match cmd {
+                                    DecoderCommand::UpdatePlayhead { playhead_frame: pf } => {
+                                        playhead_frame = pf;
+                                    }
+                                    DecoderCommand::Play { start_frame: new_sf } => {
+                                        playhead_frame = new_sf;
+                                        if new_sf < current_decoded_frame.saturating_sub(5) || new_sf > current_decoded_frame + 60 {
+                                            pending_cmd = Some(DecoderCommand::Play { start_frame: new_sf });
+                                            break_stream = true;
+                                            break;
+                                        }
+                                    }
+                                    DecoderCommand::Pause => {
+                                        is_playing = false;
                                         break_stream = true;
                                         break;
                                     }
-                                }
-                                DecoderCommand::Pause => {
-                                    is_playing = false;
-                                    break_stream = true;
+                                    DecoderCommand::Seek { target_frame } => {
+                                        is_playing = false;
+                                        pending_cmd = Some(DecoderCommand::Seek { target_frame });
+                                        break_stream = true;
+                                        break;
+                                    }
+                                },
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    should_exit_worker = true;
                                     break;
                                 }
-                                DecoderCommand::Seek { target_frame } => {
-                                    is_playing = false;
-                                    pending_cmd = Some(DecoderCommand::Seek { target_frame });
-                                    break_stream = true;
-                                    break;
-                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
                             }
+                        }
+
+                        if should_exit_worker {
+                            break 'worker_loop;
                         }
 
                         if break_stream {
@@ -771,7 +806,7 @@ impl VideoPlayer {
                                     let f_num = (pts as f64 * time_base_f * fps).round() as i64;
                                     current_decoded_frame = f_num;
 
-                                    let is_late = is_playing && f_num < playhead_frame;
+                                    let is_late = is_playing && f_num < playhead_frame.saturating_sub(3);
                                     if f_num >= start_playback_frame && !is_late {
                                         if let Some(img) = Self::scale_and_copy_frame(
                                             &mut scaler,
@@ -782,7 +817,9 @@ impl VideoPlayer {
                                             h,
                                             &mut rgba_buffer,
                                         ) {
-                                            let _ = frame_tx.send((f_num, img));
+                                            if frame_tx.send((f_num, img)).is_err() {
+                                                break 'worker_loop;
+                                            }
                                             egui_ctx.request_repaint();
                                         }
                                     }

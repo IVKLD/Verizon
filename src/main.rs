@@ -12,6 +12,9 @@ mod video_decoder;
 mod viewer;
 mod waveform;
 
+#[cfg(test)]
+mod perf_tests;
+
 use app::NleApp;
 use eframe::egui;
 
