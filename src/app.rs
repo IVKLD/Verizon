@@ -810,6 +810,10 @@ impl eframe::App for NleApp {
         }
 
         // 2. Многодорожечный Audio Mixer (Multi-Track Audio Engine)
+        if self.audio_player.has_new_decoded_audio() {
+            self.timeline.audio_dirty = true;
+            ctx.request_repaint();
+        }
         if self.timeline.audio_dirty {
             self.audio_player.rebuild_timeline_audio(&self.timeline);
             self.timeline.audio_dirty = false;

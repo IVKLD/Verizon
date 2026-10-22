@@ -598,6 +598,8 @@ fn test_real_perf_multitrack_audio_mixer() {
 
     // 1. Первый вызов декодирует потоки в кэш
     let start_initial = Instant::now();
+    audio_player.ensure_audio_stream_cached_sync(&path, 0);
+    audio_player.ensure_audio_stream_cached_sync(&path, 1);
     audio_player.rebuild_timeline_audio(&timeline);
     let initial_decode_latency = start_initial.elapsed();
     println!("  -> Initial multi-stream decode into cache: {:?}", initial_decode_latency);

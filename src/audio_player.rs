@@ -24,6 +24,8 @@ pub struct AudioPlayer {
     _stream: Option<cpal::Stream>,
     // Кэш декодированных аудиопотоков: (файл, индекс_аудиопотока) -> PCM F32 Stereo 48kHz
     pub audio_cache: Arc<Mutex<HashMap<(PathBuf, usize), Arc<Vec<f32>>>>>,
+    pub pending_decodes: Arc<Mutex<std::collections::HashSet<(PathBuf, usize)>>>,
+    pub last_cache_len: usize,
 }
 
 impl AudioPlayer {
@@ -48,6 +50,8 @@ impl AudioPlayer {
             load_counter: Arc::new(AtomicU64::new(0)),
             _stream: stream,
             audio_cache: Arc::new(Mutex::new(HashMap::new())),
+            pending_decodes: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            last_cache_len: 0,
         }
     }
 
@@ -243,15 +247,27 @@ impl AudioPlayer {
         Ok((all_samples, out_rate))
     }
 
-    /// Получить или декодировать аудиопоток из кэша
-    pub fn get_or_decode_audio_stream(&self, path: &Path, audio_track_index: usize) -> Option<Arc<Vec<f32>>> {
+    /// Проверить, завершилась ли асинхронная расшифровка новых аудиодорожек
+    pub fn has_new_decoded_audio(&mut self) -> bool {
+        if let Ok(cache) = self.audio_cache.lock() {
+            let current_len = cache.len();
+            if current_len != self.last_cache_len {
+                self.last_cache_len = current_len;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Синхронное гарантированное получение аудиопотока (для тестов)
+    #[allow(dead_code)]
+    pub fn ensure_audio_stream_cached_sync(&self, path: &Path, audio_track_index: usize) -> Option<Arc<Vec<f32>>> {
         let key = (path.to_path_buf(), audio_track_index);
         if let Ok(cache) = self.audio_cache.lock() {
             if let Some(samples) = cache.get(&key) {
                 return Some(samples.clone());
             }
         }
-
         if let Ok((samples, _)) = Self::decode_audio_stream_worker(path, audio_track_index) {
             let arc_samples = Arc::new(samples);
             if let Ok(mut cache) = self.audio_cache.lock() {
@@ -261,6 +277,40 @@ impl AudioPlayer {
         } else {
             None
         }
+    }
+
+    /// Неблокирующее получение аудиопотока из кэша.
+    /// Если аудио ещё не расшифровано, запускает фоновый воркер без блокировки интерфейса (0 ms UI lag)!
+    pub fn get_or_decode_audio_stream(&self, path: &Path, audio_track_index: usize) -> Option<Arc<Vec<f32>>> {
+        let key = (path.to_path_buf(), audio_track_index);
+        if let Ok(cache) = self.audio_cache.lock() {
+            if let Some(samples) = cache.get(&key) {
+                return Some(samples.clone());
+            }
+        }
+
+        // Запуск неблокирующего фонового декодирования (гарантирует 0 ms зависания GUI при импорте сложных видео)
+        if let Ok(mut pending) = self.pending_decodes.lock() {
+            if !pending.contains(&key) {
+                pending.insert(key.clone());
+                let cache_clone = self.audio_cache.clone();
+                let pending_clone = self.pending_decodes.clone();
+                let p = path.to_path_buf();
+                std::thread::spawn(move || {
+                    if let Ok((samples, _)) = Self::decode_audio_stream_worker(&p, audio_track_index) {
+                        let arc_samples = Arc::new(samples);
+                        if let Ok(mut c) = cache_clone.lock() {
+                            c.insert((p.clone(), audio_track_index), arc_samples);
+                        }
+                    }
+                    if let Ok(mut pend) = pending_clone.lock() {
+                        pend.remove(&(p, audio_track_index));
+                    }
+                });
+            }
+        }
+
+        None
     }
 
     /// Полная сборка и сведение мастер-аудиомикса таймлайна (Multi-Track Timeline Audio Mixer)

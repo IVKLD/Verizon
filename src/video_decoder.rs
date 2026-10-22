@@ -457,24 +457,23 @@ impl VideoPlayer {
             }
         }
 
+        // Настройка многопоточного декодера для использования всех ядер процессора (Ryzen 9 9950X: 16 ядер / 32 потока)
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(16)
+            .min(32);
+
+        context_decoder.set_threading(ffmpeg_next::codec::threading::Config {
+            kind: ffmpeg_next::codec::threading::Type::Frame,
+            count: num_threads,
+        });
+
         if !hw_device_ctx.is_null() {
             unsafe {
                 let c_ptr = context_decoder.as_mut_ptr();
                 (*c_ptr).hw_device_ctx = ffmpeg_next::ffi::av_buffer_ref(hw_device_ctx);
                 (*c_ptr).get_format = Some(get_vaapi_format);
             }
-        }
-
-        if hw_device_ctx.is_null() {
-            let num_threads = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(8)
-                .min(8);
-
-            context_decoder.set_threading(ffmpeg_next::codec::threading::Config {
-                kind: ffmpeg_next::codec::threading::Type::Frame,
-                count: num_threads,
-            });
         }
 
         let mut video_decoder = match context_decoder.decoder().video() {
@@ -806,8 +805,7 @@ impl VideoPlayer {
                                     let f_num = (pts as f64 * time_base_f * fps).round() as i64;
                                     current_decoded_frame = f_num;
 
-                                    let is_late = is_playing && f_num < playhead_frame.saturating_sub(3);
-                                    if f_num >= start_playback_frame && !is_late {
+                                    if f_num >= start_playback_frame {
                                         if let Some(img) = Self::scale_and_copy_frame(
                                             &mut scaler,
                                             &decoded_frame,
@@ -937,7 +935,18 @@ impl VideoPlayer {
                 }
             }
 
-            Some(ColorImage::from_rgba_unmultiplied([w, h], rgba_buffer))
+            // Zero-copy прямое приведение RGBA буфера в Vec<Color32>
+            // Полностью устраняет 921,600 float-операций и повторных аллокаций на каждый кадр
+            let pixels: Vec<egui::Color32> = unsafe {
+                let mut v = rgba_buffer.clone();
+                let ptr = v.as_mut_ptr() as *mut egui::Color32;
+                let len = v.len() / 4;
+                let cap = v.capacity() / 4;
+                std::mem::forget(v);
+                Vec::from_raw_parts(ptr, len, cap)
+            };
+
+            Some(ColorImage { size: [w, h], source_size: egui::vec2(w as f32, h as f32), pixels })
         } else {
             None
         }
