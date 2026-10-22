@@ -157,6 +157,11 @@ impl MediaPoolState {
     pub fn insert_selected_to_timeline(&self, timeline: &mut TimelineState) {
         if let Some(id) = self.selected_asset_id {
             if let Some(asset) = self.assets.iter().find(|a| a.id == id) {
+                // Если таймлайн пустой, переключаем FPS проекта на FPS первого импортированного видео!
+                if timeline.clips.is_empty() && asset.fps_num > 0.0 {
+                    timeline.fps = asset.fps_num.round().clamp(1.0, 240.0) as u32;
+                }
+
                 timeline.push_history();
                 let dur = (asset.duration_secs * timeline.fps as f64).round().max(1.0) as i64;
                 let start = timeline.playhead_frame;
@@ -180,6 +185,7 @@ impl MediaPoolState {
                         color: ResolveColors::VIDEO_CLIP,
                         source_path: asset.path.clone(),
                         source_in_frame: 0,
+                        source_in_secs: 0.0,
                         source_fps: asset.fps_num,
                         link_group: link_id,
                         zoom_x: 1.0,
@@ -208,6 +214,7 @@ impl MediaPoolState {
                         color: ResolveColors::AUDIO_CLIP,
                         source_path: asset.path.clone(),
                         source_in_frame: 0,
+                        source_in_secs: 0.0,
                         source_fps: asset.fps_num,
                         link_group: link_id,
                         zoom_x: 1.0,
@@ -330,6 +337,8 @@ impl MediaPoolState {
                                 name: asset.filename.clone(),
                                 path: asset.path.clone(),
                                 is_audio: asset.is_audio_only,
+                                has_video: asset.has_video,
+                                has_audio: asset.has_audio,
                                 duration_frames: dur_frames,
                                 source_fps: asset.fps_num,
                                 link_group: None,

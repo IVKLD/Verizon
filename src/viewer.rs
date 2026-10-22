@@ -82,15 +82,15 @@ impl ViewerState {
                 }
                 let offset = timeline.playhead_frame - clip.start_frame;
                 let time_secs = offset as f64 / timeline.fps as f64;
-                let source_frame = (time_secs * clip.source_fps).round() as i64 + clip.source_in_frame;
+                let total_source_secs = clip.source_in_secs + time_secs;
+                let source_frame = (total_source_secs * clip.source_fps).round() as i64;
                 video_player.seek_and_decode(source_frame, ctx);
             } else {
                 video_player.seek_and_decode(timeline.playhead_frame, ctx);
             }
-        } else if video_player.is_real_video {
-            video_player.seek_and_decode(timeline.playhead_frame, ctx);
         } else {
-            video_player.seek_and_decode(0, ctx);
+            // Если под плейхедом нет видеоклипа — отображаем чистый кадр без лишней нагрузки декодера
+            video_player.show_blank_frame(ctx);
         }
 
         // Обновление реальных уровней громкости VU-метра

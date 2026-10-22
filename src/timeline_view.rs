@@ -265,34 +265,102 @@ impl TimelineView {
                     // Если кнопку мыши отпустили — размещаем клип на выбранную дорожку!
                     if ui.input(|i| i.pointer.any_released()) {
                         timeline.push_history();
-                        let new_clip = Clip {
-                            id: timeline.next_clip_id,
-                            name: media.name.clone(),
-                            track_index: target_track_idx,
-                            start_frame: drop_frame,
-                            duration_frames: media.duration_frames,
-                            is_audio: media.is_audio,
-                            color: if media.is_audio {
-                                ResolveColors::AUDIO_CLIP
-                            } else {
-                                ResolveColors::VIDEO_CLIP
-                            },
-                            source_path: media.path.clone(),
-                            source_in_frame: 0,
-                            source_fps: media.source_fps,
-                            link_group: media.link_group,
-                            zoom_x: 1.0,
-                            zoom_y: 1.0,
-                            position_x: 0.0,
-                            position_y: 0.0,
-                            rotation: 0.0,
-                            opacity: 100.0,
-                            volume_db: 0.0,
-                            pan: 0.0,
+                        if timeline.clips.is_empty() && media.source_fps > 0.0 {
+                            timeline.fps = media.source_fps.round().clamp(1.0, 240.0) as u32;
+                        }
+
+                        let link_id = if media.has_video && media.has_audio {
+                            let id = timeline.next_link_id;
+                            timeline.next_link_id += 1;
+                            Some(id)
+                        } else {
+                            media.link_group
                         };
-                        timeline.next_clip_id += 1;
-                        timeline.selected_clip_id = Some(new_clip.id);
-                        timeline.clips.push(new_clip);
+
+                        if media.has_video && media.has_audio {
+                            // Создаем связанную пару: Видео на выбранной видеодорожке + Аудио на дорожке A1
+                            let video_track = if target_track_idx < 2 { target_track_idx } else { 1 };
+                            let v_clip = Clip {
+                                id: timeline.next_clip_id,
+                                name: media.name.clone(),
+                                track_index: video_track,
+                                start_frame: drop_frame,
+                                duration_frames: media.duration_frames,
+                                is_audio: false,
+                                color: ResolveColors::VIDEO_CLIP,
+                                source_path: media.path.clone(),
+                                source_in_frame: 0,
+                                source_in_secs: 0.0,
+                                source_fps: media.source_fps,
+                                link_group: link_id,
+                                zoom_x: 1.0,
+                                zoom_y: 1.0,
+                                position_x: 0.0,
+                                position_y: 0.0,
+                                rotation: 0.0,
+                                opacity: 100.0,
+                                volume_db: 0.0,
+                                pan: 0.0,
+                            };
+                            timeline.next_clip_id += 1;
+                            timeline.selected_clip_id = Some(v_clip.id);
+                            timeline.clips.push(v_clip);
+
+                            let a_clip = Clip {
+                                id: timeline.next_clip_id,
+                                name: media.name.clone(),
+                                track_index: 2, // A1
+                                start_frame: drop_frame,
+                                duration_frames: media.duration_frames,
+                                is_audio: true,
+                                color: ResolveColors::AUDIO_CLIP,
+                                source_path: media.path.clone(),
+                                source_in_frame: 0,
+                                source_in_secs: 0.0,
+                                source_fps: media.source_fps,
+                                link_group: link_id,
+                                zoom_x: 1.0,
+                                zoom_y: 1.0,
+                                position_x: 0.0,
+                                position_y: 0.0,
+                                rotation: 0.0,
+                                opacity: 100.0,
+                                volume_db: 0.0,
+                                pan: 0.0,
+                            };
+                            timeline.next_clip_id += 1;
+                            timeline.clips.push(a_clip);
+                        } else {
+                            let new_clip = Clip {
+                                id: timeline.next_clip_id,
+                                name: media.name.clone(),
+                                track_index: target_track_idx,
+                                start_frame: drop_frame,
+                                duration_frames: media.duration_frames,
+                                is_audio: media.is_audio,
+                                color: if media.is_audio {
+                                    ResolveColors::AUDIO_CLIP
+                                } else {
+                                    ResolveColors::VIDEO_CLIP
+                                },
+                                source_path: media.path.clone(),
+                                source_in_frame: 0,
+                                source_in_secs: 0.0,
+                                source_fps: media.source_fps,
+                                link_group: link_id,
+                                zoom_x: 1.0,
+                                zoom_y: 1.0,
+                                position_x: 0.0,
+                                position_y: 0.0,
+                                rotation: 0.0,
+                                opacity: 100.0,
+                                volume_db: 0.0,
+                                pan: 0.0,
+                            };
+                            timeline.next_clip_id += 1;
+                            timeline.selected_clip_id = Some(new_clip.id);
+                            timeline.clips.push(new_clip);
+                        }
                         drop_completed = true;
                     }
                 }

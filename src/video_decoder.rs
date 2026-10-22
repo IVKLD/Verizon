@@ -124,6 +124,20 @@ impl VideoPlayer {
         Ok(())
     }
 
+    /// Отобразить чистый нейтральный экран Resolve без декодирования
+    pub fn show_blank_frame(&mut self, ctx: &Context) {
+        if self.last_decoded_frame == -999 && self.texture.is_some() {
+            return;
+        }
+        let img = self.generate_placeholder();
+        if let Some(tex) = &mut self.texture {
+            tex.set(img, TextureOptions::NEAREST);
+        } else {
+            self.texture = Some(ctx.load_texture("video_frame", img, TextureOptions::NEAREST));
+        }
+        self.last_decoded_frame = -999;
+    }
+
     /// Прецизионное декодирование кадра по таймкоду (Frame-Accurate Zero-Lag)
     pub fn seek_and_decode(&mut self, target_frame: i64, ctx: &Context) {
         if target_frame == self.last_decoded_frame && self.texture.is_some() {
@@ -169,6 +183,13 @@ impl VideoPlayer {
             target_frame
         };
 
+        let frame_duration_pts = if time_base_f > 0.0 && self.fps > 0.0 {
+            (1.0 / self.fps / time_base_f).round().max(1.0) as i64
+        } else {
+            1
+        };
+        let tolerance = (frame_duration_pts / 2).max(1);
+
         let one_sec_pts = if time_base_f > 0.0 {
             (1.0 / time_base_f).round() as i64
         } else {
@@ -177,8 +198,8 @@ impl VideoPlayer {
 
         let pts_delta = target_pts - self.current_pts;
 
-        // Перемотка (Seek): если кадр позади текущего или дальше чем на 1 секунду вперед
-        if self.current_pts < 0 || pts_delta < 0 || pts_delta > one_sec_pts {
+        // Перемотка (Seek): если кадр позади текущего за пределами допуска или дальше чем на 1 секунду вперед
+        if self.current_pts < 0 || pts_delta < -tolerance || pts_delta > one_sec_pts {
             let av_timestamp = (target_frame as f64 / self.fps * f64::from(ffmpeg_next::ffi::AV_TIME_BASE)) as i64;
             let _ = ictx.seek(av_timestamp, ..av_timestamp);
             let _ = decoder.flush();
@@ -194,7 +215,7 @@ impl VideoPlayer {
         while decoder.receive_frame(&mut decoded_frame).is_ok() {
             if let Some(pts) = decoded_frame.pts() {
                 self.current_pts = pts;
-                if pts >= target_pts {
+                if pts >= target_pts - tolerance {
                     if scaler.run(&decoded_frame, &mut rgba_frame).is_ok() {
                         return self.copy_frame_to_image(&rgba_frame, w, h);
                     }
@@ -209,7 +230,7 @@ impl VideoPlayer {
                     while decoder.receive_frame(&mut decoded_frame).is_ok() {
                         if let Some(pts) = decoded_frame.pts() {
                             self.current_pts = pts;
-                            if pts >= target_pts {
+                            if pts >= target_pts - tolerance {
                                 if scaler.run(&decoded_frame, &mut rgba_frame).is_ok() {
                                     return self.copy_frame_to_image(&rgba_frame, w, h);
                                 }
@@ -263,5 +284,56 @@ impl VideoPlayer {
         }
 
         ColorImage::from_rgba_unmultiplied([w, h], &self.rgba_buffer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decoder_playback_consecutive_frames() {
+        let test_path = Path::new("/home/igni/Documents/IMG_6686.MP4");
+        if !test_path.exists() {
+            return;
+        }
+
+        let ctx = egui::Context::default();
+        let mut player = VideoPlayer::new();
+        assert!(player.open_file(test_path, &ctx).is_ok());
+
+        assert!(player.is_real_video);
+        assert!(player.width > 0);
+        assert!(player.height > 0);
+
+        // Декодируем подряд первые 30 кадров
+        for f in 0..30 {
+            player.seek_and_decode(f, &ctx);
+            assert!(player.texture.is_some(), "Texture must exist for frame {}", f);
+            assert_eq!(player.last_decoded_frame, f);
+        }
+
+        // Перемотка назад (Seek backward) на кадр 10
+        player.seek_and_decode(10, &ctx);
+        assert_eq!(player.last_decoded_frame, 10);
+    }
+
+    #[test]
+    fn test_decoder_4k_mkv_playback() {
+        let test_path = Path::new("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
+        if !test_path.exists() {
+            return;
+        }
+
+        let ctx = egui::Context::default();
+        let mut player = VideoPlayer::new();
+        assert!(player.open_file(test_path, &ctx).is_ok());
+
+        // Декодируем подряд 60 кадров (1 секунду 4K 60fps)
+        for f in 0..60 {
+            player.seek_and_decode(f, &ctx);
+            assert!(player.texture.is_some());
+            assert_eq!(player.last_decoded_frame, f);
+        }
     }
 }

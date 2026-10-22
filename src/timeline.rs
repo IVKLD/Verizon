@@ -22,6 +22,7 @@ pub struct Clip {
     // Ссылка на реальный медиафайл и смещение
     pub source_path: Option<PathBuf>,
     pub source_in_frame: i64,
+    pub source_in_secs: f64,
     pub source_fps: f64,
 
     // Связанность клипов (Linked Clips: Video + Audio)
@@ -65,6 +66,8 @@ pub struct DraggedMedia {
     pub name: String,
     pub path: Option<PathBuf>,
     pub is_audio: bool,
+    pub has_video: bool,
+    pub has_audio: bool,
     pub duration_frames: i64,
     pub source_fps: f64,
     pub link_group: Option<u64>,
@@ -242,6 +245,13 @@ impl TimelineState {
                 };
                 right_clip.source_in_frame += frames_offset;
 
+                let secs_offset = if self.fps > 0 {
+                    left_duration as f64 / self.fps as f64
+                } else {
+                    0.0
+                };
+                right_clip.source_in_secs += secs_offset;
+
                 self.clips[idx].duration_frames = left_duration;
                 self.clips.insert(idx + 1, right_clip);
             }
@@ -377,5 +387,188 @@ impl TimelineState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_blade_cut_preserves_audio_continuity() {
+        let mut tl = TimelineState::new_empty();
+        tl.fps = 24;
+
+        // Создаем видео и аудио клип (Linked group 1) от кадра 0 до 240 (10 секунд)
+        tl.clips.push(Clip {
+            id: 1,
+            name: "Video".to_string(),
+            track_index: 1,
+            start_frame: 0,
+            duration_frames: 240,
+            is_audio: false,
+            color: Color32::BLUE,
+            source_path: None,
+            source_in_frame: 0,
+            source_in_secs: 0.0,
+            source_fps: 24.0,
+            link_group: Some(1),
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            position_x: 0.0,
+            position_y: 0.0,
+            rotation: 0.0,
+            opacity: 100.0,
+            volume_db: 0.0,
+            pan: 0.0,
+        });
+
+        tl.clips.push(Clip {
+            id: 2,
+            name: "Audio".to_string(),
+            track_index: 2,
+            start_frame: 0,
+            duration_frames: 240,
+            is_audio: true,
+            color: Color32::GREEN,
+            source_path: None,
+            source_in_frame: 0,
+            source_in_secs: 0.0,
+            source_fps: 24.0,
+            link_group: Some(1),
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            position_x: 0.0,
+            position_y: 0.0,
+            rotation: 0.0,
+            opacity: 100.0,
+            volume_db: 0.0,
+            pan: 0.0,
+        });
+
+        // Режем на кадре 96 (ровно 4.0 секунды)
+        assert!(tl.blade_cut_at(1, 96));
+
+        // Должно стать 4 клипа: 2 левых и 2 правых
+        assert_eq!(tl.clips.len(), 4);
+
+        let left_audio = tl.clips.iter().find(|c| c.is_audio && c.start_frame == 0).unwrap();
+        assert_eq!(left_audio.duration_frames, 96);
+        assert_eq!(left_audio.source_in_secs, 0.0);
+
+        let right_audio = tl.clips.iter().find(|c| c.is_audio && c.start_frame == 96).unwrap();
+        assert_eq!(right_audio.duration_frames, 144);
+        assert!((right_audio.source_in_secs - 4.0).abs() < 1e-6);
+
+        // Проверяем непрерывность звука при переходе через точку реза
+        // В кадре 95 (перед резом):
+        let time_at_95 = left_audio.source_in_secs + (95 - left_audio.start_frame) as f64 / tl.fps as f64;
+        // В кадре 96 (первый кадр правого клипа):
+        let time_at_96 = right_audio.source_in_secs + (96 - right_audio.start_frame) as f64 / tl.fps as f64;
+
+        let delta = time_at_96 - time_at_95;
+        let expected_frame_time = 1.0 / 24.0;
+        assert!((delta - expected_frame_time).abs() < 1e-6, "Audio must not restart at cut point!");
+    }
+
+    #[test]
+    fn test_playback_stops_at_timeline_end() {
+        let mut tl = TimelineState::new_empty();
+        tl.fps = 24;
+        tl.clips.push(Clip {
+            id: 1,
+            name: "Clip".to_string(),
+            track_index: 1,
+            start_frame: 0,
+            duration_frames: 48, // 2 секунды
+            is_audio: false,
+            color: Color32::BLUE,
+            source_path: None,
+            source_in_frame: 0,
+            source_in_secs: 0.0,
+            source_fps: 24.0,
+            link_group: None,
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            position_x: 0.0,
+            position_y: 0.0,
+            rotation: 0.0,
+            opacity: 100.0,
+            volume_db: 0.0,
+            pan: 0.0,
+        });
+
+        tl.is_playing = true;
+        tl.playhead_frame = 40;
+
+        // Несколько шагов воспроизведения по 50мс до конца таймлайна
+        for _ in 0..10 {
+            tl.step_playback(0.05);
+        }
+
+        // Должно остановиться ровно на конце (48 кадрах), воспроизведение выключено
+        assert_eq!(tl.playhead_frame, 48);
+        assert!(!tl.is_playing);
+    }
+
+    #[test]
+    fn test_linked_clip_movement() {
+        let mut tl = TimelineState::new_empty();
+        tl.fps = 24;
+        tl.linked_selection = true;
+        tl.snapping_enabled = false;
+
+        tl.clips.push(Clip {
+            id: 1,
+            name: "Video".to_string(),
+            track_index: 1,
+            start_frame: 10,
+            duration_frames: 50,
+            is_audio: false,
+            color: Color32::BLUE,
+            source_path: None,
+            source_in_frame: 0,
+            source_in_secs: 0.0,
+            source_fps: 24.0,
+            link_group: Some(42),
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            position_x: 0.0,
+            position_y: 0.0,
+            rotation: 0.0,
+            opacity: 100.0,
+            volume_db: 0.0,
+            pan: 0.0,
+        });
+
+        tl.clips.push(Clip {
+            id: 2,
+            name: "Audio".to_string(),
+            track_index: 2,
+            start_frame: 10,
+            duration_frames: 50,
+            is_audio: true,
+            color: Color32::GREEN,
+            source_path: None,
+            source_in_frame: 0,
+            source_in_secs: 0.0,
+            source_fps: 24.0,
+            link_group: Some(42),
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            position_x: 0.0,
+            position_y: 0.0,
+            rotation: 0.0,
+            opacity: 100.0,
+            volume_db: 0.0,
+            pan: 0.0,
+        });
+
+        // Перемещаем только видеоклип на 30 кадр
+        tl.move_clip(1, 30);
+
+        // Оба связанных клипа должны переместиться на кадр 30
+        assert_eq!(tl.clips[0].start_frame, 30);
+        assert_eq!(tl.clips[1].start_frame, 30);
     }
 }

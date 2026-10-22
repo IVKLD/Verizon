@@ -1,4 +1,4 @@
-use egui::{Color32, Context, Id, Margin, Panel, Stroke, Ui, WidgetText};
+use egui::{Context, Id, Margin, Panel, Stroke, Ui, WidgetText};
 use egui_dock::{DockArea, DockState, NodeIndex, Style as DockStyle, TabViewer};
 
 use crate::audio_player::AudioPlayer;
@@ -13,6 +13,7 @@ use crate::video_decoder::VideoPlayer;
 use crate::viewer::ViewerState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 pub enum Page {
     Media,
     Cut,
@@ -468,49 +469,6 @@ impl NleApp {
             });
     }
 
-    fn render_bottom_page_bar(&mut self, ui: &mut Ui) {
-        Panel::bottom("bottom_page_bar")
-            .frame(
-                egui::Frame::new()
-                    .fill(ResolveColors::BG_HEADER)
-                    .stroke(Stroke::new(1.0, ResolveColors::BORDER))
-                    .inner_margin(Margin::symmetric(8, 4)),
-            )
-            .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.add_space(ui.available_width() * 0.28);
-
-                    let pages = [
-                        (Page::Media, "📁 Media"),
-                        (Page::Cut, "✂ Cut"),
-                        (Page::Edit, "🎬 Edit"),
-                        (Page::Color, "🎨 Color"),
-                        (Page::Deliver, "🚀 Deliver"),
-                    ];
-
-                    for (page, label) in pages {
-                        let is_active = self.current_page == page;
-                        let text = egui::RichText::new(label)
-                            .size(12.0)
-                            .strong()
-                            .color(if is_active { ResolveColors::ACCENT_ORANGE } else { ResolveColors::TEXT_MUTED });
-
-                        let btn = egui::Button::new(text)
-                            .fill(if is_active { Color32::from_rgb(0x2d, 0x24, 0x1c) } else { Color32::TRANSPARENT })
-                            .stroke(if is_active {
-                                Stroke::new(1.0, ResolveColors::ACCENT_ORANGE)
-                            } else {
-                                Stroke::NONE
-                            });
-
-                        if ui.add(btn).clicked() {
-                            self.current_page = page;
-                        }
-                    }
-                });
-            });
-    }
-
     fn render_preferences_window(&mut self, ctx: &Context) {
         if !self.show_preferences_window {
             return;
@@ -649,12 +607,7 @@ impl eframe::App for NleApp {
                 }
                 let offset = self.timeline.playhead_frame - clip.start_frame;
                 let time_in_clip = offset as f64 / self.timeline.fps as f64;
-                let source_in_secs = if clip.source_fps > 0.0 {
-                    clip.source_in_frame as f64 / clip.source_fps
-                } else {
-                    0.0
-                };
-                let total_source_secs = source_in_secs + time_in_clip;
+                let total_source_secs = clip.source_in_secs + time_in_clip;
                 self.audio_player.sync_playhead(Some(total_source_secs), self.timeline.is_playing);
             } else {
                 self.audio_player.sync_playhead(None, self.timeline.is_playing);
@@ -672,10 +625,7 @@ impl eframe::App for NleApp {
         // 5. Верхний бар и Меню
         self.render_top_bar(ui);
 
-        // 6. Нижняя панель страниц DaVinci Resolve
-        self.render_bottom_page_bar(ui);
-
-        // 7. Отображение активной страницы (Media / Edit)
+        // 6. Отображение активной страницы (Media / Edit)
         match self.current_page {
             Page::Media => {
                 // Полноценная страница DaVinci Resolve 21 Media Page
