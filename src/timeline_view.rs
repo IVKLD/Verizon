@@ -83,13 +83,33 @@ impl TimelineView {
                     }
                 }
 
-                // Скролл и Зум колесиком мыши
-                let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+                // Скролл и Зум колесиком мыши (поддержка любых мышей, тачпадов и колесиков с засечками)
+                let (scroll_x, scroll_y) = ui.input(|i| {
+                    let mut dx = i.smooth_scroll_delta.x;
+                    let mut dy = i.smooth_scroll_delta.y;
+                    for ev in &i.events {
+                        if let egui::Event::MouseWheel { delta, .. } = ev {
+                            if dx.abs() < 0.001 {
+                                dx = delta.x;
+                            }
+                            if dy.abs() < 0.001 {
+                                dy = delta.y;
+                            }
+                        }
+                    }
+                    (dx, dy)
+                });
+
+                if scroll_x != 0.0 {
+                    timeline.scroll_x = (timeline.scroll_x - scroll_x * 1.5).max(0.0);
+                }
 
                 if scroll_y != 0.0 {
                     let is_zoom = ui.input(|i| i.modifiers.alt || i.modifiers.ctrl || i.modifiers.command);
+                    let is_shift = ui.input(|i| i.modifiers.shift);
+
                     if is_zoom {
-                        // Зум центрированный строго под курсором мыши (как в Resolve 21)
+                        // Зум центрированный строго под курсором мыши (как в DaVinci Resolve 21)
                         let old_zoom = timeline.zoom_factor;
                         let zoom_mult = if scroll_y > 0.0 { 1.15 } else { 0.87 };
                         let new_zoom = (old_zoom * zoom_mult).clamp(0.05, 50.0);
@@ -98,6 +118,9 @@ impl TimelineView {
                         let target_frame = (mouse_rel_x + timeline.scroll_x) / old_zoom;
                         timeline.zoom_factor = new_zoom;
                         timeline.scroll_x = (target_frame * new_zoom - mouse_rel_x).max(0.0);
+                    } else if is_shift {
+                        // Shift + Колесо: вертикальный скролл дорожек
+                        timeline.scroll_y = (timeline.scroll_y - scroll_y * 1.5).max(0.0);
                     } else {
                         // Обычное колесико мыши: горизонтальный скролл таймлайна
                         timeline.scroll_x = (timeline.scroll_x - scroll_y * 2.0).max(0.0);
@@ -375,6 +398,7 @@ impl TimelineView {
                                 opacity: 100.0,
                                 volume_db: 0.0,
                                 pan: 0.0,
+                                source_audio_stream: 0,
                             };
                             timeline.next_clip_id += 1;
                             timeline.selected_clip_id = Some(v_clip.id);
@@ -411,6 +435,7 @@ impl TimelineView {
                                     opacity: 100.0,
                                     volume_db: 0.0,
                                     pan: 0.0,
+                                    source_audio_stream: a_idx,
                                 };
                                 timeline.next_clip_id += 1;
                                 timeline.clips.push(a_clip);
@@ -441,11 +466,13 @@ impl TimelineView {
                                 opacity: 100.0,
                                 volume_db: 0.0,
                                 pan: 0.0,
+                                source_audio_stream: 0,
                             };
                             timeline.next_clip_id += 1;
                             timeline.selected_clip_id = Some(new_clip.id);
                             timeline.clips.push(new_clip);
                         }
+                        timeline.audio_dirty = true;
                         drop_completed = true;
                     }
                 }
@@ -666,7 +693,7 @@ impl TimelineView {
             let half_h = (rect.height() * 0.42).max(2.0);
 
             if let Some(path) = &clip.source_path {
-                if let Some(peaks) = waveform_mgr.get_waveform(path) {
+                if let Some(peaks) = waveform_mgr.get_waveform_stream(path, clip.source_audio_stream) {
                     let pts_per_sec = 100.0;
                     let sec_per_px = 1.0 / (timeline.zoom_factor * timeline.fps as f32);
 
@@ -697,7 +724,7 @@ impl TimelineView {
                     }
                 } else {
                     // Запрос асинхронного извлечения в Tokio
-                    waveform_mgr.request_waveform(path, ctx.clone());
+                    waveform_mgr.request_waveform_stream(path, clip.source_audio_stream, ctx.clone());
 
                     // Центральная тонкая линия до завершения расшифровки
                     painter.line_segment(

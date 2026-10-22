@@ -1,7 +1,9 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use crate::timeline::TimelineState;
 
 pub struct AudioSharedState {
     pub samples: Vec<f32>,
@@ -20,6 +22,8 @@ pub struct AudioPlayer {
     pub is_loading: Arc<AtomicBool>,
     load_counter: Arc<AtomicU64>,
     _stream: Option<cpal::Stream>,
+    // Кэш декодированных аудиопотоков: (файл, индекс_аудиопотока) -> PCM F32 Stereo 48kHz
+    pub audio_cache: Arc<Mutex<HashMap<(PathBuf, usize), Arc<Vec<f32>>>>>,
 }
 
 impl AudioPlayer {
@@ -43,6 +47,7 @@ impl AudioPlayer {
             is_loading: Arc::new(AtomicBool::new(false)),
             load_counter: Arc::new(AtomicU64::new(0)),
             _stream: stream,
+            audio_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -136,14 +141,29 @@ impl AudioPlayer {
         }
     }
 
-    /// Фоновый декодер аудиофайла через FFmpeg
+    /// Фоновый декодер первого аудиопотока через FFmpeg (обратная совместимость)
+    #[allow(dead_code)]
     pub fn decode_audio_worker(path: &Path) -> Result<(Vec<f32>, u32), String> {
+        Self::decode_audio_stream_worker(path, 0)
+    }
+
+    /// Прецизионный декодер конкретной аудиодорожки (потока) из медиафайла
+    pub fn decode_audio_stream_worker(path: &Path, audio_track_index: usize) -> Result<(Vec<f32>, u32), String> {
         let mut ictx = ffmpeg_next::format::input(path).map_err(|e| e.to_string())?;
 
-        let audio_stream = ictx
+        let audio_streams: Vec<_> = ictx
             .streams()
-            .best(ffmpeg_next::media::Type::Audio)
-            .ok_or_else(|| "Аудиопоток не найден".to_string())?;
+            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Audio)
+            .collect();
+
+        if audio_streams.is_empty() {
+            return Err("Аудиопотоки не найдены в медиафайле".to_string());
+        }
+
+        let audio_stream = audio_streams
+            .get(audio_track_index)
+            .or_else(|| audio_streams.first())
+            .unwrap();
 
         let stream_idx = audio_stream.index();
         let context_decoder = ffmpeg_next::codec::context::Context::from_parameters(audio_stream.parameters())
@@ -223,7 +243,102 @@ impl AudioPlayer {
         Ok((all_samples, out_rate))
     }
 
-    /// Загрузить аудио из медиафайла асинхронно через фоновый поток без блокировки UI
+    /// Получить или декодировать аудиопоток из кэша
+    pub fn get_or_decode_audio_stream(&self, path: &Path, audio_track_index: usize) -> Option<Arc<Vec<f32>>> {
+        let key = (path.to_path_buf(), audio_track_index);
+        if let Ok(cache) = self.audio_cache.lock() {
+            if let Some(samples) = cache.get(&key) {
+                return Some(samples.clone());
+            }
+        }
+
+        if let Ok((samples, _)) = Self::decode_audio_stream_worker(path, audio_track_index) {
+            let arc_samples = Arc::new(samples);
+            if let Ok(mut cache) = self.audio_cache.lock() {
+                cache.insert(key, arc_samples.clone());
+            }
+            Some(arc_samples)
+        } else {
+            None
+        }
+    }
+
+    /// Полная сборка и сведение мастер-аудиомикса таймлайна (Multi-Track Timeline Audio Mixer)
+    /// Поддерживает неограниченное число аудиодорожек (A1, A2, A3...), Mute/Solo, громкость (volume_db), панораму (pan)
+    pub fn rebuild_timeline_audio(&mut self, timeline: &TimelineState) {
+        let max_end_frame = timeline.clips.iter().map(|c| c.end_frame()).max().unwrap_or(0);
+        let total_samples = ((max_end_frame as f64 / timeline.fps.max(1) as f64) * 48000.0).round() as usize * 2;
+        let mut mixed = vec![0.0f32; total_samples.max(48000 * 2)];
+
+        let has_solo = timeline.tracks.iter().any(|t| !t.is_video && t.is_solo);
+
+        for c in &timeline.clips {
+            if !c.is_audio {
+                continue;
+            }
+
+            // Проверка Mute / Solo для дорожки клипа
+            if let Some(t) = timeline.tracks.get(c.track_index) {
+                if t.is_muted {
+                    continue;
+                }
+                if has_solo && !t.is_solo {
+                    continue;
+                }
+            }
+
+            let path = match &c.source_path {
+                Some(p) => p,
+                None => continue,
+            };
+
+            let clip_samples = match self.get_or_decode_audio_stream(path, c.source_audio_stream) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let vol_linear = 10.0f32.powf(c.volume_db / 20.0);
+            let pan_l = ((1.0 - c.pan) / 2.0).clamp(0.0, 1.0);
+            let pan_r = ((1.0 + c.pan) / 2.0).clamp(0.0, 1.0);
+
+            let start_sample = ((c.start_frame as f64 / timeline.fps.max(1) as f64) * 48000.0).round() as usize * 2;
+            let in_sample = (c.source_in_secs * 48000.0).round() as usize * 2;
+            let dur_samples = ((c.duration_frames as f64 / timeline.fps.max(1) as f64) * 48000.0).round() as usize * 2;
+
+            for i in (0..dur_samples).step_by(2) {
+                let src_l = in_sample + i;
+                let src_r = in_sample + i + 1;
+                let dst_l = start_sample + i;
+                let dst_r = start_sample + i + 1;
+
+                if dst_r >= mixed.len() {
+                    break;
+                }
+
+                let s_l = if src_l < clip_samples.len() { clip_samples[src_l] } else { 0.0 };
+                let s_r = if src_r < clip_samples.len() { clip_samples[src_r] } else { s_l };
+
+                mixed[dst_l] += s_l * vol_linear * pan_l;
+                mixed[dst_r] += s_r * vol_linear * pan_r;
+            }
+        }
+
+        // Защитный мягкий лимитер для предотвращения клиппинга
+        for s in &mut mixed {
+            *s = s.clamp(-1.0, 1.0);
+        }
+
+        if let Ok(mut state) = self.shared_state.lock() {
+            state.samples = mixed;
+            state.sample_rate = 48000;
+            state.channels = 2;
+            state.is_playing = timeline.is_playing;
+            let target_sample = ((timeline.playhead_frame as f64 / timeline.fps.max(1) as f64) * 48000.0).round() as usize * 2;
+            state.current_sample_pos = target_sample.min(state.samples.len());
+        }
+    }
+
+    /// Загрузить аудио из медиафайла асинхронно через фоновый поток (для одиночного файла)
     pub fn load_audio_from_file(&mut self, path: &Path) -> Result<(), String> {
         if self.current_path.as_deref() == Some(path) {
             return Ok(());
@@ -232,24 +347,24 @@ impl AudioPlayer {
         self.current_path = Some(path.to_path_buf());
         self.is_loading.store(true, Ordering::SeqCst);
 
-        // Сбрасываем старые семплы перед асинхронной загрузкой нового файла
-        if let Ok(mut state) = self.shared_state.lock() {
-            state.samples.clear();
-            state.current_sample_pos = 0;
-        }
-
         let path_buf = path.to_path_buf();
         let shared = self.shared_state.clone();
         let is_loading = self.is_loading.clone();
         let load_id = self.load_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let load_counter = self.load_counter.clone();
+        let cache = self.audio_cache.clone();
 
         std::thread::spawn(move || {
-            match Self::decode_audio_worker(&path_buf) {
+            match Self::decode_audio_stream_worker(&path_buf, 0) {
                 Ok((samples, out_rate)) => {
+                    let arc_samples = Arc::new(samples);
+                    if let Ok(mut c) = cache.lock() {
+                        c.insert((path_buf.clone(), 0), arc_samples.clone());
+                    }
+
                     if load_counter.load(Ordering::SeqCst) == load_id {
                         if let Ok(mut state) = shared.lock() {
-                            state.samples = samples;
+                            state.samples = (*arc_samples).clone();
                             state.sample_rate = out_rate;
                             state.channels = 2;
                             state.current_sample_pos = 0;
@@ -283,17 +398,12 @@ impl AudioPlayer {
                 let target_sample = (time_sec * sample_rate * state.channels as f64).max(0.0) as usize;
 
                 if !was_playing && is_playing {
-                    // Момент запуска воспроизведения: жестко встаем на позицию плейхеда
                     state.current_sample_pos = target_sample.min(state.samples.len());
                 } else if !is_playing {
-                    // Пауза / скраббинг / перемотка вручную: всегда точно следуем за плейхедом
                     state.current_sample_pos = target_sample.min(state.samples.len());
                 } else {
-                    // При активном непрерывном воспроизведении НЕ дергаем семплы каждые 7-16мс!
-                    // Аудиопоток течет плавно без заиканий и щелчков (anti-crackling buffer).
-                    // Корректируем ТОЛЬКО при реальном прыжке/клике по таймлайну (>200 мс).
                     let diff = (state.current_sample_pos as isize - target_sample as isize).abs();
-                    let threshold = (sample_rate * 0.20 * state.channels as f64) as isize;
+                    let threshold = (sample_rate * 0.10 * state.channels as f64) as isize;
                     if diff > threshold {
                         state.current_sample_pos = target_sample.min(state.samples.len());
                     }
@@ -302,6 +412,12 @@ impl AudioPlayer {
                 state.current_sample_pos = state.samples.len();
             }
         }
+    }
+
+    /// Синхронизация таймлайна по номеру кадра (для прямого многодорожечного микса)
+    pub fn sync_playhead_frame(&self, playhead_frame: i64, fps: u32, is_playing: bool) {
+        let time_sec = playhead_frame as f64 / fps.max(1) as f64;
+        self.sync_playhead(Some(time_sec), is_playing);
     }
 
     /// Получить текущие уровни VU-метра для анимации
@@ -329,5 +445,26 @@ mod tests {
         let (samples, rate) = res.unwrap();
         assert_eq!(rate, 48000);
         assert!(!samples.is_empty(), "Samples should not be empty for MKV with PCM audio");
+    }
+
+    #[test]
+    fn test_multitrack_mkv_decodes_track1_and_track2() {
+        let path = Path::new("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
+        if !path.exists() {
+            return;
+        }
+        // Декодируем дорожку 1 (Stream 0:1)
+        let res1 = AudioPlayer::decode_audio_stream_worker(path, 0);
+        assert!(res1.is_ok(), "Не удалось декодировать дорожку 1");
+        let (samples1, rate1) = res1.unwrap();
+        assert_eq!(rate1, 48000);
+        assert!(!samples1.is_empty());
+
+        // Декодируем дорожку 2 (Stream 0:2)
+        let res2 = AudioPlayer::decode_audio_stream_worker(path, 1);
+        assert!(res2.is_ok(), "Не удалось декодировать дорожку 2");
+        let (samples2, rate2) = res2.unwrap();
+        assert_eq!(rate2, 48000);
+        assert!(!samples2.is_empty());
     }
 }

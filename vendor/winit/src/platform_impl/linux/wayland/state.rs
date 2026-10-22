@@ -451,7 +451,7 @@ sctk::delegate_data_device!(WinitState);
 impl DataDeviceHandler for WinitState {
     fn enter(
         &mut self,
-        _conn: &Connection,
+        conn: &Connection,
         _qh: &QueueHandle<Self>,
         data_device: &sctk::reexports::client::protocol::wl_data_device::WlDataDevice,
         _x: f64,
@@ -463,12 +463,18 @@ impl DataDeviceHandler for WinitState {
 
         if let Some(data) = data_device.data::<DataDeviceData>() {
             if let Some(drag_offer) = data.drag_offer() {
-                let has_uri_list = drag_offer.with_mime_types(|types| {
-                    types.iter().any(|t| t == "text/uri-list")
+                let best_mime = drag_offer.with_mime_types(|types| {
+                    types.iter().find(|t| {
+                        t.starts_with("text/uri-list")
+                            || t.starts_with("text/plain")
+                            || t.starts_with("UTF8_STRING")
+                            || t.starts_with("x-special/gnome-copied-files")
+                    }).cloned()
                 });
-                if has_uri_list {
-                    drag_offer.accept_mime_type(drag_offer.serial, Some("text/uri-list".to_string()));
+                if let Some(mime) = best_mime {
+                    drag_offer.accept_mime_type(drag_offer.serial, Some(mime));
                     drag_offer.set_actions(DndAction::Copy, DndAction::Copy);
+                    let _ = conn.flush();
                 }
             }
         }
@@ -484,7 +490,7 @@ impl DataDeviceHandler for WinitState {
 
     fn motion(
         &mut self,
-        _conn: &Connection,
+        conn: &Connection,
         _qh: &QueueHandle<Self>,
         data_device: &sctk::reexports::client::protocol::wl_data_device::WlDataDevice,
         _x: f64,
@@ -495,12 +501,18 @@ impl DataDeviceHandler for WinitState {
 
         if let Some(data) = data_device.data::<DataDeviceData>() {
             if let Some(drag_offer) = data.drag_offer() {
-                let has_uri_list = drag_offer.with_mime_types(|types| {
-                    types.iter().any(|t| t == "text/uri-list")
+                let best_mime = drag_offer.with_mime_types(|types| {
+                    types.iter().find(|t| {
+                        t.starts_with("text/uri-list")
+                            || t.starts_with("text/plain")
+                            || t.starts_with("UTF8_STRING")
+                            || t.starts_with("x-special/gnome-copied-files")
+                    }).cloned()
                 });
-                if has_uri_list {
-                    drag_offer.accept_mime_type(drag_offer.serial, Some("text/uri-list".to_string()));
+                if let Some(mime) = best_mime {
+                    drag_offer.accept_mime_type(drag_offer.serial, Some(mime));
                     drag_offer.set_actions(DndAction::Copy, DndAction::Copy);
+                    let _ = conn.flush();
                 }
             }
         }
@@ -528,15 +540,24 @@ impl DataDeviceHandler for WinitState {
 
         if let Some(data) = data_device.data::<DataDeviceData>() {
             if let Some(drag_offer) = data.drag_offer() {
-                let has_uri = drag_offer.with_mime_types(|types| types.iter().any(|t| t == "text/uri-list"));
-                if !has_uri {
-                    return;
-                }
+                let best_mime = drag_offer.with_mime_types(|types| {
+                    types.iter().find(|t| {
+                        t.starts_with("text/uri-list")
+                            || t.starts_with("text/plain")
+                            || t.starts_with("UTF8_STRING")
+                            || t.starts_with("x-special/gnome-copied-files")
+                    }).cloned()
+                });
 
-                drag_offer.accept_mime_type(drag_offer.serial, Some("text/uri-list".to_string()));
+                let mime = match best_mime {
+                    Some(m) => m,
+                    None => return,
+                };
+
+                drag_offer.accept_mime_type(drag_offer.serial, Some(mime.clone()));
                 drag_offer.set_actions(DndAction::Copy, DndAction::Copy);
 
-                let mut read_pipe = match drag_offer.receive("text/uri-list".to_string()) {
+                let mut read_pipe = match drag_offer.receive(mime) {
                     Ok(pipe) => pipe,
                     Err(e) => {
                         tracing::warn!("Failed to receive dnd offer pipe: {e:?}");
@@ -556,11 +577,21 @@ impl DataDeviceHandler for WinitState {
                     Some(data) => data.parent_surface().unwrap_or(&drag_offer.surface),
                     None => &drag_offer.surface,
                 };
-                let window_id = crate::platform_impl::linux::wayland::make_wid(parent_surface);
+                let surface_window_id = crate::platform_impl::linux::wayland::make_wid(parent_surface);
+                let window_id = if self.windows.get_mut().contains_key(&surface_window_id) {
+                    surface_window_id
+                } else if let Some(&fallback_id) = self.windows.get_mut().keys().next() {
+                    fallback_id
+                } else {
+                    surface_window_id
+                };
 
                 for line in buffer.lines() {
                     let line = line.trim();
                     if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if line.starts_with("copy") || line.starts_with("cut") {
                         continue;
                     }
                     let path = if let Some(path_str) = line.strip_prefix("file://") {
@@ -580,6 +611,7 @@ impl DataDeviceHandler for WinitState {
                 }
 
                 drag_offer.finish();
+                let _ = conn.flush();
             }
         }
     }

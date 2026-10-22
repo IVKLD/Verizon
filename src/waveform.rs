@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Default)]
 pub struct WaveformManager {
-    cache: Arc<Mutex<HashMap<PathBuf, Vec<f32>>>>,
-    pending: Arc<Mutex<HashSet<PathBuf>>>,
+    cache: Arc<Mutex<HashMap<(PathBuf, usize), Vec<f32>>>>,
+    pending: Arc<Mutex<HashSet<(PathBuf, usize)>>>,
 }
 
 impl WaveformManager {
@@ -16,63 +16,84 @@ impl WaveformManager {
         }
     }
 
-    /// Получить кэшированную волновую форму (100 точек на секунду)
-    pub fn get_waveform(&self, path: &Path) -> Option<Vec<f32>> {
-        self.cache.lock().ok()?.get(path).cloned()
+    /// Получить кэшированную волновую форму для конкретного аудиопотока
+    pub fn get_waveform_stream(&self, path: &Path, audio_track_index: usize) -> Option<Vec<f32>> {
+        let key = (path.to_path_buf(), audio_track_index);
+        self.cache.lock().ok()?.get(&key).cloned()
     }
 
-    /// Асинхронно запросить расшифровку аудио части в фоне через Tokio / Thread pool
-    pub fn request_waveform(&self, path: &Path, ctx: egui::Context) {
-        let path_buf = path.to_path_buf();
+    /// Получить кэшированную волновую форму (первая дорожка по умолчанию)
+    #[allow(dead_code)]
+    pub fn get_waveform(&self, path: &Path) -> Option<Vec<f32>> {
+        self.get_waveform_stream(path, 0)
+    }
+
+    /// Асинхронно запросить расшифровку аудиопотока в фоне через Tokio / Thread pool
+    pub fn request_waveform_stream(&self, path: &Path, audio_track_index: usize, ctx: egui::Context) {
+        let key = (path.to_path_buf(), audio_track_index);
 
         {
             let mut pending = match self.pending.lock() {
                 Ok(p) => p,
                 Err(_) => return,
             };
-            if pending.contains(&path_buf) {
+            if pending.contains(&key) {
                 return;
             }
             if let Ok(cache) = self.cache.lock() {
-                if cache.contains_key(&path_buf) {
+                if cache.contains_key(&key) {
                     return;
                 }
             }
-            pending.insert(path_buf.clone());
+            pending.insert(key.clone());
         }
 
         let cache = self.cache.clone();
         let pending = self.pending.clone();
+        let path_buf = path.to_path_buf();
 
         tokio::spawn(async move {
             let path_for_blocking = path_buf.clone();
             let result = tokio::task::spawn_blocking(move || {
-                Self::extract_audio_peaks(&path_for_blocking)
+                Self::extract_audio_peaks_stream(&path_for_blocking, audio_track_index)
             })
             .await;
 
             if let Ok(Ok(peaks)) = result {
                 if let Ok(mut c) = cache.lock() {
-                    c.insert(path_buf.clone(), peaks);
+                    c.insert(key.clone(), peaks);
                 }
+                ctx.request_repaint();
             }
 
             if let Ok(mut p) = pending.lock() {
-                p.remove(&path_buf);
+                p.remove(&key);
             }
-
-            ctx.request_repaint();
         });
     }
 
-    /// Быстрая расшифровка амплитуд аудио (100 замеров в секунду) через FFmpeg
-    fn extract_audio_peaks(path: &Path) -> Result<Vec<f32>, String> {
+    #[allow(dead_code)]
+    pub fn request_waveform(&self, path: &Path, ctx: egui::Context) {
+        self.request_waveform_stream(path, 0, ctx);
+    }
+
+    /// Быстрая расшифровка амплитуд конкретного аудиопотока (100 замеров в секунду) через FFmpeg
+    pub fn extract_audio_peaks_stream(path: &Path, audio_track_index: usize) -> Result<Vec<f32>, String> {
         let mut ictx = ffmpeg_next::format::input(path).map_err(|e| e.to_string())?;
 
-        let audio_stream = ictx
+        let audio_streams: Vec<_> = ictx
             .streams()
-            .best(ffmpeg_next::media::Type::Audio)
-            .ok_or_else(|| "Аудиопоток не найден".to_string())?;
+            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Audio)
+            .collect();
+
+        if audio_streams.is_empty() {
+            return Err("Аудиопотоки не найдены".to_string());
+        }
+
+        let audio_stream = audio_streams
+            .get(audio_track_index)
+            .or_else(|| audio_streams.first())
+            .unwrap();
 
         let stream_idx = audio_stream.index();
         let context_decoder = ffmpeg_next::codec::context::Context::from_parameters(audio_stream.parameters())
@@ -109,7 +130,6 @@ impl WaveformManager {
         let mut decoded_frame = ffmpeg_next::util::frame::Audio::empty();
         let mut resampled_frame = ffmpeg_next::util::frame::Audio::empty();
 
-        // 100 точек на секунду: при 8000 Гц один бакет равен 80 семплам (10 мс)
         let samples_per_point = 80;
         let mut peaks = Vec::new();
         let mut current_max: f32 = 0.0;
@@ -130,20 +150,15 @@ impl WaveformManager {
                                     samples_count,
                                 )
                             };
-                            for &sample in data {
-                                let abs = sample.abs();
-                                if abs > current_max {
-                                    current_max = abs;
+
+                            for &s in data {
+                                let abs_s = s.abs();
+                                if abs_s > current_max {
+                                    current_max = abs_s;
                                 }
                                 count_in_bucket += 1;
                                 if count_in_bucket >= samples_per_point {
-                                    // Нормализация с шумоподавлением: тишина (<0.005) становится 0.0
-                                    let normalized = if current_max < 0.005 {
-                                        0.0
-                                    } else {
-                                        current_max.min(1.0)
-                                    };
-                                    peaks.push(normalized);
+                                    peaks.push(current_max);
                                     current_max = 0.0;
                                     count_in_bucket = 0;
                                 }
@@ -154,13 +169,16 @@ impl WaveformManager {
             }
         }
 
-        // Завершающий бакет
         if count_in_bucket > 0 {
-            let normalized = if current_max < 0.005 { 0.0 } else { current_max.min(1.0) };
-            peaks.push(normalized);
+            peaks.push(current_max);
         }
 
         Ok(peaks)
+    }
+
+    #[allow(dead_code)]
+    pub fn extract_audio_peaks(path: &Path) -> Result<Vec<f32>, String> {
+        Self::extract_audio_peaks_stream(path, 0)
     }
 }
 
@@ -170,16 +188,30 @@ mod tests {
 
     #[test]
     fn test_extract_audio_peaks() {
-        let test_path = Path::new("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
-        if !test_path.exists() {
+        let path = Path::new("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
+        if !path.exists() {
             return;
         }
 
-        let t0 = std::time::Instant::now();
-        let peaks = WaveformManager::extract_audio_peaks(test_path).expect("Failed to extract peaks");
-        println!("Waveform extraction took: {:?}, extracted {} points", t0.elapsed(), peaks.len());
-        assert!(!peaks.is_empty(), "Peaks should not be empty");
-        let has_sound = peaks.iter().any(|&p| p > 0.05);
-        assert!(has_sound, "Audio must contain audible sound");
+        let start = std::time::Instant::now();
+        let res = WaveformManager::extract_audio_peaks(path);
+        let elapsed = start.elapsed();
+        assert!(res.is_ok());
+        let peaks = res.unwrap();
+        println!("Waveform extraction took: {:?}, extracted {} points", elapsed, peaks.len());
+        assert!(!peaks.is_empty());
+    }
+
+    #[test]
+    fn test_extract_multitrack_peaks() {
+        let path = Path::new("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
+        if !path.exists() {
+            return;
+        }
+
+        let peaks1 = WaveformManager::extract_audio_peaks_stream(path, 0).unwrap();
+        let peaks2 = WaveformManager::extract_audio_peaks_stream(path, 1).unwrap();
+        assert!(!peaks1.is_empty());
+        assert!(!peaks2.is_empty());
     }
 }

@@ -37,6 +37,7 @@ pub struct Clip {
     pub opacity: f32,
     pub volume_db: f32,
     pub pan: f32,
+    pub source_audio_stream: usize,
 }
 
 impl Clip {
@@ -86,6 +87,7 @@ pub struct TimelineState {
     pub fps: u32,
     pub zoom_factor: f32, // Пикселей на кадр
     pub scroll_x: f32,
+    pub scroll_y: f32,
 
     pub in_point: Option<i64>,
     pub out_point: Option<i64>,
@@ -110,6 +112,9 @@ pub struct TimelineState {
 
     // История для Undo
     pub history: Vec<Vec<Clip>>,
+
+    // Флаг необходимости пересчета аудиомикса
+    pub audio_dirty: bool,
 }
 
 impl TimelineState {
@@ -154,6 +159,7 @@ impl TimelineState {
             fps: 24,
             zoom_factor: 2.0,
             scroll_x: 0.0,
+            scroll_y: 0.0,
             in_point: None,
             out_point: None,
             loop_enabled: false,
@@ -168,6 +174,7 @@ impl TimelineState {
             moving_clip: None,
             pending_imports: Vec::new(),
             history: Vec::new(),
+            audio_dirty: true,
         }
     }
 
@@ -207,6 +214,7 @@ impl TimelineState {
     pub fn undo(&mut self) {
         if let Some(prev) = self.history.pop() {
             self.clips = prev;
+            self.audio_dirty = true;
         }
     }
 
@@ -276,6 +284,7 @@ impl TimelineState {
                 self.clips.insert(idx + 1, right_clip);
             }
         }
+        self.audio_dirty = true;
         true
     }
 
@@ -293,6 +302,7 @@ impl TimelineState {
             for id in intersecting_ids {
                 self.blade_cut_at(id, playhead);
             }
+            self.audio_dirty = true;
         }
     }
 
@@ -307,6 +317,7 @@ impl TimelineState {
                 self.clips.retain(|c| c.id != selected_id);
             }
             self.selected_clip_id = None;
+            self.audio_dirty = true;
         }
     }
 
@@ -361,6 +372,7 @@ impl TimelineState {
         } else {
             self.clips[clip_idx].start_frame = target_frame;
         }
+        self.audio_dirty = true;
     }
 
     /// Шаг плейхеда при воспроизведении с точной остановкой в конце таймлайна
@@ -497,6 +509,7 @@ mod tests {
             opacity: 100.0,
             volume_db: 0.0,
             pan: 0.0,
+            source_audio_stream: 0,
         });
 
         tl.clips.push(Clip {
@@ -520,6 +533,7 @@ mod tests {
             opacity: 100.0,
             volume_db: 0.0,
             pan: 0.0,
+            source_audio_stream: 0,
         });
 
         // Режем на кадре 96 (ровно 4.0 секунды)
@@ -572,6 +586,7 @@ mod tests {
             opacity: 100.0,
             volume_db: 0.0,
             pan: 0.0,
+            source_audio_stream: 0,
         });
 
         tl.is_playing = true;
@@ -615,6 +630,7 @@ mod tests {
             opacity: 100.0,
             volume_db: 0.0,
             pan: 0.0,
+            source_audio_stream: 0,
         });
 
         tl.clips.push(Clip {
@@ -638,6 +654,7 @@ mod tests {
             opacity: 100.0,
             volume_db: 0.0,
             pan: 0.0,
+            source_audio_stream: 0,
         });
 
         // Перемещаем только видеоклип на 30 кадр
@@ -675,6 +692,7 @@ mod tests {
             opacity: 100.0,
             volume_db: 0.0,
             pan: 0.0,
+            source_audio_stream: 0,
         });
 
         // Режем на кадре 25

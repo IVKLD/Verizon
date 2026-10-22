@@ -263,8 +263,14 @@ impl NleApp {
             let mut total_imported = 0;
             for file in dropped_files {
                 let p = file.path();
-                let maybe_path = if !p.as_os_str().is_empty() && p.exists() {
-                    Some(p.to_path_buf())
+                let maybe_path = if !p.as_os_str().is_empty() {
+                    if p.exists() {
+                        Some(p.to_path_buf())
+                    } else if let Some(decoded) = Self::decode_uri_path(&p.to_string_lossy()) {
+                        Some(decoded)
+                    } else {
+                        None
+                    }
                 } else if let Ok(bytes) = file.bytes() {
                     if let Ok(text) = std::str::from_utf8(&bytes) {
                         Self::decode_uri_path(text)
@@ -397,17 +403,38 @@ impl NleApp {
                 self.timeline.out_point = None;
             }
 
-            // J / K / L Shuttle
+            // J / K / L Shuttle (Прогрессивный Shuttle в стиле DaVinci Resolve)
             if i.key_pressed(egui::Key::J) {
-                self.timeline.playback_speed = -2.0;
-                self.timeline.is_playing = true;
+                if !self.timeline.is_playing {
+                    self.timeline.is_playing = true;
+                    self.timeline.playback_speed = -1.0;
+                } else if self.timeline.playback_speed > 0.0 {
+                    self.timeline.playback_speed = -1.0;
+                } else if self.timeline.playback_speed == -1.0 {
+                    self.timeline.playback_speed = -2.0;
+                } else if self.timeline.playback_speed == -2.0 {
+                    self.timeline.playback_speed = -4.0;
+                } else if self.timeline.playback_speed <= -4.0 {
+                    self.timeline.playback_speed = -8.0;
+                }
             }
             if i.key_pressed(egui::Key::K) {
                 self.timeline.is_playing = false;
+                self.timeline.playback_speed = 1.0;
             }
             if i.key_pressed(egui::Key::L) {
-                self.timeline.playback_speed = 2.0;
-                self.timeline.is_playing = true;
+                if !self.timeline.is_playing {
+                    self.timeline.is_playing = true;
+                    self.timeline.playback_speed = 1.0;
+                } else if self.timeline.playback_speed < 0.0 {
+                    self.timeline.playback_speed = 1.0;
+                } else if self.timeline.playback_speed == 1.0 {
+                    self.timeline.playback_speed = 2.0;
+                } else if self.timeline.playback_speed == 2.0 {
+                    self.timeline.playback_speed = 4.0;
+                } else if self.timeline.playback_speed >= 4.0 {
+                    self.timeline.playback_speed = 8.0;
+                }
             }
 
             // Инструменты: A (Arrow), B (Blade)
@@ -724,28 +751,16 @@ impl eframe::App for NleApp {
             ctx.request_repaint(); // 144+ FPS перерисовка при активном воспроизведении
         }
 
-        // 2. Синхронизация звука с видеоплейбэком активного аудиоклипа
-        let active_audio_clip = self
-            .timeline
-            .clips
-            .iter()
-            .find(|c| c.is_audio && c.contains_frame(self.timeline.playhead_frame));
-
-        if let Some(clip) = active_audio_clip {
-            if let Some(path) = &clip.source_path {
-                if self.audio_player.current_path.as_deref() != Some(path.as_path()) {
-                    let _ = self.audio_player.load_audio_from_file(path);
-                }
-                let offset = self.timeline.playhead_frame - clip.start_frame;
-                let time_in_clip = offset as f64 / self.timeline.fps as f64;
-                let total_source_secs = clip.source_in_secs + time_in_clip;
-                self.audio_player.sync_playhead(Some(total_source_secs), self.timeline.is_playing);
-            } else {
-                self.audio_player.sync_playhead(None, self.timeline.is_playing);
-            }
-        } else {
-            self.audio_player.sync_playhead(None, self.timeline.is_playing);
+        // 2. Многодорожечный Audio Mixer (Multi-Track Audio Engine)
+        if self.timeline.audio_dirty {
+            self.audio_player.rebuild_timeline_audio(&self.timeline);
+            self.timeline.audio_dirty = false;
         }
+        self.audio_player.sync_playhead_frame(
+            self.timeline.playhead_frame,
+            self.timeline.fps,
+            self.timeline.is_playing,
+        );
 
         // 3. Обработка Drag & Drop файлов и буфера обмена (Ctrl+V)
         self.handle_drag_and_drop(&ctx);

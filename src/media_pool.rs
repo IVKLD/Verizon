@@ -204,6 +204,7 @@ impl MediaPoolState {
                         opacity: 100.0,
                         volume_db: 0.0,
                         pan: 0.0,
+                        source_audio_stream: 0,
                     };
                     timeline.next_clip_id += 1;
                     timeline.selected_clip_id = Some(v_clip.id);
@@ -243,6 +244,7 @@ impl MediaPoolState {
                             opacity: 100.0,
                             volume_db: 0.0,
                             pan: 0.0,
+                            source_audio_stream: a_idx,
                         };
                         timeline.next_clip_id += 1;
                         if !asset.has_video && a_idx == 0 {
@@ -251,6 +253,7 @@ impl MediaPoolState {
                         timeline.clips.push(a_clip);
                     }
                 }
+                timeline.audio_dirty = true;
             }
         }
     }
