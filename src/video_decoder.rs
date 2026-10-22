@@ -165,9 +165,9 @@ impl VideoPlayer {
         if self.is_real_video {
             let now = std::time::Instant::now();
             let elapsed = now.duration_since(self.last_request_time).as_millis();
-            // Троттлинг запросов во время непрерывного скраббинга (не чаще 30 раз в секунду)
-            // Это устраняет перегрузку шины и планировщика и полностью ликвидирует любые лаги
-            if elapsed >= 30 || target_frame == 0 {
+            // Троттлинг 60 FPS (16мс) при быстром скраббинге, при последовательном воспроизведении отправляем каждый кадр
+            let is_sequential = target_frame == self.last_decoded_frame + 1;
+            if elapsed >= 16 || target_frame == 0 || is_sequential {
                 self.last_request_time = now;
                 if let Some(tx) = &self.request_tx {
                     let _ = tx.send(target_frame);
@@ -239,11 +239,16 @@ impl VideoPlayer {
             Err(_) => return,
         };
 
-        // Высокопроизводительное многопоточное декодирование на ядрах процессора (оптимум 16 потоков по рекомендации FFmpeg)
+        context_decoder.set_flags(ffmpeg_next::codec::flag::Flags::LOW_DELAY);
+        unsafe {
+            (*context_decoder.as_mut_ptr()).flags2 |= ffmpeg_next::ffi::AV_CODEC_FLAG2_FAST as i32;
+        }
+
+        // Высокопроизводительное многопоточное декодирование на ядрах процессора
         let num_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(8)
-            .min(16);
+            .min(12);
 
         context_decoder.set_threading(ffmpeg_next::codec::threading::Config {
             kind: ffmpeg_next::codec::threading::Type::Frame,
@@ -285,7 +290,7 @@ impl VideoPlayer {
             }
 
             let time_base_f = f64::from(time_base);
-            let target_pts = if time_base_f > 0.0 {
+            let mut target_pts = if time_base_f > 0.0 {
                 (target_frame as f64 / fps / time_base_f).round() as i64
             } else {
                 target_frame
@@ -297,15 +302,16 @@ impl VideoPlayer {
                 1
             };
             let tolerance = (frame_duration_pts / 2).max(1);
-            let one_sec_pts = if time_base_f > 0.0 {
-                (1.0 / time_base_f).round() as i64
+            let gop_max_pts = if time_base_f > 0.0 {
+                (3.0 / time_base_f).round() as i64
             } else {
-                30
+                180
             };
 
             let pts_delta = target_pts - current_pts;
+            let mut waiting_for_keyframe = false;
 
-            if current_pts < 0 || pts_delta < -tolerance || pts_delta > one_sec_pts {
+            if current_pts < 0 || pts_delta < -tolerance || pts_delta > gop_max_pts {
                 unsafe {
                     ffmpeg_next::ffi::av_seek_frame(
                         ictx.as_mut_ptr(),
@@ -314,51 +320,79 @@ impl VideoPlayer {
                         ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
                     );
                 }
-                let _ = video_decoder.flush();
+                video_decoder.flush();
                 current_pts = -1;
+                waiting_for_keyframe = true;
             }
 
             let mut found_image: Option<ColorImage> = None;
             let mut keyframe_sent = false;
 
-            // 1. Проверяем буферизованные кадры в декодере
-            while video_decoder.receive_frame(&mut decoded_frame).is_ok() {
-                if let Some(pts) = decoded_frame.pts() {
-                    current_pts = pts;
-                    if pts >= target_pts - tolerance {
-                        found_image = Self::scale_and_copy_frame(
-                            &mut scaler,
-                            &decoded_frame,
-                            &mut rgba_frame,
-                            w,
-                            h,
-                            &mut rgba_buffer,
-                        );
-                        break;
+            // 1. Проверяем буферизованные кадры в декодере, если не было сброса
+            if !waiting_for_keyframe {
+                while video_decoder.receive_frame(&mut decoded_frame).is_ok() {
+                    if let Some(pts) = decoded_frame.pts() {
+                        current_pts = pts;
+                        if pts >= target_pts - tolerance {
+                            found_image = Self::scale_and_copy_frame(
+                                &mut scaler,
+                                &decoded_frame,
+                                &mut rgba_frame,
+                                w,
+                                h,
+                                &mut rgba_buffer,
+                            );
+                            break;
+                        }
                     }
                 }
             }
 
             // 2. Читаем новые пакеты до достижения целевого кадра
             if found_image.is_none() {
-                let mut packets_read = 0;
                 let mut latest_frame_img: Option<ColorImage> = None;
 
                 for (st, packet) in ictx.packets() {
-                    // Если во время декодирования уже пришел новый запрос от мыши — прерываемся!
-                    if req_rx.try_recv().is_ok() {
-                        break;
+                    // Если во время декодирования пришел новый запрос от мыши:
+                    if let Ok(newer) = req_rx.try_recv() {
+                        let mut latest = newer;
+                        while let Ok(even_newer) = req_rx.try_recv() {
+                            latest = even_newer;
+                        }
+                        target_frame = latest;
+                        let new_target_pts = if time_base_f > 0.0 {
+                            (target_frame as f64 / fps / time_base_f).round() as i64
+                        } else {
+                            target_frame
+                        };
+                        // Если новый кадр впереди в том же диапазоне — обновляем цель и продолжаем раскодирование
+                        if new_target_pts >= current_pts && (new_target_pts - current_pts) <= gop_max_pts {
+                            target_pts = new_target_pts;
+                        } else {
+                            // Если новый кадр позади — прерываемся и сбрасываем PTS, чтобы выполнить чистый seek
+                            current_pts = -1;
+                            break;
+                        }
                     }
 
                     if st.index() == stream_idx {
-                        packets_read += 1;
+                        // КРИТИЧЕСКИ ВАЖНО ДЛЯ HEVC:
+                        // После flush декодер не имеет опорных кадров.
+                        // Пропускаем любые не-ключевые пакеты, пока не встретим I-frame (is_key == true)!
+                        if waiting_for_keyframe {
+                            if packet.is_key() {
+                                waiting_for_keyframe = false;
+                            } else {
+                                continue;
+                            }
+                        }
+
                         if video_decoder.send_packet(&packet).is_ok() {
                             while video_decoder.receive_frame(&mut decoded_frame).is_ok() {
                                 if let Some(pts) = decoded_frame.pts() {
                                     current_pts = pts;
 
-                                    // Отправляем первый декодированный опорный кадр (Keyframe) мгновенно!
-                                    // Это дает мгновенный отклик превью при скраббинге (1-2 мс вместо ожидания 100 кадров)
+                                    // Мгновенная отправка опорного кадра для отклика
                                     if !keyframe_sent {
                                         if let Some(kf_img) = Self::scale_and_copy_frame(
                                             &mut scaler,
@@ -398,7 +432,7 @@ impl VideoPlayer {
                             }
                         }
                     }
-                    if found_image.is_some() || packets_read > 90 {
+                    if found_image.is_some() {
                         break;
                     }
                 }
@@ -529,5 +563,29 @@ mod tests {
         // Перемотка на кадр 600
         assert!(player.wait_for_frame(600, &ctx, std::time::Duration::from_secs(3)));
         assert_eq!(player.last_decoded_frame, 600);
+    }
+
+    #[test]
+    fn test_seek_packets() {
+        let test_path = Path::new("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
+        if !test_path.exists() {
+            return;
+        }
+
+        let ctx = egui::Context::default();
+        let mut player = VideoPlayer::new();
+        assert!(player.open_file(test_path, &ctx).is_ok());
+
+        // Проверяем устойчивость к быстрому случайному скраббингу по всему 4K HEVC файлу
+        let scrub_frames = [0, 50, 120, 240, 350, 480, 210, 75, 590, 15, 0];
+        for &frame in &scrub_frames {
+            player.force_seek_frame(frame, &ctx);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            player.poll_frames(&ctx);
+        }
+
+        // Финальный кадр должен успешно декодироваться
+        assert!(player.wait_for_frame(350, &ctx, std::time::Duration::from_secs(3)));
+        assert_eq!(player.last_decoded_frame, 350);
     }
 }
