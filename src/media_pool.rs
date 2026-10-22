@@ -360,6 +360,7 @@ impl MediaPoolState {
                                 has_audio: asset.has_audio,
                                 audio_tracks_count: asset.audio_tracks_count,
                                 duration_frames: dur_frames,
+                                duration_secs: asset.duration_secs,
                                 source_fps: asset.fps_num,
                                 link_group: None,
                             });

@@ -161,8 +161,9 @@ impl VideoPlayer {
                     let _ = tx.send(DecoderCommand::Play { start_frame: target_frame });
                 }
             } else {
-                let jump = (target_frame - self.last_playback_target).abs();
-                if jump > 5 {
+                let jump = target_frame - self.last_playback_target;
+                // Сбрасываем очередь и отправляем Play только при РЕАЛЬНОМ скачке пользователем (назад или вперед >60 кадров)
+                if jump < -5 || jump > 60 {
                     self.frame_queue.clear();
                     if let Some(tx) = &self.command_tx {
                         let _ = tx.send(DecoderCommand::Play { start_frame: target_frame });
@@ -347,6 +348,8 @@ impl VideoPlayer {
             *pix_fmts
         }
 
+        ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Fatal);
+
         let mut ictx = match ffmpeg_next::format::input(&path) {
             Ok(c) => c,
             Err(_) => return,
@@ -410,15 +413,17 @@ impl VideoPlayer {
             }
         }
 
-        let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8)
-            .min(16);
+        if hw_device_ctx.is_null() {
+            let num_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8)
+                .min(8);
 
-        context_decoder.set_threading(ffmpeg_next::codec::threading::Config {
-            kind: ffmpeg_next::codec::threading::Type::Frame,
-            count: num_threads,
-        });
+            context_decoder.set_threading(ffmpeg_next::codec::threading::Config {
+                kind: ffmpeg_next::codec::threading::Type::Frame,
+                count: num_threads,
+            });
+        }
 
         let mut video_decoder = match context_decoder.decoder().video() {
             Ok(d) => d,
@@ -462,329 +467,327 @@ impl VideoPlayer {
 
         let mut is_playing = false;
         let mut playhead_frame: i64 = 0;
-        let mut start_playback_frame: i64 = 0;
+        let mut start_playback_frame: i64;
         let mut waiting_for_keyframe = false;
         let mut pending_cmd: Option<DecoderCommand> = None;
 
         'worker_loop: loop {
-            if !is_playing {
-                // Режим паузы / ожидания команды
-                let cmd = if let Some(c) = pending_cmd.take() {
-                    c
-                } else {
-                    match cmd_rx.recv() {
-                        Ok(c) => c,
-                        Err(_) => break 'worker_loop,
-                    }
-                };
-
-                let mut active_cmd = cmd;
-                // Схлопываем скопившиеся команды Seek, чтобы не обрабатывать устаревшие промежуточные кадры
-                while let Ok(newer) = cmd_rx.try_recv() {
-                    match newer {
-                        DecoderCommand::Seek { .. } | DecoderCommand::Play { .. } | DecoderCommand::Pause => {
-                            active_cmd = newer;
-                        }
-                        DecoderCommand::UpdatePlayhead { .. } => {}
-                    }
-                }
-
-                match active_cmd {
-                    DecoderCommand::Play { start_frame } => {
-                        is_playing = true;
-                        playhead_frame = start_frame;
-                        start_playback_frame = start_frame;
-
-                        let target_pts = if time_base_f > 0.0 {
-                            (start_frame as f64 / fps / time_base_f).round() as i64
-                        } else {
-                            start_frame
-                        };
-
-                        let pts_delta = target_pts - current_pts;
-                        if current_pts < 0 || pts_delta < -tolerance || pts_delta > gop_max_pts {
-                            unsafe {
-                                ffmpeg_next::ffi::av_seek_frame(
-                                    ictx.as_mut_ptr(),
-                                    stream_idx as i32,
-                                    target_pts,
-                                    ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
-                                );
-                            }
-                            video_decoder.flush();
-                            current_pts = -1;
-                            current_decoded_frame = -1;
-                            waiting_for_keyframe = true;
-                        }
-                    }
-                    DecoderCommand::Seek { mut target_frame } => {
-                        let mut target_pts = if time_base_f > 0.0 {
-                            (target_frame as f64 / fps / time_base_f).round() as i64
-                        } else {
-                            target_frame
-                        };
-
-                        let pts_delta = target_pts - current_pts;
-                        if current_pts < 0 || pts_delta < -tolerance || pts_delta > gop_max_pts {
-                            unsafe {
-                                ffmpeg_next::ffi::av_seek_frame(
-                                    ictx.as_mut_ptr(),
-                                    stream_idx as i32,
-                                    target_pts,
-                                    ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
-                                );
-                            }
-                            video_decoder.flush();
-                            current_pts = -1;
-                            current_decoded_frame = -1;
-                            waiting_for_keyframe = true;
-                        }
-
-                        let mut found_image: Option<ColorImage> = None;
-                        let mut keyframe_sent = false;
-
-                        // 1. Проверяем буферизованные кадры в декодере, если не было сброса
-                        if !waiting_for_keyframe {
-                            while video_decoder.receive_frame(&mut decoded_frame).is_ok() {
-                                let pts = decoded_frame.pts().unwrap_or(current_pts + frame_duration_pts);
-                                current_pts = pts;
-                                current_decoded_frame = (pts as f64 * time_base_f * fps).round() as i64;
-                                if pts >= target_pts - tolerance {
-                                    found_image = Self::scale_and_copy_frame(
-                                        &mut scaler,
-                                        &decoded_frame,
-                                        &mut sw_frame,
-                                        &mut rgba_frame,
-                                        w,
-                                        h,
-                                        &mut rgba_buffer,
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-
-                        // 2. Читаем новые пакеты до достижения целевого кадра
-                        if found_image.is_none() {
-                            for (st, packet) in ictx.packets() {
-                                // Если во время скраббинга пришел новый запрос от мыши:
-                                if let Ok(mut newer) = cmd_rx.try_recv() {
-                                    while let Ok(even_newer) = cmd_rx.try_recv() {
-                                        newer = even_newer;
-                                    }
-                                    match newer {
-                                        DecoderCommand::Seek { target_frame: newer_target } => {
-                                            target_frame = newer_target;
-                                            let new_target_pts = if time_base_f > 0.0 {
-                                                (target_frame as f64 / fps / time_base_f).round() as i64
-                                            } else {
-                                                target_frame
-                                            };
-                                            if new_target_pts >= current_pts && (new_target_pts - current_pts) <= gop_max_pts {
-                                                target_pts = new_target_pts;
-                                            } else {
-                                                current_pts = -1;
-                                                pending_cmd = Some(DecoderCommand::Seek { target_frame });
-                                                break;
-                                            }
-                                        }
-                                        DecoderCommand::Play { start_frame } => {
-                                            is_playing = true;
-                                            playhead_frame = start_frame;
-                                            pending_cmd = Some(DecoderCommand::Play { start_frame });
-                                            break;
-                                        }
-                                        DecoderCommand::Pause => {}
-                                        DecoderCommand::UpdatePlayhead { .. } => {}
-                                    }
-                                }
-
-                                if st.index() == stream_idx {
-                                    if waiting_for_keyframe {
-                                        if packet.is_key() {
-                                            waiting_for_keyframe = false;
-                                        } else {
-                                            continue;
-                                        }
-                                    }
-
-                                    if video_decoder.send_packet(&packet).is_ok() {
-                                        while video_decoder.receive_frame(&mut decoded_frame).is_ok() {
-                                            let pts = decoded_frame.pts().unwrap_or(current_pts + frame_duration_pts);
-                                            current_pts = pts;
-                                            let f_num = (pts as f64 * time_base_f * fps).round() as i64;
-                                            current_decoded_frame = f_num;
-
-                                            // Мгновенная отправка опорного кадра при перемотке на далекие расстояния
-                                            if !keyframe_sent {
-                                                if let Some(kf_img) = Self::scale_and_copy_frame(
-                                                    &mut scaler,
-                                                    &decoded_frame,
-                                                    &mut sw_frame,
-                                                    &mut rgba_frame,
-                                                    w,
-                                                    h,
-                                                    &mut rgba_buffer,
-                                                ) {
-                                                    let _ = frame_tx.send((target_frame, kf_img));
-                                                    egui_ctx.request_repaint();
-                                                    keyframe_sent = true;
-                                                }
-                                            }
-
-                                            if pts >= target_pts - tolerance {
-                                                found_image = Self::scale_and_copy_frame(
-                                                    &mut scaler,
-                                                    &decoded_frame,
-                                                    &mut sw_frame,
-                                                    &mut rgba_frame,
-                                                    w,
-                                                    h,
-                                                    &mut rgba_buffer,
-                                                );
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if found_image.is_some() {
-                                    break;
-                                }
-                            }
-                        }
-
-                        if let Some(img) = found_image {
-                            let _ = frame_tx.send((target_frame, img));
-                            egui_ctx.request_repaint();
-                        }
-                    }
-                    DecoderCommand::Pause => {}
-                    DecoderCommand::UpdatePlayhead { .. } => {}
+            let active_cmd = if let Some(c) = pending_cmd.take() {
+                c
+            } else if is_playing {
+                match cmd_rx.try_recv() {
+                    Ok(c) => c,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => DecoderCommand::Play { start_frame: playhead_frame },
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'worker_loop,
                 }
             } else {
-                // --- РЕЖИМ НЕПРЕРЫВНОГО ВОСПРОИЗВЕДЕНИЯ (Streaming Jitter Buffer) ---
-                let mut eof_reached = true;
+                match cmd_rx.recv() {
+                    Ok(c) => c,
+                    Err(_) => break 'worker_loop,
+                }
+            };
 
-                for (st, packet) in ictx.packets() {
-                    let mut break_packet_loop = false;
-
-                    // Проверяем команды от UI во время воспроизведения
-                    while let Ok(cmd) = cmd_rx.try_recv() {
-                        match cmd {
-                            DecoderCommand::UpdatePlayhead { playhead_frame: new_pf } => {
-                                playhead_frame = new_pf;
-                            }
-                            DecoderCommand::Play { start_frame } => {
-                                playhead_frame = start_frame;
-                                start_playback_frame = start_frame;
-                                if (start_frame - current_decoded_frame).abs() > 5 || start_frame < current_decoded_frame {
-                                    is_playing = false;
-                                    pending_cmd = Some(DecoderCommand::Play { start_frame });
-                                    break_packet_loop = true;
-                                    break;
-                                }
-                            }
-                            DecoderCommand::Pause => {
-                                is_playing = false;
-                                break_packet_loop = true;
-                                break;
-                            }
-                            DecoderCommand::Seek { target_frame } => {
-                                is_playing = false;
-                                pending_cmd = Some(DecoderCommand::Seek { target_frame });
-                                break_packet_loop = true;
-                                break;
-                            }
-                        }
+            let mut resolved_cmd = active_cmd;
+            while let Ok(newer) = cmd_rx.try_recv() {
+                match newer {
+                    DecoderCommand::Seek { .. } | DecoderCommand::Play { .. } | DecoderCommand::Pause => {
+                        resolved_cmd = newer;
                     }
-
-                    if break_packet_loop {
-                        eof_reached = false;
-                        break;
-                    }
-
-                    if st.index() == stream_idx {
-                        if waiting_for_keyframe {
-                            if packet.is_key() {
-                                waiting_for_keyframe = false;
-                            } else {
-                                continue;
-                            }
-                        }
-
-                        if video_decoder.send_packet(&packet).is_ok() {
-                            while video_decoder.receive_frame(&mut decoded_frame).is_ok() {
-                                let pts = decoded_frame.pts().unwrap_or(current_pts + frame_duration_pts);
-                                current_pts = pts;
-                                let f_num = (pts as f64 * time_base_f * fps).round() as i64;
-                                current_decoded_frame = f_num;
-
-                                // Отправляем все кадры потока, начиная со start_playback_frame
-                                if f_num >= start_playback_frame {
-                                    if let Some(img) = Self::scale_and_copy_frame(
-                                        &mut scaler,
-                                        &decoded_frame,
-                                        &mut sw_frame,
-                                        &mut rgba_frame,
-                                        w,
-                                        h,
-                                        &mut rgba_buffer,
-                                    ) {
-                                        let _ = frame_tx.send((f_num, img));
-                                        egui_ctx.request_repaint();
-                                    }
-                                }
-
-                                // Упреждающий троттлинг: держим буфер декодера впереди не более 20 кадров
-                                while is_playing && current_decoded_frame > playhead_frame + 20 {
-                                    match cmd_rx.recv_timeout(std::time::Duration::from_millis(4)) {
-                                        Ok(DecoderCommand::UpdatePlayhead { playhead_frame: new_pf }) => {
-                                            playhead_frame = new_pf;
-                                        }
-                                        Ok(DecoderCommand::Play { start_frame }) => {
-                                            playhead_frame = start_frame;
-                                            if (start_frame - current_decoded_frame).abs() > 5 || start_frame < current_decoded_frame {
-                                                is_playing = false;
-                                                pending_cmd = Some(DecoderCommand::Play { start_frame });
-                                                break_packet_loop = true;
-                                                break;
-                                            }
-                                        }
-                                        Ok(DecoderCommand::Pause) => {
-                                            is_playing = false;
-                                            break;
-                                        }
-                                        Ok(DecoderCommand::Seek { target_frame }) => {
-                                            is_playing = false;
-                                            pending_cmd = Some(DecoderCommand::Seek { target_frame });
-                                            break_packet_loop = true;
-                                            break;
-                                        }
-                                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                            // Таймаут истек, продолжаем проверку условия цикла
-                                        }
-                                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                            break 'worker_loop;
-                                        }
-                                    }
-                                }
-
-                                if break_packet_loop || !is_playing {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    if break_packet_loop || !is_playing {
-                        eof_reached = false;
-                        break;
+                    DecoderCommand::UpdatePlayhead { playhead_frame: new_pf } => {
+                        playhead_frame = new_pf;
                     }
                 }
+            }
 
-                if eof_reached {
+            match resolved_cmd {
+                DecoderCommand::Pause => {
                     is_playing = false;
+                }
+                DecoderCommand::UpdatePlayhead { playhead_frame: new_pf } => {
+                    playhead_frame = new_pf;
+                }
+                DecoderCommand::Seek { mut target_frame } => {
+                    is_playing = false;
+                    let mut target_pts = if time_base_f > 0.0 {
+                        (target_frame as f64 / fps / time_base_f).round() as i64
+                    } else {
+                        target_frame
+                    };
+
+                    let can_decode_forward = current_pts >= 0
+                        && target_pts >= current_pts
+                        && (target_pts - current_pts) <= gop_max_pts
+                        && !waiting_for_keyframe;
+
+                    if !can_decode_forward {
+                        unsafe {
+                            ffmpeg_next::ffi::av_seek_frame(
+                                ictx.as_mut_ptr(),
+                                stream_idx as i32,
+                                target_pts,
+                                ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
+                            );
+                        }
+                        video_decoder.flush();
+                        current_pts = -1;
+                        current_decoded_frame = -1;
+                        waiting_for_keyframe = true;
+                    }
+
+                    let mut found_image: Option<ColorImage> = None;
+                    let mut keyframe_sent = false;
+
+                    if !waiting_for_keyframe {
+                        while video_decoder.receive_frame(&mut decoded_frame).is_ok() {
+                            let pts = decoded_frame.pts().unwrap_or(current_pts + frame_duration_pts);
+                            current_pts = pts;
+                            let f_num = (pts as f64 * time_base_f * fps).round() as i64;
+                            current_decoded_frame = f_num;
+                            if pts >= target_pts - tolerance {
+                                found_image = Self::scale_and_copy_frame(
+                                    &mut scaler,
+                                    &decoded_frame,
+                                    &mut sw_frame,
+                                    &mut rgba_frame,
+                                    w,
+                                    h,
+                                    &mut rgba_buffer,
+                                );
+                                break;
+                            }
+                        }
+                    }
+
+                    if found_image.is_none() {
+                        for (st, packet) in ictx.packets() {
+                            if let Ok(mut newer) = cmd_rx.try_recv() {
+                                while let Ok(even_newer) = cmd_rx.try_recv() {
+                                    newer = even_newer;
+                                }
+                                match newer {
+                                    DecoderCommand::Seek { target_frame: newer_target } => {
+                                        target_frame = newer_target;
+                                        let new_target_pts = if time_base_f > 0.0 {
+                                            (target_frame as f64 / fps / time_base_f).round() as i64
+                                        } else {
+                                            target_frame
+                                        };
+                                        if new_target_pts >= current_pts && (new_target_pts - current_pts) <= gop_max_pts {
+                                            target_pts = new_target_pts;
+                                        } else {
+                                            pending_cmd = Some(DecoderCommand::Seek { target_frame });
+                                            break;
+                                        }
+                                    }
+                                    DecoderCommand::Play { start_frame } => {
+                                        pending_cmd = Some(DecoderCommand::Play { start_frame });
+                                        break;
+                                    }
+                                    DecoderCommand::Pause => {
+                                        break;
+                                    }
+                                    DecoderCommand::UpdatePlayhead { playhead_frame: pf } => {
+                                        playhead_frame = pf;
+                                    }
+                                }
+                            }
+
+                            if st.index() == stream_idx {
+                                if waiting_for_keyframe {
+                                    if packet.is_key() {
+                                        waiting_for_keyframe = false;
+                                    } else {
+                                        continue;
+                                    }
+                                }
+
+                                if video_decoder.send_packet(&packet).is_ok() {
+                                    while video_decoder.receive_frame(&mut decoded_frame).is_ok() {
+                                        let pts = decoded_frame.pts().unwrap_or(current_pts + frame_duration_pts);
+                                        current_pts = pts;
+                                        let f_num = (pts as f64 * time_base_f * fps).round() as i64;
+                                        current_decoded_frame = f_num;
+
+                                        if !keyframe_sent {
+                                            if let Some(kf_img) = Self::scale_and_copy_frame(
+                                                &mut scaler,
+                                                &decoded_frame,
+                                                &mut sw_frame,
+                                                &mut rgba_frame,
+                                                w,
+                                                h,
+                                                &mut rgba_buffer,
+                                            ) {
+                                                let _ = frame_tx.send((target_frame, kf_img));
+                                                egui_ctx.request_repaint();
+                                                keyframe_sent = true;
+                                            }
+                                        }
+
+                                        if pts >= target_pts - tolerance {
+                                            found_image = Self::scale_and_copy_frame(
+                                                &mut scaler,
+                                                &decoded_frame,
+                                                &mut sw_frame,
+                                                &mut rgba_frame,
+                                                w,
+                                                h,
+                                                &mut rgba_buffer,
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if found_image.is_some() {
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Some(img) = found_image {
+                        let _ = frame_tx.send((target_frame, img));
+                        egui_ctx.request_repaint();
+                    }
+                }
+                DecoderCommand::Play { start_frame } => {
+                    is_playing = true;
+                    playhead_frame = start_frame;
+                    start_playback_frame = start_frame;
+
+                    let target_pts = if time_base_f > 0.0 {
+                        (start_frame as f64 / fps / time_base_f).round() as i64
+                    } else {
+                        start_frame
+                    };
+
+                    let can_continue_forward = current_pts >= 0
+                        && target_pts >= current_pts
+                        && (target_pts - current_pts) <= gop_max_pts
+                        && !waiting_for_keyframe;
+
+                    if !can_continue_forward {
+                        unsafe {
+                            ffmpeg_next::ffi::av_seek_frame(
+                                ictx.as_mut_ptr(),
+                                stream_idx as i32,
+                                target_pts,
+                                ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
+                            );
+                        }
+                        video_decoder.flush();
+                        current_pts = -1;
+                        current_decoded_frame = -1;
+                        waiting_for_keyframe = true;
+                    }
+
+                    for (st, packet) in ictx.packets() {
+                        let mut break_stream = false;
+
+                        while let Ok(cmd) = cmd_rx.try_recv() {
+                            match cmd {
+                                DecoderCommand::UpdatePlayhead { playhead_frame: pf } => {
+                                    playhead_frame = pf;
+                                }
+                                DecoderCommand::Play { start_frame: new_sf } => {
+                                    playhead_frame = new_sf;
+                                    if new_sf < current_decoded_frame.saturating_sub(5) || new_sf > current_decoded_frame + 60 {
+                                        pending_cmd = Some(DecoderCommand::Play { start_frame: new_sf });
+                                        break_stream = true;
+                                        break;
+                                    }
+                                }
+                                DecoderCommand::Pause => {
+                                    is_playing = false;
+                                    break_stream = true;
+                                    break;
+                                }
+                                DecoderCommand::Seek { target_frame } => {
+                                    is_playing = false;
+                                    pending_cmd = Some(DecoderCommand::Seek { target_frame });
+                                    break_stream = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if break_stream {
+                            break;
+                        }
+
+                        if st.index() == stream_idx {
+                            if waiting_for_keyframe {
+                                if packet.is_key() {
+                                    waiting_for_keyframe = false;
+                                } else {
+                                    continue;
+                                }
+                            }
+
+                            if video_decoder.send_packet(&packet).is_ok() {
+                                while video_decoder.receive_frame(&mut decoded_frame).is_ok() {
+                                    let pts = decoded_frame.pts().unwrap_or(current_pts + frame_duration_pts);
+                                    current_pts = pts;
+                                    let f_num = (pts as f64 * time_base_f * fps).round() as i64;
+                                    current_decoded_frame = f_num;
+
+                                    if f_num >= start_playback_frame {
+                                        if let Some(img) = Self::scale_and_copy_frame(
+                                            &mut scaler,
+                                            &decoded_frame,
+                                            &mut sw_frame,
+                                            &mut rgba_frame,
+                                            w,
+                                            h,
+                                            &mut rgba_buffer,
+                                        ) {
+                                            let _ = frame_tx.send((f_num, img));
+                                            egui_ctx.request_repaint();
+                                        }
+                                    }
+
+                                    // Упреждающий троттлинг jitter buffer: 25 кадров вперед
+                                    while is_playing && current_decoded_frame > playhead_frame + 25 {
+                                        match cmd_rx.recv_timeout(std::time::Duration::from_millis(4)) {
+                                            Ok(DecoderCommand::UpdatePlayhead { playhead_frame: pf }) => {
+                                                playhead_frame = pf;
+                                            }
+                                            Ok(DecoderCommand::Play { start_frame: new_sf }) => {
+                                                playhead_frame = new_sf;
+                                                if new_sf < current_decoded_frame.saturating_sub(5) || new_sf > current_decoded_frame + 60 {
+                                                    pending_cmd = Some(DecoderCommand::Play { start_frame: new_sf });
+                                                    break_stream = true;
+                                                    break;
+                                                }
+                                            }
+                                            Ok(DecoderCommand::Pause) => {
+                                                is_playing = false;
+                                                break_stream = true;
+                                                break;
+                                            }
+                                            Ok(DecoderCommand::Seek { target_frame }) => {
+                                                is_playing = false;
+                                                pending_cmd = Some(DecoderCommand::Seek { target_frame });
+                                                break_stream = true;
+                                                break;
+                                            }
+                                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'worker_loop,
+                                        }
+                                    }
+
+                                    if break_stream {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if break_stream {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -927,6 +930,47 @@ mod tests {
     }
 
     #[test]
+    fn test_seek_to_90() {
+        let test_path = Path::new("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
+        if !test_path.exists() {
+            return;
+        }
+
+        let mut ictx = ffmpeg_next::format::input(&test_path).unwrap();
+        let (stream_idx, time_base) = {
+            let s = ictx.streams().best(ffmpeg_next::media::Type::Video).unwrap();
+            (s.index(), s.time_base())
+        };
+
+        let target_frame = 90;
+        let time_base_f = f64::from(time_base);
+        let target_pts = (target_frame as f64 / 60.0 / time_base_f).round() as i64;
+        println!("target_pts: {}", target_pts);
+
+        unsafe {
+            ffmpeg_next::ffi::av_seek_frame(
+                ictx.as_mut_ptr(),
+                stream_idx as i32,
+                target_pts,
+                ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
+            );
+        }
+
+        let mut count = 0;
+        for (st, packet) in ictx.packets() {
+            if st.index() == stream_idx {
+                if packet.is_key() {
+                    println!("Key packet {}: pts={:?}", count, packet.pts());
+                }
+                count += 1;
+                if count >= 300 {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_seek_packets() {
         let test_path = Path::new("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
         if !test_path.exists() {
@@ -948,6 +992,33 @@ mod tests {
         // Финальный кадр должен успешно декодироваться
         assert!(player.wait_for_frame(350, &ctx, std::time::Duration::from_secs(3)));
         assert_eq!(player.last_decoded_frame, 350);
+    }
+
+    #[test]
+    fn test_clean_seek_and_playback_zero_errors() {
+        let test_path = Path::new("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
+        if !test_path.exists() {
+            return;
+        }
+
+        let ctx = egui::Context::default();
+        let mut player = VideoPlayer::new();
+        assert!(player.open_file(test_path, &ctx).is_ok());
+
+        assert!(player.wait_for_frame(0, &ctx, std::time::Duration::from_secs(3)));
+
+        // Скраббинг через границы GOP
+        for &f in &[50, 120, 89, 15] {
+            assert!(player.wait_for_frame(f, &ctx, std::time::Duration::from_secs(3)));
+            assert_eq!(player.last_decoded_frame, f);
+        }
+
+        // Плавное воспроизведение, начиная с кадра 89 (без ошибок RPS/POC)
+        for f in 89..130 {
+            player.update_playback(f, true, &ctx);
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+        player.update_playback(130, false, &ctx);
     }
 
     #[test]

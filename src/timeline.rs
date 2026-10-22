@@ -70,6 +70,7 @@ pub struct DraggedMedia {
     pub has_audio: bool,
     pub audio_tracks_count: usize,
     pub duration_frames: i64,
+    pub duration_secs: f64,
     pub source_fps: f64,
     pub link_group: Option<u64>,
 }

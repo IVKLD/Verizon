@@ -18,6 +18,7 @@ use eframe::egui;
 fn main() -> Result<(), eframe::Error> {
     // Глобальная инициализация кодеков и контейнеров FFmpeg
     let _ = ffmpeg_next::init();
+    ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Fatal);
 
     // Инициализация многопоточного рантайма Tokio для высокопроизводительных фоновых задач
     let rt = tokio::runtime::Builder::new_multi_thread()

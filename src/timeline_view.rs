@@ -339,6 +339,9 @@ impl TimelineView {
                             timeline.fps = media.source_fps.round().clamp(1.0, 240.0) as u32;
                         }
 
+                        let dur_from_secs = (media.duration_secs * timeline.fps as f64).round().max(1.0) as i64;
+                        let actual_dur_frames = if dur_from_secs > 0 { dur_from_secs } else { media.duration_frames };
+
                         let num_audio = media.audio_tracks_count.max(if media.has_audio { 1 } else { 0 });
                         let link_id = if media.has_video && num_audio > 0 {
                             let id = timeline.next_link_id;
@@ -356,7 +359,7 @@ impl TimelineView {
                                 name: media.name.clone(),
                                 track_index: video_track,
                                 start_frame: drop_frame,
-                                duration_frames: media.duration_frames,
+                                duration_frames: actual_dur_frames,
                                 is_audio: false,
                                 color: ResolveColors::VIDEO_CLIP,
                                 source_path: media.path.clone(),
@@ -392,7 +395,7 @@ impl TimelineView {
                                     name: track_name,
                                     track_index: track_idx,
                                     start_frame: drop_frame,
-                                    duration_frames: media.duration_frames,
+                                    duration_frames: actual_dur_frames,
                                     is_audio: true,
                                     color: ResolveColors::AUDIO_CLIP,
                                     source_path: media.path.clone(),
@@ -418,7 +421,7 @@ impl TimelineView {
                                 name: media.name.clone(),
                                 track_index: target_track_idx,
                                 start_frame: drop_frame,
-                                duration_frames: media.duration_frames,
+                                duration_frames: actual_dur_frames,
                                 is_audio: media.is_audio,
                                 color: if media.is_audio {
                                     ResolveColors::AUDIO_CLIP
