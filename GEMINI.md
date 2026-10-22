@@ -6,3 +6,6 @@
 - **NO X11 Crate Features**: In `Cargo.toml`, never enable `"x11"` features on GUI or windowing libraries (`eframe`, `winit`, `egui`, etc.). Enable only `"wayland"`.
 - **NO X11 Dependencies in Nix**: Remove all direct X11 packages (`libx11`, `libXcursor`, `libXi`, `libXrandr`) from `shell.nix`. Target pure Wayland packages (`wayland`, `wayland-protocols`, `libxkbcommon`).
 - **Native Wayland Architecture**: All windowing, surface presentation, input, drag-and-drop, and clipboards must be designed strictly for pure modern Wayland compositors.
+
+## Git Workflow
+- **Git Push on Demand**: Whenever requested to push/upload sources, always stage, commit, and push to GitHub repository `git@github.com:IVKLD/Verizon.git` on branch `main`.
