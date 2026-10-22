@@ -66,19 +66,40 @@ impl ViewerState {
         ui: &mut Ui,
         timeline: &mut TimelineState,
         video_player: &mut VideoPlayer,
+        vu_levels: (f32, f32),
         ctx: &egui::Context,
     ) {
-        // Декодирование текущего кадра при движении плейхеда или плейбэке
-        video_player.seek_and_decode(timeline.playhead_frame, ctx);
+        // Декодирование текущего кадра активного клипа на таймлайне
+        let active_clip = timeline
+            .clips
+            .iter()
+            .find(|c| !c.is_audio && c.contains_frame(timeline.playhead_frame));
 
-        // Обновление анимации VU-метра при плейбэке
-        if timeline.is_playing {
-            let t = timeline.playhead_frame as f32 * 0.2;
-            self.vu_level_left = 0.55 + 0.35 * (t.sin() * 0.5 + 0.5);
-            self.vu_level_right = 0.52 + 0.38 * ((t + 1.2).cos() * 0.5 + 0.5);
+        if let Some(clip) = active_clip {
+            if let Some(path) = &clip.source_path {
+                if video_player.current_path.as_deref() != Some(path.as_path()) {
+                    let _ = video_player.open_file(path, ctx);
+                }
+                let offset = timeline.playhead_frame - clip.start_frame;
+                let time_secs = offset as f64 / timeline.fps as f64;
+                let source_frame = (time_secs * clip.source_fps).round() as i64 + clip.source_in_frame;
+                video_player.seek_and_decode(source_frame, ctx);
+            } else {
+                video_player.seek_and_decode(timeline.playhead_frame, ctx);
+            }
+        } else if video_player.is_real_video {
+            video_player.seek_and_decode(timeline.playhead_frame, ctx);
         } else {
-            self.vu_level_left = (self.vu_level_left - 0.05).max(0.0);
-            self.vu_level_right = (self.vu_level_right - 0.05).max(0.0);
+            video_player.seek_and_decode(0, ctx);
+        }
+
+        // Обновление реальных уровней громкости VU-метра
+        if timeline.is_playing {
+            self.vu_level_left = (vu_levels.0 * 1.5).clamp(0.0, 1.0);
+            self.vu_level_right = (vu_levels.1 * 1.5).clamp(0.0, 1.0);
+        } else {
+            self.vu_level_left = (self.vu_level_left - 0.1).max(0.0);
+            self.vu_level_right = (self.vu_level_right - 0.1).max(0.0);
         }
 
         // ВЕРХНИЙ ТУЛБАР МОНИТОРА RESOLVE (Display Modes)

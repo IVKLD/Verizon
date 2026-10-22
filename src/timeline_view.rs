@@ -221,6 +221,9 @@ impl TimelineView {
                             } else {
                                 ResolveColors::VIDEO_CLIP
                             },
+                            source_path: media.path.clone(),
+                            source_in_frame: 0,
+                            source_fps: media.source_fps,
                             zoom_x: 1.0,
                             zoom_y: 1.0,
                             position_x: 0.0,
@@ -267,6 +270,19 @@ impl TimelineView {
 
             if ui.button(egui::RichText::new("✂ Cut at Playhead").size(11.0)).on_hover_text("Разрезать по плейхеду [Ctrl+B]").clicked() {
                 timeline.blade_all_at_playhead();
+            }
+
+            ui.separator();
+
+            if ui.button(egui::RichText::new("📥 Импорт медиа (Ctrl+I)").size(11.0)).on_hover_text("Импортировать медиафайлы [Ctrl+I]").clicked() {
+                if let Some(files) = rfd::FileDialog::new()
+                    .add_filter("Media Files", &["mp4", "mov", "mkv", "avi", "webm", "wav", "mp3", "flac"])
+                    .pick_files()
+                {
+                    for f in files {
+                        timeline.pending_imports.push(f);
+                    }
+                }
             }
 
             ui.separator();

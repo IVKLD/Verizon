@@ -1,5 +1,5 @@
-use crate::theme::ResolveColors;
 use egui::Color32;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -18,6 +18,11 @@ pub struct Clip {
     pub duration_frames: i64,
     pub is_audio: bool,
     pub color: Color32,
+
+    // Ссылка на реальный медиафайл
+    pub source_path: Option<PathBuf>,
+    pub source_in_frame: i64,
+    pub source_fps: f64,
 
     // Свойства инспектора (Transform / Composite / Audio)
     pub zoom_x: f32,
@@ -55,8 +60,10 @@ pub struct Track {
 #[derive(Debug, Clone)]
 pub struct DraggedMedia {
     pub name: String,
+    pub path: Option<PathBuf>,
     pub is_audio: bool,
     pub duration_frames: i64,
+    pub source_fps: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -84,12 +91,15 @@ pub struct TimelineState {
     // Активно перетаскиваемый клип (Drag & Drop)
     pub dragged_media: Option<DraggedMedia>,
 
+    // Очередь импорта медиа
+    pub pending_imports: Vec<PathBuf>,
+
     // История для Undo
     pub history: Vec<Vec<Clip>>,
 }
 
 impl TimelineState {
-    pub fn new_demo() -> Self {
+    pub fn new_empty() -> Self {
         let tracks = vec![
             Track {
                 name: "V2".to_string(),
@@ -121,135 +131,37 @@ impl TimelineState {
             },
         ];
 
-        let clips = vec![
-            // V1 Клипы (Основная камера A-Roll)
-            Clip {
-                id: 1,
-                name: "A001_C001_0422.MOV".to_string(),
-                track_index: 1, // V1
-                start_frame: 0,
-                duration_frames: 120, // 5 секунд при 24fps
-                is_audio: false,
-                color: ResolveColors::VIDEO_CLIP,
-                zoom_x: 1.0,
-                zoom_y: 1.0,
-                position_x: 0.0,
-                position_y: 0.0,
-                rotation: 0.0,
-                opacity: 100.0,
-                volume_db: 0.0,
-                pan: 0.0,
-            },
-            Clip {
-                id: 2,
-                name: "A001_C002_0422.MOV".to_string(),
-                track_index: 1, // V1
-                start_frame: 120,
-                duration_frames: 168, // 7 секунд
-                is_audio: false,
-                color: ResolveColors::VIDEO_CLIP,
-                zoom_x: 1.0,
-                zoom_y: 1.0,
-                position_x: 0.0,
-                position_y: 0.0,
-                rotation: 0.0,
-                opacity: 100.0,
-                volume_db: 0.0,
-                pan: 0.0,
-            },
-            Clip {
-                id: 3,
-                name: "A001_C005_0422.MOV".to_string(),
-                track_index: 1, // V1
-                start_frame: 288,
-                duration_frames: 192, // 8 секунд
-                is_audio: false,
-                color: ResolveColors::VIDEO_CLIP,
-                zoom_x: 1.0,
-                zoom_y: 1.0,
-                position_x: 0.0,
-                position_y: 0.0,
-                rotation: 0.0,
-                opacity: 100.0,
-                volume_db: 0.0,
-                pan: 0.0,
-            },
-            // V2 Клип (B-Roll перебивка)
-            Clip {
-                id: 4,
-                name: "B_ROLL_DRONE_4K.MP4".to_string(),
-                track_index: 0, // V2
-                start_frame: 72,
-                duration_frames: 96,
-                is_audio: false,
-                color: Color32::from_rgb(0x3a, 0x6e, 0x9f),
-                zoom_x: 1.05,
-                zoom_y: 1.05,
-                position_x: 0.0,
-                position_y: 0.0,
-                rotation: 0.0,
-                opacity: 100.0,
-                volume_db: 0.0,
-                pan: 0.0,
-            },
-            // A1 Клипы (Голос / Диалог)
-            Clip {
-                id: 5,
-                name: "VOICE_MIC_01.WAV".to_string(),
-                track_index: 2, // A1
-                start_frame: 0,
-                duration_frames: 288,
-                is_audio: true,
-                color: ResolveColors::AUDIO_CLIP,
-                zoom_x: 1.0,
-                zoom_y: 1.0,
-                position_x: 0.0,
-                position_y: 0.0,
-                rotation: 0.0,
-                opacity: 100.0,
-                volume_db: -1.5,
-                pan: 0.0,
-            },
-            // A2 Клип (Фоновый саундтрек)
-            Clip {
-                id: 6,
-                name: "CINEMATIC_OST_AMBIENT.WAV".to_string(),
-                track_index: 3, // A2
-                start_frame: 0,
-                duration_frames: 480, // 20 секунд
-                is_audio: true,
-                color: Color32::from_rgb(0x27, 0x75, 0x50),
-                zoom_x: 1.0,
-                zoom_y: 1.0,
-                position_x: 0.0,
-                position_y: 0.0,
-                rotation: 0.0,
-                opacity: 100.0,
-                volume_db: -12.0,
-                pan: 0.0,
-            },
-        ];
-
         Self {
             tracks,
-            clips,
-            next_clip_id: 10,
-            playhead_frame: 48, // 2 секунды
+            clips: Vec::new(),
+            next_clip_id: 1,
+            playhead_frame: 0,
             fps: 24,
-            zoom_factor: 2.0, // 1 кадр = 2px
+            zoom_factor: 2.0,
             scroll_x: 0.0,
             in_point: None,
             out_point: None,
             loop_enabled: false,
             active_tool: Tool::Selection,
             snapping_enabled: true,
-            selected_clip_id: Some(1),
+            selected_clip_id: None,
             is_playing: false,
             playback_speed: 1.0,
             frame_accumulator: 0.0,
             dragged_media: None,
+            pending_imports: Vec::new(),
             history: Vec::new(),
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn new_demo() -> Self {
+        Self::new_empty()
+    }
+
+    /// Максимальный конечный кадр всех клипов на таймлайне
+    pub fn timeline_end_frame(&self) -> i64 {
+        self.clips.iter().map(|c| c.end_frame()).max().unwrap_or(0)
     }
 
     /// Сохранить текущее состояние клипов для Undo
@@ -285,6 +197,9 @@ impl TimelineState {
                 self.next_clip_id += 1;
                 right_clip.start_frame = cut_frame;
                 right_clip.duration_frames = right_duration;
+                // Сдвиг смещения в исходном файле
+                let frames_offset_in_source = (left_duration as f64 * (right_clip.source_fps / self.fps as f64)).round() as i64;
+                right_clip.source_in_frame += frames_offset_in_source;
 
                 self.clips[idx].duration_frames = left_duration;
                 self.clips.insert(idx + 1, right_clip);
@@ -353,33 +268,48 @@ impl TimelineState {
         }
     }
 
-    /// Шаг плейхеда при воспроизведении с точной привязкой к реальному времени
+    /// Шаг плейхеда при воспроизведении с точной остановкой в конце таймлайна
     pub fn step_playback(&mut self, delta_seconds: f64) {
         if self.is_playing {
             let dt = delta_seconds.min(0.1);
             self.frame_accumulator += dt * self.fps as f64 * self.playback_speed;
 
+            let end_frame = self.out_point.unwrap_or_else(|| self.timeline_end_frame());
+
             if self.playback_speed >= 0.0 {
                 if self.frame_accumulator >= 1.0 {
                     let frames = self.frame_accumulator.floor() as i64;
                     self.frame_accumulator -= frames as f64;
-                    let mut next = self.playhead_frame + frames;
+                    let next = self.playhead_frame + frames;
 
-                    // Зацикливание ТОЛЬКО если включен флаг loop_enabled и задан Out-point
-                    if self.loop_enabled {
-                        if let Some(out_p) = self.out_point {
-                            if next >= out_p {
-                                next = self.in_point.unwrap_or(0);
-                            }
+                    // Если дошли до конца клипов или Out-point
+                    if end_frame > 0 && next >= end_frame {
+                        if self.loop_enabled {
+                            self.playhead_frame = self.in_point.unwrap_or(0);
+                        } else {
+                            // ОСТАНОВКА ВОСПРОИЗВЕДЕНИЯ В КОНЦЕ ТАЙМЛАЙНА
+                            self.playhead_frame = end_frame;
+                            self.is_playing = false;
                         }
+                    } else {
+                        self.playhead_frame = next.max(0);
                     }
-
-                    self.playhead_frame = next.max(0);
                 }
             } else if self.frame_accumulator <= -1.0 {
                 let frames = self.frame_accumulator.ceil() as i64;
                 self.frame_accumulator -= frames as f64;
-                self.playhead_frame = (self.playhead_frame + frames).max(0);
+                let start_bound = self.in_point.unwrap_or(0);
+                let next = self.playhead_frame + frames;
+                if next <= start_bound {
+                    if self.loop_enabled && end_frame > 0 {
+                        self.playhead_frame = end_frame;
+                    } else {
+                        self.playhead_frame = start_bound;
+                        self.is_playing = false;
+                    }
+                } else {
+                    self.playhead_frame = next.max(0);
+                }
             }
         }
     }

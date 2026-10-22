@@ -1,5 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub struct AudioSharedState {
@@ -9,9 +9,12 @@ pub struct AudioSharedState {
     pub current_sample_pos: usize,
     pub is_playing: bool,
     pub volume: f32,
+    pub current_vu_l: f32,
+    pub current_vu_r: f32,
 }
 
 pub struct AudioPlayer {
+    pub current_path: Option<PathBuf>,
     pub shared_state: Arc<Mutex<AudioSharedState>>,
     _stream: Option<cpal::Stream>,
 }
@@ -25,11 +28,14 @@ impl AudioPlayer {
             current_sample_pos: 0,
             is_playing: false,
             volume: 1.0,
+            current_vu_l: 0.0,
+            current_vu_r: 0.0,
         }));
 
         let stream = Self::init_cpal_stream(shared_state.clone());
 
         Self {
+            current_path: None,
             shared_state,
             _stream: stream,
         }
@@ -82,20 +88,44 @@ impl AudioPlayer {
         if let Ok(mut state) = shared.lock() {
             if !state.is_playing || state.samples.is_empty() {
                 output.fill(0.0);
+                state.current_vu_l = 0.0;
+                state.current_vu_r = 0.0;
                 return;
             }
 
             let volume = state.volume;
             let total = state.samples.len();
+            let mut peak_l: f32 = 0.0;
+            let mut peak_r: f32 = 0.0;
 
-            for sample in output.iter_mut() {
+            for frame in output.chunks_mut(2) {
                 if state.current_sample_pos < total {
-                    *sample = state.samples[state.current_sample_pos] * volume;
+                    let s_l = state.samples[state.current_sample_pos] * volume;
+                    frame[0] = s_l;
+                    if s_l.abs() > peak_l {
+                        peak_l = s_l.abs();
+                    }
                     state.current_sample_pos += 1;
                 } else {
-                    *sample = 0.0;
+                    frame[0] = 0.0;
+                }
+
+                if frame.len() > 1 {
+                    if state.current_sample_pos < total {
+                        let s_r = state.samples[state.current_sample_pos] * volume;
+                        frame[1] = s_r;
+                        if s_r.abs() > peak_r {
+                            peak_r = s_r.abs();
+                        }
+                        state.current_sample_pos += 1;
+                    } else {
+                        frame[1] = 0.0;
+                    }
                 }
             }
+
+            state.current_vu_l = peak_l;
+            state.current_vu_r = peak_r;
         } else {
             output.fill(0.0);
         }
@@ -103,6 +133,10 @@ impl AudioPlayer {
 
     /// Загрузить аудио из медиафайла через FFmpeg
     pub fn load_audio_from_file(&mut self, path: &Path) -> Result<(), String> {
+        if self.current_path.as_deref() == Some(path) {
+            return Ok(());
+        }
+
         let mut ictx = ffmpeg_next::format::input(path).map_err(|e| e.to_string())?;
 
         let audio_stream = ictx
@@ -163,20 +197,35 @@ impl AudioPlayer {
             state.current_sample_pos = 0;
         }
 
+        self.current_path = Some(path.to_path_buf());
         Ok(())
     }
 
-    /// Синхронизация текущей позиции звука с плейхедом видео
-    pub fn sync_playhead(&self, frame: i64, fps: f64, is_playing: bool) {
+    /// Синхронизация текущей позиции звука с плейхедом таймлайна
+    pub fn sync_playhead(&self, current_time_seconds: Option<f64>, is_playing: bool) {
         if let Ok(mut state) = self.shared_state.lock() {
             state.is_playing = is_playing;
-            let sample_rate = state.sample_rate as f64;
-            let target_sample = ((frame as f64 / fps) * sample_rate * state.channels as f64).max(0.0) as usize;
-            // Если расхождение больше 0.1 сек, корректируем позицию звука
-            let diff = (state.current_sample_pos as isize - target_sample as isize).abs();
-            if diff > (sample_rate * 0.1 * state.channels as f64) as isize || !is_playing {
-                state.current_sample_pos = target_sample.min(state.samples.len());
+            if let Some(time_sec) = current_time_seconds {
+                let sample_rate = state.sample_rate as f64;
+                let target_sample = (time_sec * sample_rate * state.channels as f64).max(0.0) as usize;
+                let diff = (state.current_sample_pos as isize - target_sample as isize).abs();
+                let threshold = (sample_rate * 0.05 * state.channels as f64) as isize;
+
+                if diff > threshold || !is_playing {
+                    state.current_sample_pos = target_sample.min(state.samples.len());
+                }
+            } else {
+                state.current_sample_pos = state.samples.len();
             }
+        }
+    }
+
+    /// Получить текущие уровни VU-метра для анимации
+    pub fn get_vu_levels(&self) -> (f32, f32) {
+        if let Ok(state) = self.shared_state.lock() {
+            (state.current_vu_l, state.current_vu_r)
+        } else {
+            (0.0, 0.0)
         }
     }
 }

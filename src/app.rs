@@ -34,6 +34,7 @@ struct ResolveTabViewer<'a> {
     inspector: &'a mut InspectorState,
     timeline: &'a mut TimelineState,
     video_player: &'a mut VideoPlayer,
+    audio_player: &'a mut AudioPlayer,
 }
 
 impl<'a> TabViewer for ResolveTabViewer<'a> {
@@ -64,7 +65,8 @@ impl<'a> TabViewer for ResolveTabViewer<'a> {
                 self.media_pool.render(ui, self.timeline);
             }
             Tab::Viewers => {
-                self.viewer.render_dual_viewers(ui, self.timeline, self.video_player, &ctx);
+                let vu = self.audio_player.get_vu_levels();
+                self.viewer.render_dual_viewers(ui, self.timeline, self.video_player, vu, &ctx);
             }
             Tab::Inspector => {
                 self.inspector.render(ui, self.timeline);
@@ -101,7 +103,7 @@ impl NleApp {
             media_page: MediaPageState::new(),
             viewer: ViewerState::new(),
             inspector: InspectorState::new(),
-            timeline: TimelineState::new_demo(),
+            timeline: TimelineState::new_empty(),
             video_player: VideoPlayer::new(),
             audio_player: AudioPlayer::new(),
             last_frame_time: std::time::Instant::now(),
@@ -110,6 +112,30 @@ impl NleApp {
 
         app.reset_dock_layout();
         app
+    }
+
+    pub fn prompt_import_media(&mut self, ctx: &Context) {
+        if let Some(files) = rfd::FileDialog::new()
+            .add_filter("Media Files", &["mp4", "mov", "mkv", "avi", "webm", "wav", "mp3", "flac"])
+            .pick_files()
+        {
+            let mut count = 0;
+            for f in files {
+                let imported = self.media_pool.import_path(&f);
+                if imported > 0 {
+                    self.media_pool.insert_selected_to_timeline(&mut self.timeline);
+                    let _ = self.video_player.open_file(&f, ctx);
+                    let _ = self.audio_player.load_audio_from_file(&f);
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                self.notification = Some((
+                    format!("✅ Импортировано клипов на таймлайн: {}", count),
+                    std::time::Instant::now(),
+                ));
+            }
+        }
     }
 
     /// Сброс расположения окон к дефолтному стандарту DaVinci Resolve
@@ -192,11 +218,17 @@ impl NleApp {
     }
 
     fn handle_keyboard_shortcuts(&mut self, ctx: &Context) {
+        let mut import_requested = false;
         ctx.input(|i| {
             // Space: Play / Pause
             if i.key_pressed(egui::Key::Space) {
                 self.timeline.is_playing = !self.timeline.is_playing;
                 self.timeline.playback_speed = 1.0;
+            }
+
+            // Ctrl+I: Import Media
+            if (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::I) {
+                import_requested = true;
             }
 
             // J / K / L Shuttle
@@ -234,12 +266,14 @@ impl NleApp {
                 self.timeline.snapping_enabled = !self.timeline.snapping_enabled;
             }
 
-            // In / Out: I / O
-            if i.key_pressed(egui::Key::I) {
-                self.timeline.in_point = Some(self.timeline.playhead_frame);
-            }
-            if i.key_pressed(egui::Key::O) {
-                self.timeline.out_point = Some(self.timeline.playhead_frame);
+            // In / Out: I / O (без модификаторов)
+            if !i.modifiers.ctrl && !i.modifiers.command {
+                if i.key_pressed(egui::Key::I) {
+                    self.timeline.in_point = Some(self.timeline.playhead_frame);
+                }
+                if i.key_pressed(egui::Key::O) {
+                    self.timeline.out_point = Some(self.timeline.playhead_frame);
+                }
             }
 
             // Delete selected clip
@@ -252,6 +286,10 @@ impl NleApp {
                 self.timeline.undo();
             }
         });
+
+        if import_requested {
+            self.prompt_import_media(ctx);
+        }
     }
 
     fn render_top_bar(&mut self, ui: &mut Ui) {
@@ -276,18 +314,8 @@ impl NleApp {
 
                     // Верхнее главное меню DaVinci Resolve
                     ui.menu_button("File", |ui| {
-                        if ui.button("📂 Import Media...").clicked() {
-                            if let Some(files) = rfd::FileDialog::new()
-                                .add_filter("Video & Audio", &["mp4", "mov", "mkv", "avi", "webm", "wav", "mp3", "flac"])
-                                .pick_files()
-                            {
-                                for f in files {
-                                    self.media_pool.import_path(&f);
-                                    self.media_pool.insert_selected_to_timeline(&mut self.timeline);
-                                    let _ = self.video_player.open_file(&f, ui.ctx());
-                                    let _ = self.audio_player.load_audio_from_file(&f);
-                                }
-                            }
+                        if ui.button("📂 Import Media... [Ctrl+I]").clicked() {
+                            self.prompt_import_media(ui.ctx());
                             ui.close();
                         }
                         if ui.button("📁 Import Folder...").clicked() {
@@ -410,6 +438,15 @@ impl eframe::App for NleApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        // 0. Обработка очереди импорта из таймлайна
+        let pending = std::mem::take(&mut self.timeline.pending_imports);
+        for f in pending {
+            self.media_pool.import_path(&f);
+            self.media_pool.insert_selected_to_timeline(&mut self.timeline);
+            let _ = self.video_player.open_file(&f, &ctx);
+            let _ = self.audio_player.load_audio_from_file(&f);
+        }
+
         // 1. Шаг воспроизведения по таймеру
         let now = std::time::Instant::now();
         let delta = now.duration_since(self.last_frame_time).as_secs_f64();
@@ -420,12 +457,27 @@ impl eframe::App for NleApp {
             ctx.request_repaint(); // 144+ FPS перерисовка при активном воспроизведении
         }
 
-        // 2. Синхронизация звука с видеоплейбэком
-        self.audio_player.sync_playhead(
-            self.timeline.playhead_frame,
-            self.timeline.fps as f64,
-            self.timeline.is_playing,
-        );
+        // 2. Синхронизация звука с видеоплейбэком активного аудиоклипа
+        let active_audio_clip = self
+            .timeline
+            .clips
+            .iter()
+            .find(|c| c.is_audio && c.contains_frame(self.timeline.playhead_frame));
+
+        if let Some(clip) = active_audio_clip {
+            if let Some(path) = &clip.source_path {
+                if self.audio_player.current_path.as_deref() != Some(path.as_path()) {
+                    let _ = self.audio_player.load_audio_from_file(path);
+                }
+                let offset = self.timeline.playhead_frame - clip.start_frame;
+                let time_secs = offset as f64 / self.timeline.fps as f64;
+                self.audio_player.sync_playhead(Some(time_secs), self.timeline.is_playing);
+            } else {
+                self.audio_player.sync_playhead(None, self.timeline.is_playing);
+            }
+        } else {
+            self.audio_player.sync_playhead(None, self.timeline.is_playing);
+        }
 
         // 3. Обработка Drag & Drop файлов и буфера обмена (Ctrl+V)
         self.handle_drag_and_drop(&ctx);
@@ -461,6 +513,7 @@ impl eframe::App for NleApp {
                     inspector: &mut self.inspector,
                     timeline: &mut self.timeline,
                     video_player: &mut self.video_player,
+                    audio_player: &mut self.audio_player,
                 };
 
                 DockArea::new(&mut self.dock_state)

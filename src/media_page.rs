@@ -297,7 +297,7 @@ impl MediaPageState {
                             .inner_margin(egui::Margin::same(6))
                             .show(ui, |ui| {
                                 ui.vertical(|ui| {
-                                    let icon = if asset.is_audio { "🎵" } else { "🎬" };
+                                    let icon = if asset.has_audio { "🎵" } else { "🎬" };
                                     ui.label(egui::RichText::new(icon).size(20.0));
                                     let name_text = egui::RichText::new(&asset.filename)
                                         .size(11.0)
