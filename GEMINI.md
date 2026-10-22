@@ -7,5 +7,10 @@
 - **NO X11 Dependencies in Nix**: Remove all direct X11 packages (`libx11`, `libXcursor`, `libXi`, `libXrandr`) from `shell.nix`. Target pure Wayland packages (`wayland`, `wayland-protocols`, `libxkbcommon`).
 - **Native Wayland Architecture**: All windowing, surface presentation, input, drag-and-drop, and clipboards must be designed strictly for pure modern Wayland compositors.
 
-## Git Workflow
-- **Git Push on Demand**: Whenever requested to push/upload sources, always stage, commit, and push to GitHub repository `git@github.com:IVKLD/Verizon.git` on branch `main`.
+## Git Workflow & Push Policy
+- **NO AUTOMATIC GIT PUSH**: NEVER push to GitHub without an explicit, direct command from the user (e.g. "запушь", "push", "залей в репу").
+- **Stage & Commit Locally**: Local commits can be made when concluding steps, but pushing to the remote repository MUST ONLY be done when explicitly requested.
+
+## Developer & Architectural Standards
+- **Use Tokio & Standard Modern Rust Ecosystem**: Leverage `tokio` for async tasks, background processing, channels, and modern concurrency.
+- **Rule Self-Update**: Always add or refine rules when corrected by the user to avoid recurring mistakes.

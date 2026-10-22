@@ -100,6 +100,9 @@ pub struct TimelineState {
     // Активно перетаскиваемый клип (Drag & Drop)
     pub dragged_media: Option<DraggedMedia>,
 
+    // Текущая сессия перемещения клипа на таймлайне: (clip_id, mouse_start_x, clip_initial_start_frame)
+    pub moving_clip: Option<(u64, f32, i64)>,
+
     // Очередь импорта медиа
     pub pending_imports: Vec<PathBuf>,
 
@@ -160,6 +163,7 @@ impl TimelineState {
             playback_speed: 1.0,
             frame_accumulator: 0.0,
             dragged_media: None,
+            moving_clip: None,
             pending_imports: Vec::new(),
             history: Vec::new(),
         }

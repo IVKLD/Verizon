@@ -22,7 +22,10 @@ pub enum Page {
     Deliver,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+use serde::{Deserialize, Serialize};
+use crate::waveform::WaveformManager;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Tab {
     MediaPool,
     Viewers,
@@ -37,6 +40,7 @@ struct ResolveTabViewer<'a> {
     timeline: &'a mut TimelineState,
     video_player: &'a mut VideoPlayer,
     audio_player: &'a mut AudioPlayer,
+    waveform_mgr: &'a WaveformManager,
 }
 
 impl<'a> TabViewer for ResolveTabViewer<'a> {
@@ -55,7 +59,7 @@ impl<'a> TabViewer for ResolveTabViewer<'a> {
         }
     }
 
-    // Запрет случайного удаления основных рабочих панелей (исправление бага пропажи окон)
+    // Запрет закрытия критически важных панелей без явного сброса
     fn is_closeable(&self, _tab: &Self::Tab) -> bool {
         false
     }
@@ -74,7 +78,7 @@ impl<'a> TabViewer for ResolveTabViewer<'a> {
                 self.inspector.render(ui, self.timeline);
             }
             Tab::Timeline => {
-                TimelineView::render(ui, self.timeline);
+                TimelineView::render(ui, self.timeline, self.waveform_mgr);
             }
         }
     }
@@ -90,6 +94,7 @@ pub struct NleApp {
     pub timeline: TimelineState,
     pub video_player: VideoPlayer,
     pub audio_player: AudioPlayer,
+    pub waveform_mgr: WaveformManager,
     pub preferences: UserPreferences,
     pub show_preferences_window: bool,
     pub last_frame_time: std::time::Instant,
@@ -113,21 +118,56 @@ impl NleApp {
             timeline: TimelineState::new_empty(),
             video_player: VideoPlayer::new(),
             audio_player: AudioPlayer::new(),
-            preferences: prefs,
+            waveform_mgr: WaveformManager::new(),
+            preferences: prefs.clone(),
             show_preferences_window: false,
             last_frame_time: std::time::Instant::now(),
             notification: None,
         };
 
-        app.reset_dock_layout();
+        app.timeline.snapping_enabled = prefs.snapping_enabled;
+        app.timeline.linked_selection = prefs.linked_selection;
+        app.timeline.loop_enabled = prefs.loop_enabled;
+
+        // Восстановление сохраненного расположения окон (Dock Layout)
+        let dock_path = UserPreferences::dock_layout_path();
+        let loaded_dock = if let Ok(json) = std::fs::read_to_string(&dock_path) {
+            serde_json::from_str::<DockState<Tab>>(&json).ok()
+        } else {
+            None
+        };
+
+        if let Some(dock) = loaded_dock {
+            app.dock_state = dock;
+        } else {
+            app.reset_dock_layout();
+        }
+
         app
+    }
+
+    pub fn save_preferences(&mut self) {
+        self.preferences.snapping_enabled = self.timeline.snapping_enabled;
+        self.preferences.linked_selection = self.timeline.linked_selection;
+        self.preferences.loop_enabled = self.timeline.loop_enabled;
+        self.preferences.save();
+    }
+
+    pub fn save_dock_layout(&self) {
+        let path = UserPreferences::dock_layout_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&self.dock_state) {
+            let _ = std::fs::write(path, json);
+        }
     }
 
     pub fn set_ui_scale(&mut self, new_scale: f32, ctx: &Context) {
         let clamped = new_scale.clamp(0.5, 4.0);
         self.preferences.ui_scale = (clamped * 100.0).round() / 100.0;
         ctx.set_zoom_factor(self.preferences.ui_scale);
-        self.preferences.save();
+        self.save_preferences();
     }
 
     pub fn prompt_import_media(&mut self, ctx: &Context) {
@@ -154,7 +194,8 @@ impl NleApp {
         }
     }
 
-    /// Сброс расположения окон к дефолтному стандарту DaVinci Resolve
+    /// Сброс расположения окон к дефолтному стандарту DaVinci Resolve:
+    /// Media слева, Viewers по центру, Inspector справа от предпросмотра, Timeline снизу во всю ширину
     pub fn reset_dock_layout(&mut self) {
         let mut dock = DockState::new(vec![Tab::Viewers]);
 
@@ -165,14 +206,14 @@ impl NleApp {
             vec![Tab::Timeline],
         );
 
-        // 2. Слева сверху: Media Pool (media слева)
+        // 2. Слева сверху: Media Pool (Media слева)
         let [_left, center] = dock.main_surface_mut().split_left(
             top,
             0.22,
             vec![Tab::MediaPool],
         );
 
-        // 3. Справа сверху: Inspector (inspector справа, viewers по центру)
+        // 3. Справа сверху: Inspector (Inspector строго справа от Viewers/предпросмотра)
         let [_center, _right] = dock.main_surface_mut().split_right(
             center,
             0.70,
@@ -180,6 +221,7 @@ impl NleApp {
         );
 
         self.dock_state = dock;
+        self.save_dock_layout();
     }
 
     fn handle_drag_and_drop(&mut self, ctx: &Context) {
@@ -648,11 +690,12 @@ impl eframe::App for NleApp {
                     timeline: &mut self.timeline,
                     video_player: &mut self.video_player,
                     audio_player: &mut self.audio_player,
+                    waveform_mgr: &self.waveform_mgr,
                 };
 
                 DockArea::new(&mut self.dock_state)
                     .style(dock_style)
-                    .draggable_tabs(false)
+                    .draggable_tabs(true)
                     .show_close_buttons(false)
                     .show_add_buttons(false)
                     .show_inside(ui, &mut tab_viewer);
@@ -661,5 +704,10 @@ impl eframe::App for NleApp {
 
         // 8. Модальное окно настроек (Масштабирование UI для 4K)
         self.render_preferences_window(&ctx);
+    }
+
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.save_preferences();
+        self.save_dock_layout();
     }
 }

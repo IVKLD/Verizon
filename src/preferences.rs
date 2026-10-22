@@ -1,51 +1,59 @@
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserPreferences {
     pub ui_scale: f32,
+    pub snapping_enabled: bool,
+    pub linked_selection: bool,
+    pub loop_enabled: bool,
 }
 
 impl Default for UserPreferences {
     fn default() -> Self {
         Self {
-            ui_scale: 1.5, // 150% по умолчанию для комфортного чтения на современных мониторах
+            ui_scale: 1.5, // 150% по умолчанию для комфортного чтения на 2K/4K экранах
+            snapping_enabled: true,
+            linked_selection: true,
+            loop_enabled: false,
         }
     }
 }
 
 impl UserPreferences {
-    pub fn config_path() -> PathBuf {
+    pub fn config_dir() -> PathBuf {
         if let Ok(home) = std::env::var("HOME") {
-            PathBuf::from(home).join(".config/verizon_nle/preferences.txt")
+            PathBuf::from(home).join(".config/verizon_nle")
         } else {
-            PathBuf::from("verizon_preferences.txt")
+            PathBuf::from(".config/verizon_nle")
         }
+    }
+
+    pub fn preferences_path() -> PathBuf {
+        Self::config_dir().join("preferences.json")
+    }
+
+    pub fn dock_layout_path() -> PathBuf {
+        Self::config_dir().join("dock_layout.json")
     }
 
     pub fn load() -> Self {
-        let mut prefs = Self::default();
-        let path = Self::config_path();
+        let path = Self::preferences_path();
         if let Ok(content) = fs::read_to_string(&path) {
-            for line in content.lines() {
-                if let Some((k, v)) = line.split_once('=') {
-                    if k.trim() == "ui_scale" {
-                        if let Ok(val) = v.trim().parse::<f32>() {
-                            prefs.ui_scale = val.clamp(0.5, 4.0);
-                        }
-                    }
-                }
+            if let Ok(prefs) = serde_json::from_str::<UserPreferences>(&content) {
+                return prefs;
             }
         }
-        prefs
+        Self::default()
     }
 
     pub fn save(&self) {
-        let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+        let dir = Self::config_dir();
+        let _ = fs::create_dir_all(&dir);
+        let path = Self::preferences_path();
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = fs::write(path, json);
         }
-        let content = format!("ui_scale={:.2}\n", self.ui_scale);
-        let _ = fs::write(&path, content);
     }
 }

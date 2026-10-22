@@ -6,7 +6,11 @@ use crate::timecode::Timecode;
 pub struct TimelineView;
 
 impl TimelineView {
-    pub fn render(ui: &mut Ui, timeline: &mut TimelineState) {
+    pub fn render(
+        ui: &mut Ui,
+        timeline: &mut TimelineState,
+        waveform_mgr: &crate::waveform::WaveformManager,
+    ) {
         // 1. Верхний тулбар таймлайна
         Self::render_toolbar(ui, timeline);
         ui.separator();
@@ -99,9 +103,6 @@ impl TimelineView {
         }
 
         // 5. Отрисовка и высокоточная интерактивность клипов на дорожках
-        let drag_session_id = ui.id().with("clip_moving_session");
-        let mut moving_session: Option<(u64, f32, i64)> = ui.data(|d| d.get_temp(drag_session_id));
-
         let mut hovered_clip_id = None;
         let mut clicked_clip_id = None;
         let mut cut_request = None;
@@ -137,10 +138,15 @@ impl TimelineView {
                 false
             };
 
-            Self::draw_clip(&painter, clip_rect, clip, is_selected);
+            Self::draw_clip(&painter, clip_rect, clip, is_selected, timeline, waveform_mgr, ui.ctx());
 
             // Четкая регистрация клика и перетаскивания клипа
-            let clip_resp = ui.interact(clip_rect, ui.id().with(format!("clip_{}", clip.id)), egui::Sense::click_and_drag());
+            let clip_resp = ui.interact(
+                clip_rect,
+                ui.id().with(format!("clip_{}", clip.id)),
+                egui::Sense::click_and_drag(),
+            );
+
             if clip_resp.hovered() {
                 hovered_clip_id = Some(clip.id);
             }
@@ -156,10 +162,12 @@ impl TimelineView {
                 }
             }
 
-            // Инициализация плавного drag-перемещения клипа
-            if clip_resp.drag_started() && timeline.active_tool == Tool::Selection {
-                if let Some(m_pos) = mouse_pos {
-                    start_drag_request = Some((clip.id, m_pos.x, clip.start_frame));
+            // Инициализация перетаскивания клипа при зажатии ЛКМ
+            if timeline.active_tool == Tool::Selection {
+                if clip_resp.drag_started() || (clip_resp.dragged() && timeline.moving_clip.is_none()) {
+                    if let Some(m_pos) = mouse_pos {
+                        start_drag_request = Some((clip.id, m_pos.x, clip.start_frame));
+                    }
                 }
             }
 
@@ -178,25 +186,24 @@ impl TimelineView {
 
         if let Some((id, mouse_x, start_fr)) = start_drag_request {
             timeline.push_history();
-            moving_session = Some((id, mouse_x, start_fr));
+            timeline.moving_clip = Some((id, mouse_x, start_fr));
         }
 
         // Обновление позиции перетаскиваемого клипа (и всех связанных с ним)
-        if let Some((drag_id, start_mouse_x, init_start_frame)) = moving_session {
+        if let Some((drag_id, start_mouse_x, init_start_frame)) = timeline.moving_clip {
             if let Some(m_pos) = mouse_pos {
                 let dx = m_pos.x - start_mouse_x;
                 let delta_frames = (dx / timeline.zoom_factor).round() as i64;
                 let target_start = (init_start_frame + delta_frames).max(0);
                 timeline.move_clip(drag_id, target_start);
             }
-            if ui.input(|i| i.pointer.any_released()) {
-                moving_session = None;
+            if ui.input(|i| i.pointer.any_released() || !i.pointer.primary_down()) {
+                timeline.moving_clip = None;
             }
         }
-        ui.data_mut(|d| d.insert_temp(drag_session_id, moving_session));
 
         // Клик по пустой области дорожек (где нет клипов) — перемещение плейхеда
-        if moving_session.is_none() && hovered_clip_id.is_none() && timeline.dragged_media.is_none() {
+        if timeline.moving_clip.is_none() && hovered_clip_id.is_none() && timeline.dragged_media.is_none() {
             let canvas_sense = ui.interact(tracks_canvas_rect, ui.id().with("empty_tracks_canvas"), egui::Sense::click_and_drag());
             if canvas_sense.clicked() || canvas_sense.dragged() {
                 if let Some(m_pos) = mouse_pos {
@@ -550,7 +557,15 @@ impl TimelineView {
         );
     }
 
-    fn draw_clip(painter: &egui::Painter, rect: Rect, clip: &Clip, is_selected: bool) {
+    fn draw_clip(
+        painter: &egui::Painter,
+        rect: Rect,
+        clip: &Clip,
+        is_selected: bool,
+        timeline: &TimelineState,
+        waveform_mgr: &crate::waveform::WaveformManager,
+        ctx: &egui::Context,
+    ) {
         let fill_color = if is_selected {
             if clip.is_audio { ResolveColors::AUDIO_CLIP_SELECTED } else { ResolveColors::VIDEO_CLIP_SELECTED }
         } else {
@@ -566,20 +581,58 @@ impl TimelineView {
         painter.rect_filled(rect, CornerRadius::same(2), fill_color);
         painter.rect_stroke(rect, CornerRadius::same(2), stroke, StrokeKind::Inside);
 
-        // Для аудиоклипов отрисовываем реалистичные волноформы (Waveforms)
-        if clip.is_audio && rect.width() > 20.0 {
+        // Для аудиоклипов: реальная асинхронная расшифровка звуковой волны (Waveform)
+        // Наглядно показывает, где есть звук, а где тишина (нет звука)
+        if clip.is_audio && rect.width() > 10.0 {
             let mid_y = rect.center().y;
-            let step = 3.0;
-            let mut x = rect.min.x + 2.0;
-            let mut idx = 0;
-            while x < rect.max.x - 2.0 {
-                let pseudo_amp = ((idx as f32 * 0.4).sin().abs() * 0.7 + (idx as f32 * 0.9).cos().abs() * 0.3) * (rect.height() * 0.35);
+            let half_h = (rect.height() * 0.42).max(2.0);
+
+            if let Some(path) = &clip.source_path {
+                if let Some(peaks) = waveform_mgr.get_waveform(path) {
+                    let pts_per_sec = 100.0;
+                    let sec_per_px = 1.0 / (timeline.zoom_factor * timeline.fps as f32);
+
+                    let mut x = rect.min.x + 2.0;
+                    let step_px = 2.0;
+                    while x < rect.max.x - 2.0 {
+                        let rel_x = x - rect.min.x;
+                        let sec_in_clip = rel_x as f64 * sec_per_px as f64;
+                        let total_source_sec = clip.source_in_secs + sec_in_clip;
+                        let sample_idx = (total_source_sec * pts_per_sec).round() as usize;
+
+                        let amp = peaks.get(sample_idx).copied().unwrap_or(0.0);
+
+                        if amp > 0.005 {
+                            let bar_h = (amp * half_h).max(1.0);
+                            painter.line_segment(
+                                [pos2(x, mid_y - bar_h), pos2(x, mid_y + bar_h)],
+                                Stroke::new(1.5, Color32::from_rgb(0x38, 0xd4, 0x8a)), // Свежий зеленый цвет Resolve Audio Waveform
+                            );
+                        } else {
+                            // Тонкая линия тишины (наглядно видно, что звука в этом фрагменте нет)
+                            painter.line_segment(
+                                [pos2(x, mid_y), pos2(x + step_px, mid_y)],
+                                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 45)),
+                            );
+                        }
+                        x += step_px;
+                    }
+                } else {
+                    // Запрос асинхронного извлечения в Tokio
+                    waveform_mgr.request_waveform(path, ctx.clone());
+
+                    // Центральная тонкая линия до завершения расшифровки
+                    painter.line_segment(
+                        [pos2(rect.min.x + 2.0, mid_y), pos2(rect.max.x - 2.0, mid_y)],
+                        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 50)),
+                    );
+                }
+            } else {
+                // Если клип без источника — центральная линия
                 painter.line_segment(
-                    [pos2(x, mid_y - pseudo_amp), pos2(x, mid_y + pseudo_amp)],
-                    Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 255, 255, 120)),
+                    [pos2(rect.min.x + 2.0, mid_y), pos2(rect.max.x - 2.0, mid_y)],
+                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 50)),
                 );
-                x += step;
-                idx += 1;
             }
         }
 

@@ -10,11 +10,19 @@ mod timeline;
 mod timeline_view;
 mod video_decoder;
 mod viewer;
+mod waveform;
 
 use app::NleApp;
 use eframe::egui;
 
 fn main() -> Result<(), eframe::Error> {
+    // Инициализация многопоточного рантайма Tokio для высокопроизводительных фоновых задач
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to initialize Tokio runtime");
+    let _guard = rt.enter();
+
     // Чистый нативный Wayland бэкенд (никакого X11 / XWayland)
     std::env::set_var("WINIT_UNIX_BACKEND", "wayland");
 
