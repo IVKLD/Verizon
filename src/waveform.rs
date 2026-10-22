@@ -26,8 +26,26 @@ impl WaveformManager {
     /// Принудительно положить пики в кэш (тесты / предзагрузка)
     #[allow(dead_code)]
     pub fn insert_waveform(&self, path: &Path, audio_track_index: usize, peaks: Vec<f32>) {
+        self.insert_waveform_arc(path, audio_track_index, Arc::new(peaks));
+    }
+
+    /// Положить готовый Arc<Vec<f32>> пиков (из единого прохода AudioPlayer) без копирования и снять флаг pending
+    pub fn insert_waveform_arc(&self, path: &Path, audio_track_index: usize, peaks: Arc<Vec<f32>>) {
+        let key = (path.to_path_buf(), audio_track_index);
         if let Ok(mut c) = self.cache.lock() {
-            c.insert((path.to_path_buf(), audio_track_index), Arc::new(peaks));
+            c.insert(key.clone(), peaks);
+        }
+        if let Ok(mut p) = self.pending.lock() {
+            p.remove(&key);
+        }
+    }
+
+    /// Заранее пометить аудиопотоки файла как декодируемые в AudioPlayer, чтобы не запускать второй FFmpeg-демультиплексор
+    pub fn mark_pending_streams(&self, path: &Path, num_streams: usize) {
+        if let Ok(mut p) = self.pending.lock() {
+            for idx in 0..num_streams {
+                p.insert((path.to_path_buf(), idx));
+            }
         }
     }
 
@@ -61,22 +79,38 @@ impl WaveformManager {
         let pending = self.pending.clone();
         let path_buf = path.to_path_buf();
 
+        // Чтобы один файл с несколькими дорожками (A1, A2...) не читал весь диск повторно N раз,
+        // помечаем все дорожки файла как pending и расшифровываем пики ВСЕХ дорожек за один проход!
+        if let Ok(ictx) = ffmpeg_next::format::input(&path_buf) {
+            let n = ictx
+                .streams()
+                .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Audio)
+                .count();
+            if let Ok(mut p) = self.pending.lock() {
+                for idx in 0..n {
+                    p.insert((path_buf.clone(), idx));
+                }
+            }
+        }
+
         tokio::spawn(async move {
             let path_for_blocking = path_buf.clone();
             let result = tokio::task::spawn_blocking(move || {
-                Self::extract_audio_peaks_stream(&path_for_blocking, audio_track_index)
+                Self::extract_all_audio_peaks(&path_for_blocking)
             })
             .await;
 
-            if let Ok(Ok(peaks)) = result {
+            if let Ok(Ok(all_peaks)) = result {
                 if let Ok(mut c) = cache.lock() {
-                    c.insert(key.clone(), Arc::new(peaks));
+                    for (idx, peaks) in all_peaks {
+                        c.insert((path_buf.clone(), idx), Arc::new(peaks));
+                    }
                 }
                 ctx.request_repaint();
             }
 
             if let Ok(mut p) = pending.lock() {
-                p.remove(&key);
+                p.retain(|(p_path, _)| p_path != &path_buf);
             }
         });
     }
@@ -84,6 +118,132 @@ impl WaveformManager {
     #[allow(dead_code)]
     pub fn request_waveform(&self, path: &Path, ctx: egui::Context) {
         self.request_waveform_stream(path, 0, ctx);
+    }
+
+    /// Однопроходная расшифровка волновых форм ВСЕХ аудиодорожек файла за один проход демультиплексора
+    pub fn extract_all_audio_peaks(path: &Path) -> Result<Vec<(usize, Vec<f32>)>, String> {
+        let mut ictx = ffmpeg_next::format::input(path).map_err(|e| e.to_string())?;
+
+        let stream_infos: Vec<(usize, usize, ffmpeg_next::codec::Parameters)> = ictx
+            .streams()
+            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Audio)
+            .enumerate()
+            .map(|(a_idx, s)| (a_idx, s.index(), s.parameters()))
+            .collect();
+
+        if stream_infos.is_empty() {
+            return Err("Аудиопотоки не найдены".to_string());
+        }
+
+        // Отключаем чтение видеопотоков (AVDISCARD_ALL), чтобы не аллоцировать видеопакеты при построении волновой формы
+        for mut s in ictx.streams_mut() {
+            if s.parameters().medium() != ffmpeg_next::media::Type::Audio {
+                unsafe {
+                    (*s.as_mut_ptr()).discard = ffmpeg_next::ffi::AVDiscard::AVDISCARD_ALL;
+                }
+            }
+        }
+
+        struct PeakState {
+            a_idx: usize,
+            stream_idx: usize,
+            decoder: ffmpeg_next::decoder::Audio,
+            resampler: ffmpeg_next::software::resampling::Context,
+            in_channel_layout: ffmpeg_next::channel_layout::ChannelLayout,
+            decoded_frame: ffmpeg_next::util::frame::Audio,
+            resampled_frame: ffmpeg_next::util::frame::Audio,
+            peaks: Vec<f32>,
+            current_max: f32,
+            count_in_bucket: usize,
+        }
+
+        let mut states = Vec::with_capacity(stream_infos.len());
+        for (a_idx, stream_idx, params) in stream_infos {
+            let Ok(ctx_dec) = ffmpeg_next::codec::context::Context::from_parameters(params) else { continue; };
+            let Ok(decoder) = ctx_dec.decoder().audio() else { continue; };
+
+            let in_rate = decoder.rate();
+            let in_format = decoder.format();
+            let in_channel_layout = if decoder.channel_layout().is_empty() {
+                if decoder.channels() == 1 {
+                    ffmpeg_next::channel_layout::ChannelLayout::MONO
+                } else {
+                    ffmpeg_next::channel_layout::ChannelLayout::STEREO
+                }
+            } else {
+                decoder.channel_layout()
+            };
+
+            let out_rate = 8000;
+            let out_channel_layout = ffmpeg_next::channel_layout::ChannelLayout::MONO;
+            let out_format = ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Packed);
+
+            let Ok(resampler) = ffmpeg_next::software::resampling::Context::get(
+                in_format,
+                in_channel_layout,
+                in_rate,
+                out_format,
+                out_channel_layout,
+                out_rate,
+            ) else { continue; };
+
+            states.push(PeakState {
+                a_idx,
+                stream_idx,
+                decoder,
+                resampler,
+                in_channel_layout,
+                decoded_frame: ffmpeg_next::util::frame::Audio::empty(),
+                resampled_frame: ffmpeg_next::util::frame::Audio::empty(),
+                peaks: Vec::new(),
+                current_max: 0.0,
+                count_in_bucket: 0,
+            });
+        }
+
+        let samples_per_point = 80;
+        for (stream, packet) in ictx.packets() {
+            let s_idx = stream.index();
+            for st in &mut states {
+                if st.stream_idx == s_idx && st.decoder.send_packet(&packet).is_ok() {
+                    while st.decoder.receive_frame(&mut st.decoded_frame).is_ok() {
+                        if st.decoded_frame.channel_layout().is_empty() {
+                            st.decoded_frame.set_channel_layout(st.in_channel_layout);
+                        }
+                        if st.resampler.run(&st.decoded_frame, &mut st.resampled_frame).is_ok() {
+                            let samples_count = st.resampled_frame.samples();
+                            let data: &[f32] = unsafe {
+                                std::slice::from_raw_parts(
+                                    st.resampled_frame.data(0).as_ptr() as *const f32,
+                                    samples_count,
+                                )
+                            };
+                            for &s in data {
+                                let abs_s = s.abs();
+                                if abs_s > st.current_max {
+                                    st.current_max = abs_s;
+                                }
+                                st.count_in_bucket += 1;
+                                if st.count_in_bucket >= samples_per_point {
+                                    st.peaks.push(st.current_max);
+                                    st.current_max = 0.0;
+                                    st.count_in_bucket = 0;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(states.len());
+        for mut st in states {
+            if st.count_in_bucket > 0 {
+                st.peaks.push(st.current_max);
+            }
+            out.push((st.a_idx, st.peaks));
+        }
+        Ok(out)
     }
 
     /// Быстрая расшифровка амплитуд конкретного аудиопотока (100 замеров в секунду) через FFmpeg
@@ -108,6 +268,14 @@ impl WaveformManager {
         let context_decoder = ffmpeg_next::codec::context::Context::from_parameters(audio_stream.parameters())
             .map_err(|e| e.to_string())?;
         let mut decoder = context_decoder.decoder().audio().map_err(|e| e.to_string())?;
+
+        for mut s in ictx.streams_mut() {
+            if s.index() != stream_idx {
+                unsafe {
+                    (*s.as_mut_ptr()).discard = ffmpeg_next::ffi::AVDiscard::AVDISCARD_ALL;
+                }
+            }
+        }
 
         let in_rate = decoder.rate();
         let in_format = decoder.format();

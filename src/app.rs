@@ -100,6 +100,8 @@ pub struct NleApp {
     pub show_preferences_window: bool,
     pub last_frame_time: std::time::Instant,
     pub notification: Option<(String, std::time::Instant)>,
+    /// Самопроверка реального приложения (включается переменной окружения VERIZON_AUTOPILOT)
+    pub autopilot: Option<crate::autopilot::Autopilot>,
 }
 
 impl NleApp {
@@ -124,6 +126,7 @@ impl NleApp {
             show_preferences_window: false,
             last_frame_time: std::time::Instant::now(),
             notification: None,
+            autopilot: crate::autopilot::Autopilot::from_env(),
         };
 
         app.timeline.snapping_enabled = prefs.snapping_enabled;
@@ -181,6 +184,7 @@ impl NleApp {
                 let imported = self.media_pool.import_path(&f);
                 if imported > 0 {
                     self.media_pool.insert_selected_to_timeline(&mut self.timeline);
+                    self.waveform_mgr.mark_pending_streams(&f, 8);
                     let _ = self.video_player.open_file(&f, ctx);
                     let _ = self.audio_player.load_audio_from_file(&f);
                     count += 1;
@@ -289,6 +293,7 @@ impl NleApp {
                     self.media_pool.insert_selected_to_timeline(&mut self.timeline);
 
                     if MediaPoolState::is_media_file(&path) {
+                        self.waveform_mgr.mark_pending_streams(&path, 8);
                         let _ = self.video_player.open_file(&path, ctx);
                         let _ = self.audio_player.load_audio_from_file(&path);
                     }
@@ -315,6 +320,7 @@ impl NleApp {
                         if count > 0 {
                             self.media_pool.insert_selected_to_timeline(&mut self.timeline);
                             if MediaPoolState::is_media_file(&path) {
+                                self.waveform_mgr.mark_pending_streams(&path, 8);
                                 let _ = self.video_player.open_file(&path, ctx);
                                 let _ = self.audio_player.load_audio_from_file(&path);
                             }
@@ -815,6 +821,7 @@ impl eframe::App for NleApp {
         for f in pending {
             self.media_pool.import_path(&f);
             self.media_pool.insert_selected_to_timeline(&mut self.timeline);
+            self.waveform_mgr.mark_pending_streams(&f, 8);
             let _ = self.video_player.open_file(&f, &ctx);
             let _ = self.audio_player.load_audio_from_file(&f);
         }
@@ -831,6 +838,7 @@ impl eframe::App for NleApp {
 
         // 2. Многодорожечный Audio Mixer (Multi-Track Audio Engine)
         if self.audio_player.has_new_decoded_audio() {
+            self.audio_player.export_waveforms_to(&self.waveform_mgr);
             self.timeline.audio_dirty = true;
             ctx.request_repaint();
         }
@@ -843,12 +851,6 @@ impl eframe::App for NleApp {
             self.timeline.fps,
             self.timeline.is_playing,
         );
-
-        // 3. Обработка Drag & Drop файлов и буфера обмена (Ctrl+V)
-        self.handle_drag_and_drop(&ctx);
-
-        // 4. Обработка хоткеев DaVinci
-        self.handle_keyboard_shortcuts(&ctx);
 
         // 5. Верхний бар меню и Нижний бар переключения страниц DaVinci Resolve
         self.render_top_bar(ui);
@@ -889,7 +891,45 @@ impl eframe::App for NleApp {
             }
         }
 
-        // 8. Модальное окно настроек (Масштабирование UI для 4K)
+        // 7. Синхронизация Audio Mixer ПОСЛЕ обработки всех событий ввода, кликов и изменений таймлайна в текущем кадре
+        if self.audio_player.has_new_decoded_audio() {
+            self.audio_player.export_waveforms_to(&self.waveform_mgr);
+            self.timeline.audio_dirty = true;
+            ctx.request_repaint();
+        }
+        if self.timeline.audio_dirty {
+            self.audio_player.rebuild_timeline_audio(&self.timeline);
+            self.timeline.audio_dirty = false;
+        }
+        self.audio_player.sync_playhead_frame(
+            self.timeline.playhead_frame,
+            self.timeline.fps,
+            self.timeline.is_playing,
+        );
+
+        // 8. Автопилот самопроверки ПОСЛЕ рендера Viewers (чтобы замерять актуальный декодированный кадр текущего тика)
+        let is_autopilot = self.autopilot.is_some();
+        if let Some(mut ap) = self.autopilot.take() {
+            ap.tick(self, &ctx);
+            self.autopilot = Some(ap);
+            if self.timeline.audio_dirty {
+                self.audio_player.rebuild_timeline_audio(&self.timeline);
+                self.timeline.audio_dirty = false;
+            }
+            self.audio_player.sync_playhead_frame(
+                self.timeline.playhead_frame,
+                self.timeline.fps,
+                self.timeline.is_playing,
+            );
+        }
+
+        // 3. Обработка Drag & Drop и хоткеев (во время VERIZON_AUTOPILOT игнорируем внешние события клавиатуры/мыши пользователя)
+        if !is_autopilot {
+            self.handle_drag_and_drop(&ctx);
+            self.handle_keyboard_shortcuts(&ctx);
+        }
+
+        // 9. Модальное окно настроек (Масштабирование UI для 4K)
         self.render_preferences_window(&ctx);
     }
 

@@ -201,17 +201,33 @@ impl TimelineView {
             if timeline.active_tool == Tool::Selection || timeline.active_tool == Tool::Trim {
                 let interact_rect = clip_rect.intersect(tracks_canvas_rect);
                 if interact_rect.is_positive() {
-                    let trim_handle_w = 8.0_f32.min(interact_rect.width() * 0.25);
-                    let left_handle = Rect::from_min_size(interact_rect.min, vec2(trim_handle_w, interact_rect.height()));
-                    let right_handle = Rect::from_min_size(pos2(interact_rect.max.x - trim_handle_w, interact_rect.min.y), vec2(trim_handle_w, interact_rect.height()));
+                    // Ручки Trim привязываются СТРОГО к истинным краям клипа (clip_rect.min.x / clip_rect.max.x),
+                    // а НЕ к обрезанному окном interact_rect! Иначе при выходе правого края клипа за правую границу
+                    // экрана попытка передвинуть клип возле правого края окна случайно обрезает конец клипа!
+                    let allow_trim_handles = timeline.active_tool == Tool::Trim || clip_rect.width() >= 36.0;
+                    let trim_handle_w = if allow_trim_handles {
+                        8.0_f32.min(clip_rect.width() * 0.22)
+                    } else {
+                        0.0
+                    };
+                    let left_handle = Rect::from_min_size(
+                        pos2(clip_rect.min.x, interact_rect.min.y),
+                        vec2(trim_handle_w, interact_rect.height()),
+                    )
+                    .intersect(tracks_canvas_rect);
+                    let right_handle = Rect::from_min_size(
+                        pos2(clip_rect.max.x - trim_handle_w, interact_rect.min.y),
+                        vec2(trim_handle_w, interact_rect.height()),
+                    )
+                    .intersect(tracks_canvas_rect);
 
                     let is_hovered = mouse_pos.map(|m| interact_rect.contains(m)).unwrap_or(false);
                     if is_hovered {
                         hovered_clip_id = Some(clip.id);
                         if let Some(m_pos) = mouse_pos {
-                            if left_handle.contains(m_pos) {
+                            if left_handle.is_positive() && left_handle.contains(m_pos) {
                                 ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeEast);
-                            } else if right_handle.contains(m_pos) {
+                            } else if right_handle.is_positive() && right_handle.contains(m_pos) {
                                 ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeWest);
                             }
                         }
@@ -227,10 +243,10 @@ impl TimelineView {
                         clicked_clip_id = Some(clip.id);
                     }
 
-                    // Начало действия: Trimming (если зажали возле края) или Moving (если зажали по центру)
+                    // Начало действия: Trimming (если зажали возле истинного края клипа) или Moving (если зажали по телу клипа)
                     if clip_resp.drag_started() && timeline.moving_clip.is_none() && timeline.trim_session.is_none() {
                         if let Some(m_pos) = mouse_pos {
-                            if left_handle.contains(m_pos) {
+                            if left_handle.is_positive() && left_handle.contains(m_pos) {
                                 start_trim_request = Some(crate::timeline::TrimSession {
                                     clip_id: clip.id,
                                     edge: crate::timeline::TrimEdge::Start,
@@ -240,7 +256,7 @@ impl TimelineView {
                                     init_source_in_frame: clip.source_in_frame,
                                     init_source_in_secs: clip.source_in_secs,
                                 });
-                            } else if right_handle.contains(m_pos) {
+                            } else if right_handle.is_positive() && right_handle.contains(m_pos) {
                                 start_trim_request = Some(crate::timeline::TrimSession {
                                     clip_id: clip.id,
                                     edge: crate::timeline::TrimEdge::End,

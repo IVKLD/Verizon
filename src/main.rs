@@ -1,4 +1,5 @@
 mod app;
+mod autopilot;
 mod audio_player;
 mod inspector;
 mod media_page;

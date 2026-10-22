@@ -897,3 +897,225 @@ fn test_real_audio_continuity_after_razor_and_move() {
     let moved = audio_player.render_mix_window(cut_sample + 10 * 48000 * 2, 48000 * 2);
     assert!(moved.iter().map(|s| s.abs()).sum::<f32>() > 1.0, "Звук должен переехать вместе с клипом");
 }
+
+/// Результат реалистичного прогона воспроизведения
+struct PlaybackReport {
+    expected: i64,
+    displayed: usize,
+    max_gap_frames: i64,
+    late_p95_frames: i64,
+    startup_ms: f64,
+}
+
+/// Реалистичное воспроизведение как в приложении: плейхед идёт по настенным часам (1.0x), UI опрашивает
+/// плеер на 144 Hz. Считаем сколько кадров из ожидаемых реально показано и как долго «стоит» картинка.
+fn run_realistic_playback(path: &PathBuf, start_frame: i64, secs: f64) -> PlaybackReport {
+    let ctx = Context::default();
+    let mut player = VideoPlayer::new();
+    assert!(player.open_file(path, &ctx).is_ok());
+    assert!(player.wait_for_frame(start_frame, &ctx, Duration::from_secs(3)), "нет начального кадра");
+
+    let fps = player.fps as f64;
+    let t0 = Instant::now();
+    let mut shown: Vec<i64> = Vec::new();
+    let mut lates: Vec<i64> = Vec::new();
+    let mut startup_ms = -1.0;
+    loop {
+        let el = t0.elapsed().as_secs_f64();
+        if el >= secs {
+            break;
+        }
+        let target = start_frame + (el * fps) as i64;
+        player.update_playback(target, true, &ctx);
+        let lf = player.last_decoded_frame;
+        if lf >= start_frame && shown.last().copied() != Some(lf) {
+            if startup_ms < 0.0 && lf > start_frame {
+                startup_ms = el * 1000.0;
+            }
+            shown.push(lf);
+            lates.push((target - lf).max(0));
+        }
+        std::thread::sleep(Duration::from_micros(6900));
+    }
+    let expected = (secs * fps) as i64;
+    let mut max_gap = 0;
+    for w in shown.windows(2) {
+        max_gap = max_gap.max(w[1] - w[0]);
+    }
+    lates.sort();
+    PlaybackReport {
+        expected,
+        displayed: shown.len(),
+        max_gap_frames: max_gap,
+        late_p95_frames: lates.get(lates.len() * 95 / 100).copied().unwrap_or(0),
+        startup_ms,
+    }
+}
+
+/// 11. Воспроизведение «простых» (низкобитрейтных) файлов: дропов быть не должно
+#[test]
+fn test_real_perf_simple_videos_no_frame_drops() {
+    let dir = PathBuf::from("/mnt/kdenlive-cache/epic-movie");
+    if !dir.exists() { return; }
+    let files = [
+        "Replay 2026-10-15 20-17-46.mkv",
+        "Replay 2026-10-17 20-44-39.mkv",
+        "Replay 2026-10-17 20-49-41.mkv",
+    ];
+    println!("\n========================================================");
+    println!(" [PERF BENCHMARK] 11. SIMPLE VIDEOS: REALISTIC 1.0x PLAYBACK");
+    println!("========================================================");
+    let mut worst_ratio = 1.0f64;
+    for name in files {
+        let p = dir.join(name);
+        if !p.exists() { continue; }
+        for start in [0i64, 3000] {
+            let r = run_realistic_playback(&p, start, 6.0);
+            let ratio = r.displayed as f64 / r.expected as f64;
+            worst_ratio = worst_ratio.min(ratio);
+            println!(
+                "  {} @{:5}: shown {}/{} ({:.1}%), max gap {} fr, p95 late {} fr, startup {:.0} ms",
+                &name[7..26], start, r.displayed, r.expected, ratio * 100.0, r.max_gap_frames, r.late_p95_frames, r.startup_ms
+            );
+        }
+    }
+    assert!(worst_ratio >= 0.97, "Frame drop: показано только {:.1}% кадров", worst_ratio * 100.0);
+}
+
+/// 12. Конец клипа: последние кадры должны декодироваться (drain декодера на EOF), перемотка на последний кадр работает,
+/// воспроизведение доходит до самого конца без залипания.
+#[test]
+fn test_real_clip_tail_is_not_truncated() {
+    let p = PathBuf::from("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-15 20-17-46.mkv");
+    if !p.exists() { return; }
+    let ctx = Context::default();
+    let mut player = VideoPlayer::new();
+    assert!(player.open_file(&p, &ctx).is_ok());
+    assert!(player.wait_for_frame(0, &ctx, Duration::from_secs(3)));
+    let total = player.total_frames;
+    println!("\n [TAIL] total_frames reported = {}", total);
+
+    // 1. Перемотка на последние кадры
+    for back in [60i64, 10, 3, 1] {
+        let target = total - back;
+        let ok = player.wait_for_frame(target, &ctx, Duration::from_secs(3));
+        println!("  seek to total-{:<3} (frame {}) -> reached={} last_decoded={}", back, target, ok, player.last_decoded_frame);
+        assert!(ok, "Перемотка на кадр {} (конец клипа -{}) не дала кадр: клип обрезан в конце", target, back);
+    }
+
+    // 2. Воспроизведение через конец: стартуем за 1.5 с до конца
+    let start = total - 90;
+    assert!(player.wait_for_frame(start, &ctx, Duration::from_secs(3)));
+    let t0 = Instant::now();
+    let mut max_seen = start;
+    while t0.elapsed() < Duration::from_millis(1600) {
+        let target = (start + (t0.elapsed().as_secs_f64() * 60.0) as i64).min(total - 1);
+        player.update_playback(target, true, &ctx);
+        max_seen = max_seen.max(player.last_decoded_frame);
+        std::thread::sleep(Duration::from_millis(7));
+    }
+    println!("  playback through tail: max displayed frame = {} (last = {})", max_seen, total - 1);
+    assert!(max_seen >= total - 3, "Воспроизведение не дошло до конца клипа: макс. кадр {} из {}", max_seen, total - 1);
+}
+
+/// Эталонный кадр: программный декодер FFmpeg (CPU) с полным drain на EOF, тот же swscale, тот же отпечаток
+fn ground_truth_fingerprint(path: &std::path::Path, frame: i64, w: u32, h: u32) -> Option<Vec<u8>> {
+    let mut ictx = ffmpeg_next::format::input(path).ok()?;
+    let (idx, tb, fps, params) = {
+        let s = ictx.streams().best(ffmpeg_next::media::Type::Video)?;
+        (s.index(), f64::from(s.time_base()), f64::from(s.avg_frame_rate()), s.parameters())
+    };
+    let mut dec = ffmpeg_next::codec::context::Context::from_parameters(params).ok()?.decoder().video().ok()?;
+    let target_pts = (frame as f64 / fps / tb).round() as i64;
+    unsafe {
+        ffmpeg_next::ffi::av_seek_frame(ictx.as_mut_ptr(), idx as i32, target_pts, ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD);
+    }
+    let mut scaler: Option<ffmpeg_next::software::scaling::Context> = None;
+    let mut decoded = ffmpeg_next::util::frame::Video::empty();
+    let mut rgba = ffmpeg_next::util::frame::Video::empty();
+    let mut result: Option<Vec<u8>> = None;
+
+    let handle = |decoded: &ffmpeg_next::util::frame::Video, scaler: &mut Option<ffmpeg_next::software::scaling::Context>, rgba: &mut ffmpeg_next::util::frame::Video| -> Option<Vec<u8>> {
+        let pts = decoded.pts().unwrap_or(0);
+        let f_num = (pts as f64 * tb * fps).round() as i64;
+        if f_num != frame {
+            return None;
+        }
+        if scaler.is_none() {
+            *scaler = ffmpeg_next::software::scaling::Context::get(
+                decoded.format(), decoded.width(), decoded.height(),
+                ffmpeg_next::format::Pixel::RGBA, w, h,
+                ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
+            ).ok();
+        }
+        let sc = scaler.as_mut().unwrap();
+        if sc.run(decoded, rgba).is_err() {
+            return None;
+        }
+        let data = rgba.data(0);
+        let stride = rgba.stride(0);
+        let mut px: Vec<egui::Color32> = Vec::with_capacity((w * h) as usize);
+        for y in 0..h as usize {
+            px.extend(bytemuck::pod_collect_to_vec::<u8, egui::Color32>(&data[y * stride..y * stride + w as usize * 4]));
+        }
+        let img = egui::ColorImage { size: [w as usize, h as usize], source_size: egui::vec2(w as f32, h as f32), pixels: px };
+        Some(crate::video_decoder::image_fingerprint(&img))
+    };
+
+    'outer: for (st, packet) in ictx.packets() {
+        if st.index() != idx { continue; }
+        if dec.send_packet(&packet).is_ok() {
+            while dec.receive_frame(&mut decoded).is_ok() {
+                if let Some(r) = handle(&decoded, &mut scaler, &mut rgba) { result = Some(r); break 'outer; }
+            }
+        }
+    }
+    if result.is_none() {
+        let _ = dec.send_eof();
+        while dec.receive_frame(&mut decoded).is_ok() {
+            if let Some(r) = handle(&decoded, &mut scaler, &mut rgba) { result = Some(r); break; }
+        }
+    }
+    result
+}
+
+fn fp_distance(a: &[u8], b: &[u8]) -> f64 {
+    if a.len() != b.len() || a.is_empty() { return 255.0; }
+    a.iter().zip(b).map(|(x, y)| (*x as f64 - *y as f64).abs()).sum::<f64>() / a.len() as f64
+}
+
+/// 13. Точность кадров: показанный кадр совпадает с эталонным (включая самый конец клипа).
+#[test]
+fn test_real_frame_accuracy_including_tail() {
+    let p = PathBuf::from("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-15 20-17-46.mkv");
+    if !p.exists() { return; }
+    let ctx = Context::default();
+    let mut player = VideoPlayer::new();
+    assert!(player.open_file(&p, &ctx).is_ok());
+    assert!(player.wait_for_frame(0, &ctx, Duration::from_secs(3)));
+    let total = player.total_frames;
+    let (w, h) = (player.width, player.height);
+
+    let frames = [0, 1, 59, 61, 1000, 17975, total - 61, total - 31, total - 10, total - 4, total - 3, total - 2, total - 1];
+    let mut bad = Vec::new();
+    for &f in &frames {
+        let Some(truth) = ground_truth_fingerprint(&p, f, w, h) else {
+            println!("  frame {:6}: эталон не декодируется (кадра нет в файле?)", f);
+            bad.push(f);
+            continue;
+        };
+        player.force_seek_frame(f, &ctx);
+        let t = Instant::now();
+        let mut dist = 255.0;
+        while t.elapsed() < Duration::from_secs(3) {
+            player.poll_frames(&ctx);
+            dist = fp_distance(&player.last_fingerprint, &truth);
+            if dist < 1.0 && player.last_decoded_frame == f { break; }
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let neighbor = ground_truth_fingerprint(&p, (f - 20).max(0), w, h).map(|n| fp_distance(&n, &truth)).unwrap_or(-1.0);
+        println!("  frame {:6}: dist={:.2} (settled in {:?}; neighbour f-20 differs by {:.2})", f, dist, t.elapsed(), neighbor);
+        if dist >= 1.0 { bad.push(f); }
+    }
+    assert!(bad.is_empty(), "Кадры не совпали с эталоном: {:?}", bad);
+}

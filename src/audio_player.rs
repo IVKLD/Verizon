@@ -1,14 +1,89 @@
 use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use crate::timeline::TimelineState;
 
+/// Прогрессивный потоковый буфер аудиопотока (48 кГц Stereo Interleaved F32).
+/// Создается мгновенно (0 мс) при добавлении клипа на таймлайн и заполняется в фоне с нулевой секунды:
+/// real-time коллбэк CPAL читает уже декодированную часть lock-free через `decoded_len` (Acquire/Release).
+pub struct AudioStreamBuffer {
+    pub samples: Box<[AtomicU32]>,
+    pub decoded_len: AtomicUsize,
+    pub finished: AtomicBool,
+    pub peaks: Mutex<Option<Arc<Vec<f32>>>>,
+}
+
+impl AudioStreamBuffer {
+    pub fn with_capacity(cap_samples: usize) -> Arc<Self> {
+        let cap = cap_samples.max(2) & !1;
+        let mut vec = Vec::with_capacity(cap);
+        vec.resize_with(cap, || AtomicU32::new(0));
+        Arc::new(Self {
+            samples: vec.into_boxed_slice(),
+            decoded_len: AtomicUsize::new(0),
+            finished: AtomicBool::new(false),
+            peaks: Mutex::new(None),
+        })
+    }
+
+    pub fn from_vec(v: Vec<f32>) -> Arc<Self> {
+        let len = v.len() & !1;
+        let boxed: Box<[AtomicU32]> = v
+            .into_iter()
+            .take(len)
+            .map(|f| AtomicU32::new(f.to_bits()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Arc::new(Self {
+            samples: boxed,
+            decoded_len: AtomicUsize::new(len),
+            finished: AtomicBool::new(true),
+            peaks: Mutex::new(None),
+        })
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.decoded_len.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn get(&self, idx: usize) -> Option<f32> {
+        if idx < self.decoded_len.load(Ordering::Acquire) {
+            self.samples.get(idx).map(|a| f32::from_bits(a.load(Ordering::Relaxed)))
+        } else {
+            None
+        }
+    }
+
+    /// Дописать порцию декодированных сэмплов и опубликовать новую длину (Release)
+    pub fn append_slice(&self, cursor: &mut usize, data: &[f32]) {
+        let cap = self.samples.len();
+        if *cursor >= cap {
+            return;
+        }
+        let avail = (cap - *cursor).min(data.len());
+        for (i, &s) in data[..avail].iter().enumerate() {
+            self.samples[*cursor + i].store(s.to_bits(), Ordering::Relaxed);
+        }
+        *cursor += avail;
+        self.decoded_len.store(*cursor & !1, Ordering::Release);
+    }
+}
+
 /// Один звуковой сегмент на таймлайне (клип A-дорожки) в координатах interleaved-сэмплов (L,R,L,R...)
 pub struct MixSegment {
-    pub samples: Arc<Vec<f32>>,
+    pub samples: Arc<AudioStreamBuffer>,
     /// Позиция начала сегмента на таймлайне (в interleaved-сэмплах, чётная)
     pub start: usize,
     /// Смещение внутри исходного PCM-потока (в interleaved-сэмплах, чётное)
@@ -42,13 +117,16 @@ impl MixSnapshot {
             let src_base = seg.in_off + (lo - seg.start);
             let dst = &mut out[lo - pos..hi - pos];
             let pcm = &seg.samples;
+            let avail_len = pcm.decoded_len.load(Ordering::Acquire).min(pcm.samples.len());
             for (k, d) in dst.iter_mut().enumerate() {
                 let src = src_base + k;
+                if src >= avail_len {
+                    break;
+                }
                 // Чётность относительно начала таймлайна: чётный индекс = L, нечётный = R
                 let gain = if (lo + k) & 1 == 0 { seg.gain_l } else { seg.gain_r };
-                if let Some(s) = pcm.get(src) {
-                    *d += *s * gain;
-                }
+                let s = f32::from_bits(pcm.samples[src].load(Ordering::Relaxed));
+                *d += s * gain;
             }
         }
         for s in out.iter_mut() {
@@ -76,10 +154,11 @@ pub struct AudioPlayer {
     pub is_loading: Arc<AtomicBool>,
     load_counter: Arc<AtomicU64>,
     _stream: Option<cpal::Stream>,
-    // Кэш декодированных аудиопотоков: (файл, индекс_аудиопотока) -> PCM F32 Stereo 48kHz
-    pub audio_cache: Arc<Mutex<HashMap<(PathBuf, usize), Arc<Vec<f32>>>>>,
-    pub pending_decodes: Arc<Mutex<std::collections::HashSet<(PathBuf, usize)>>>,
-    pub last_cache_len: usize,
+    // Кэш прогрессивных аудиопотоков: (файл, индекс_аудиопотока) -> AudioStreamBuffer (PCM F32 Stereo 48kHz)
+    pub audio_cache: Arc<Mutex<HashMap<(PathBuf, usize), Arc<AudioStreamBuffer>>>>,
+    pub pending_decodes: Arc<Mutex<HashSet<(PathBuf, usize)>>>,
+    pub cache_generation: Arc<AtomicU64>,
+    pub last_seen_generation: u64,
 }
 
 impl AudioPlayer {
@@ -105,8 +184,9 @@ impl AudioPlayer {
             load_counter: Arc::new(AtomicU64::new(0)),
             _stream: stream,
             audio_cache: Arc::new(Mutex::new(HashMap::new())),
-            pending_decodes: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            last_cache_len: 0,
+            pending_decodes: Arc::new(Mutex::new(HashSet::new())),
+            cache_generation: Arc::new(AtomicU64::new(0)),
+            last_seen_generation: 0,
         }
     }
 
@@ -246,6 +326,15 @@ impl AudioPlayer {
             .map_err(|e| e.to_string())?;
         let mut audio_decoder = context_decoder.decoder().audio().map_err(|e| e.to_string())?;
 
+        // Отключаем чтение видеопотоков (AVDISCARD_ALL), чтобы не аллоцировать гигабайты видеопакетов при декодировании звука
+        for mut s in ictx.streams_mut() {
+            if s.index() != stream_idx {
+                unsafe {
+                    (*s.as_mut_ptr()).discard = ffmpeg_next::ffi::AVDiscard::AVDISCARD_ALL;
+                }
+            }
+        }
+
         let in_rate = audio_decoder.rate();
         let in_format = audio_decoder.format();
         let in_channel_layout = if audio_decoder.channel_layout().is_empty() {
@@ -319,70 +408,318 @@ impl AudioPlayer {
         Ok((all_samples, out_rate))
     }
 
-    /// Проверить, завершилась ли асинхронная расшифровка новых аудиодорожек
+    /// Проверить, появились ли новые расшифрованные аудиопотоки
     pub fn has_new_decoded_audio(&mut self) -> bool {
-        if let Ok(cache) = self.audio_cache.lock() {
-            let current_len = cache.len();
-            if current_len != self.last_cache_len {
-                self.last_cache_len = current_len;
-                return true;
-            }
+        let gen = self.cache_generation.load(Ordering::Acquire);
+        if gen != self.last_seen_generation {
+            self.last_seen_generation = gen;
+            return true;
         }
         false
     }
 
-    /// Синхронное гарантированное получение аудиопотока (для тестов)
+    /// Передать вычисленные во время декодирования волновые пики в WaveformManager (без повторного чтения файла с диска!)
+    pub fn export_waveforms_to(&self, waveform_mgr: &crate::waveform::WaveformManager) {
+        if let Ok(cache) = self.audio_cache.lock() {
+            for ((path, idx), buf) in cache.iter() {
+                if waveform_mgr.get_waveform_stream(path, *idx).is_none() {
+                    if let Ok(pk_guard) = buf.peaks.lock() {
+                        if let Some(ref arc_peaks) = *pk_guard {
+                            waveform_mgr.insert_waveform_arc(path, *idx, arc_peaks.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Синхронное гарантированное получение полностью декодированного аудиопотока (для тестов)
     #[allow(dead_code)]
-    pub fn ensure_audio_stream_cached_sync(&self, path: &Path, audio_track_index: usize) -> Option<Arc<Vec<f32>>> {
+    pub fn ensure_audio_stream_cached_sync(&self, path: &Path, audio_track_index: usize) -> Option<Arc<AudioStreamBuffer>> {
         let key = (path.to_path_buf(), audio_track_index);
         if let Ok(cache) = self.audio_cache.lock() {
-            if let Some(samples) = cache.get(&key) {
-                return Some(samples.clone());
+            if let Some(buf) = cache.get(&key) {
+                if buf.finished.load(Ordering::Acquire) {
+                    return Some(buf.clone());
+                }
             }
         }
         if let Ok((samples, _)) = Self::decode_audio_stream_worker(path, audio_track_index) {
-            let arc_samples = Arc::new(samples);
+            let arc_buf = AudioStreamBuffer::from_vec(samples);
             if let Ok(mut cache) = self.audio_cache.lock() {
-                cache.insert(key, arc_samples.clone());
+                cache.insert(key, arc_buf.clone());
             }
-            Some(arc_samples)
+            self.cache_generation.fetch_add(1, Ordering::Release);
+            Some(arc_buf)
         } else {
             None
         }
     }
 
-    /// Неблокирующее получение аудиопотока из кэша.
-    /// Если аудио ещё не расшифровано, запускает фоновый воркер без блокировки интерфейса (0 ms UI lag)!
-    pub fn get_or_decode_audio_stream(&self, path: &Path, audio_track_index: usize) -> Option<Arc<Vec<f32>>> {
-        let key = (path.to_path_buf(), audio_track_index);
-        if let Ok(cache) = self.audio_cache.lock() {
-            if let Some(samples) = cache.get(&key) {
-                return Some(samples.clone());
+    /// Однопроходный прогрессивный декодер ВСЕХ аудиопотоков файла одновременно.
+    /// Заполняет все буферы потоков с 0-й секунды параллельно чтению пакетов (звук играет мгновенно!).
+    fn decode_all_streams_progressive(
+        path: &Path,
+        buffers: Vec<(usize, Arc<AudioStreamBuffer>)>,
+    ) {
+        let Ok(mut ictx) = ffmpeg_next::format::input(path) else {
+            for (_, b) in &buffers {
+                b.finished.store(true, Ordering::Release);
+            }
+            return;
+        };
+
+        let audio_stream_indices: Vec<(usize, usize, ffmpeg_next::codec::Parameters)> = ictx
+            .streams()
+            .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Audio)
+            .enumerate()
+            .map(|(a_idx, s)| (a_idx, s.index(), s.parameters()))
+            .collect();
+
+        // Отключаем чтение видеопотоков (AVDISCARD_ALL), чтобы не аллоцировать 10+ ГБ 4K60 видеопакетов при прогрессивном декодировании звука
+        for mut s in ictx.streams_mut() {
+            if s.parameters().medium() != ffmpeg_next::media::Type::Audio {
+                unsafe {
+                    (*s.as_mut_ptr()).discard = ffmpeg_next::ffi::AVDiscard::AVDISCARD_ALL;
+                }
             }
         }
 
-        // Запуск неблокирующего фонового декодирования (гарантирует 0 ms зависания GUI при импорте сложных видео)
-        if let Ok(mut pending) = self.pending_decodes.lock() {
-            if !pending.contains(&key) {
-                pending.insert(key.clone());
-                let cache_clone = self.audio_cache.clone();
-                let pending_clone = self.pending_decodes.clone();
-                let p = path.to_path_buf();
-                std::thread::spawn(move || {
-                    if let Ok((samples, _)) = Self::decode_audio_stream_worker(&p, audio_track_index) {
-                        let arc_samples = Arc::new(samples);
-                        if let Ok(mut c) = cache_clone.lock() {
-                            c.insert((p.clone(), audio_track_index), arc_samples);
+        struct StreamDecoder {
+            stream_idx: usize,
+            decoder: ffmpeg_next::decoder::Audio,
+            resampler: ffmpeg_next::software::resampling::Context,
+            in_channel_layout: ffmpeg_next::channel_layout::ChannelLayout,
+            decoded_frame: ffmpeg_next::util::frame::Audio,
+            resampled_frame: ffmpeg_next::util::frame::Audio,
+            buf: Arc<AudioStreamBuffer>,
+            cursor: usize,
+            peaks: Vec<f32>,
+            current_max: f32,
+            count_in_bucket: usize,
+        }
+
+        let samples_per_bucket = (AUDIO_RATE as usize * 2) / 100; // 100 пиков в секунду (каждые 10 мс = 960 сэмплов)
+        let mut decoders: Vec<StreamDecoder> = Vec::new();
+        for (a_idx, buf) in &buffers {
+            let Some((_, stream_idx, ref params)) = audio_stream_indices
+                .iter()
+                .find(|(idx, _, _)| idx == a_idx)
+                .or_else(|| audio_stream_indices.first())
+            else {
+                buf.finished.store(true, Ordering::Release);
+                continue;
+            };
+
+            let Ok(ctx_dec) = ffmpeg_next::codec::context::Context::from_parameters(params.clone()) else {
+                buf.finished.store(true, Ordering::Release);
+                continue;
+            };
+            let Ok(audio_decoder) = ctx_dec.decoder().audio() else {
+                buf.finished.store(true, Ordering::Release);
+                continue;
+            };
+
+            let in_rate = audio_decoder.rate();
+            let in_format = audio_decoder.format();
+            let in_channel_layout = if audio_decoder.channel_layout().is_empty() {
+                if audio_decoder.channels() == 1 {
+                    ffmpeg_next::channel_layout::ChannelLayout::MONO
+                } else {
+                    ffmpeg_next::channel_layout::ChannelLayout::STEREO
+                }
+            } else {
+                audio_decoder.channel_layout()
+            };
+
+            let out_rate = AUDIO_RATE;
+            let out_channel_layout = ffmpeg_next::channel_layout::ChannelLayout::STEREO;
+            let out_format = ffmpeg_next::format::Sample::F32(ffmpeg_next::format::sample::Type::Packed);
+
+            let Ok(resampler) = ffmpeg_next::software::resampling::Context::get(
+                in_format,
+                in_channel_layout,
+                in_rate,
+                out_format,
+                out_channel_layout,
+                out_rate,
+            ) else {
+                buf.finished.store(true, Ordering::Release);
+                continue;
+            };
+
+            let est_buckets = (buf.samples.len() / samples_per_bucket).max(256);
+            decoders.push(StreamDecoder {
+                stream_idx: *stream_idx,
+                decoder: audio_decoder,
+                resampler,
+                in_channel_layout,
+                decoded_frame: ffmpeg_next::util::frame::Audio::empty(),
+                resampled_frame: ffmpeg_next::util::frame::Audio::empty(),
+                buf: buf.clone(),
+                cursor: 0,
+                peaks: Vec::with_capacity(est_buckets),
+                current_max: 0.0,
+                count_in_bucket: 0,
+            });
+        }
+
+        if decoders.is_empty() {
+            return;
+        }
+
+        for (stream, packet) in ictx.packets() {
+            let s_idx = stream.index();
+            for dec in &mut decoders {
+                if dec.stream_idx == s_idx && dec.decoder.send_packet(&packet).is_ok() {
+                    while dec.decoder.receive_frame(&mut dec.decoded_frame).is_ok() {
+                        if dec.decoded_frame.channel_layout().is_empty() {
+                            dec.decoded_frame.set_channel_layout(dec.in_channel_layout);
+                        }
+                        if dec.resampler.run(&dec.decoded_frame, &mut dec.resampled_frame).is_ok() {
+                            let samples_count = dec.resampled_frame.samples() * 2;
+                            let data: &[f32] = unsafe {
+                                std::slice::from_raw_parts(
+                                    dec.resampled_frame.data(0).as_ptr() as *const f32,
+                                    samples_count,
+                                )
+                            };
+                            dec.buf.append_slice(&mut dec.cursor, data);
+                            for &sample in data {
+                                let abs = sample.abs();
+                                if abs > dec.current_max {
+                                    dec.current_max = abs;
+                                }
+                                dec.count_in_bucket += 1;
+                                if dec.count_in_bucket >= samples_per_bucket {
+                                    dec.peaks.push(dec.current_max.clamp(0.0, 1.0));
+                                    dec.current_max = 0.0;
+                                    dec.count_in_bucket = 0;
+                                }
+                            }
                         }
                     }
-                    if let Ok(mut pend) = pending_clone.lock() {
-                        pend.remove(&(p, audio_track_index));
-                    }
-                });
+                }
             }
         }
 
-        None
+        for dec in &mut decoders {
+            if dec.decoder.send_eof().is_ok() {
+                while dec.decoder.receive_frame(&mut dec.decoded_frame).is_ok() {
+                    if dec.decoded_frame.channel_layout().is_empty() {
+                        dec.decoded_frame.set_channel_layout(dec.in_channel_layout);
+                    }
+                    if dec.resampler.run(&dec.decoded_frame, &mut dec.resampled_frame).is_ok() {
+                        let samples_count = dec.resampled_frame.samples() * 2;
+                        let data: &[f32] = unsafe {
+                            std::slice::from_raw_parts(
+                                dec.resampled_frame.data(0).as_ptr() as *const f32,
+                                samples_count,
+                            )
+                        };
+                        dec.buf.append_slice(&mut dec.cursor, data);
+                        for &sample in data {
+                            let abs = sample.abs();
+                            if abs > dec.current_max {
+                                dec.current_max = abs;
+                            }
+                            dec.count_in_bucket += 1;
+                            if dec.count_in_bucket >= samples_per_bucket {
+                                dec.peaks.push(dec.current_max.clamp(0.0, 1.0));
+                                dec.current_max = 0.0;
+                                dec.count_in_bucket = 0;
+                            }
+                        }
+                    }
+                }
+            }
+            if dec.count_in_bucket > 0 {
+                dec.peaks.push(dec.current_max.clamp(0.0, 1.0));
+            }
+            let max_peak = dec.peaks.iter().copied().fold(0.0_f32, f32::max);
+            if max_peak > 0.001 && max_peak < 0.8 {
+                let gain = (0.85 / max_peak).min(6.0);
+                for p in &mut dec.peaks {
+                    *p = (*p * gain).clamp(0.0, 1.0);
+                }
+            }
+            if let Ok(mut pk_guard) = dec.buf.peaks.lock() {
+                *pk_guard = Some(Arc::new(std::mem::take(&mut dec.peaks)));
+            }
+            dec.buf.finished.store(true, Ordering::Release);
+        }
+    }
+
+    /// Неблокирующее получение прогрессивного аудиопотока из кэша.
+    /// Возвращает `Some(Arc<AudioStreamBuffer>)` МГНОВЕННО (0 ms) и запускает однопроходное фоновое
+    /// декодирование всех аудиодорожек файла, чтобы звук играл с первой же миллисекунды!
+    pub fn get_or_decode_audio_stream(&self, path: &Path, audio_track_index: usize) -> Option<Arc<AudioStreamBuffer>> {
+        let key = (path.to_path_buf(), audio_track_index);
+        if let Ok(cache) = self.audio_cache.lock() {
+            if let Some(buf) = cache.get(&key) {
+                return Some(buf.clone());
+            }
+        }
+
+        // Определяем число аудиопотоков и длительность файла за ~0.2 мс (чтение заголовка контейнера)
+        let (num_streams, duration_secs) = if let Ok(ictx) = ffmpeg_next::format::input(path) {
+            let n = ictx
+                .streams()
+                .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Audio)
+                .count();
+            let d = (ictx.duration() as f64 / f64::from(ffmpeg_next::ffi::AV_TIME_BASE)).max(1.0);
+            (n, d)
+        } else {
+            return None;
+        };
+
+        if num_streams == 0 {
+            return None;
+        }
+
+        // Выделяем прогрессивные буферы сразу для всех аудиодорожек файла (с запасом +2 сек)
+        let cap_samples = ((duration_secs + 2.0) * AUDIO_RATE as f64).ceil() as usize * 2;
+        let mut to_decode: Vec<(usize, Arc<AudioStreamBuffer>)> = Vec::new();
+        let mut result_buf: Option<Arc<AudioStreamBuffer>> = None;
+
+        if let (Ok(mut cache), Ok(mut pending)) = (self.audio_cache.lock(), self.pending_decodes.lock()) {
+            let max_idx = num_streams.max(audio_track_index + 1);
+            for idx in 0..max_idx {
+                let k = (path.to_path_buf(), idx);
+                let buf = cache
+                    .entry(k.clone())
+                    .or_insert_with(|| AudioStreamBuffer::with_capacity(cap_samples))
+                    .clone();
+                if idx == audio_track_index {
+                    result_buf = Some(buf.clone());
+                }
+                if !pending.contains(&k) && !buf.finished.load(Ordering::Acquire) {
+                    pending.insert(k);
+                    to_decode.push((idx, buf));
+                }
+            }
+        }
+
+        if !to_decode.is_empty() {
+            let pending_clone = self.pending_decodes.clone();
+            let gen_clone = self.cache_generation.clone();
+            let is_loading = self.is_loading.clone();
+            is_loading.store(true, Ordering::Release);
+            let p = path.to_path_buf();
+            std::thread::spawn(move || {
+                let indices: Vec<usize> = to_decode.iter().map(|(i, _)| *i).collect();
+                Self::decode_all_streams_progressive(&p, to_decode);
+                if let Ok(mut pend) = pending_clone.lock() {
+                    for idx in indices {
+                        pend.remove(&(p.clone(), idx));
+                    }
+                }
+                gen_clone.fetch_add(1, Ordering::Release);
+                is_loading.store(false, Ordering::Release);
+            });
+        }
+
+        result_buf
     }
 
     /// Мгновенная сборка снимка аудио-таймлайна (Multi-Track Mixer): O(число клипов), без копирования PCM.
@@ -449,38 +786,11 @@ impl AudioPlayer {
         out
     }
 
-    /// Загрузить аудио из медиафайла асинхронно через фоновый поток (прогрев кэша PCM).
-    /// Сведение выполняется снимком таймлайна, как только поток расшифрован (см. has_new_decoded_audio).
+    /// Загрузить аудио из медиафайла асинхронно через единый прогрессивный декодер (без дублирования потоков).
     pub fn load_audio_from_file(&mut self, path: &Path) -> Result<(), String> {
-        if self.current_path.as_deref() == Some(path) {
-            return Ok(());
-        }
-
+        let _ = self.load_counter;
         self.current_path = Some(path.to_path_buf());
-        self.is_loading.store(true, Ordering::SeqCst);
-
-        let path_buf = path.to_path_buf();
-        let is_loading = self.is_loading.clone();
-        let load_id = self.load_counter.fetch_add(1, Ordering::SeqCst) + 1;
-        let load_counter = self.load_counter.clone();
-        let cache = self.audio_cache.clone();
-
-        std::thread::spawn(move || {
-            match Self::decode_audio_stream_worker(&path_buf, 0) {
-                Ok((samples, _out_rate)) => {
-                    if let Ok(mut c) = cache.lock() {
-                        c.insert((path_buf.clone(), 0), Arc::new(samples));
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Background audio decode error: {}", e);
-                }
-            }
-            if load_counter.load(Ordering::SeqCst) == load_id {
-                is_loading.store(false, Ordering::SeqCst);
-            }
-        });
-
+        let _ = self.get_or_decode_audio_stream(path, 0);
         Ok(())
     }
 

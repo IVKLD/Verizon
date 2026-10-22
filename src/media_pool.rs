@@ -113,7 +113,10 @@ impl MediaPoolState {
                 if let Ok(decoder) = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters()) {
                     if let Ok(v_dec) = decoder.decoder().video() {
                         res = format!("{}x{}", v_dec.width(), v_dec.height());
-                        let f = f64::from(stream.avg_frame_rate());
+                        let mut f = f64::from(stream.avg_frame_rate());
+                        if f <= 0.0 || f.is_nan() {
+                            f = f64::from(stream.rate());
+                        }
                         if f > 0.0 && !f.is_nan() {
                             fps_num = f;
                             fps_str = format!("{:.2} fps", f);
@@ -354,6 +357,9 @@ impl MediaPoolState {
 
                         // ИНИЦИАЛИЗАЦИЯ ПЕРЕТАСКИВАНИЯ НА ТАЙМЛАЙН
                         if interact_resp.drag_started() {
+                            if timeline.clips.is_empty() && asset.fps_num > 0.0 {
+                                timeline.fps = asset.fps_num.round().clamp(1.0, 240.0) as u32;
+                            }
                             let dur_frames = (asset.duration_secs * timeline.fps as f64).round().max(1.0) as i64;
                             timeline.dragged_media = Some(DraggedMedia {
                                 name: asset.filename.clone(),

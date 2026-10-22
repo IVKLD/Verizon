@@ -69,11 +69,12 @@ impl ViewerState {
         vu_levels: (f32, f32),
         ctx: &egui::Context,
     ) {
-        // Декодирование текущего кадра активного клипа на таймлайне
+        // Декодирование текущего кадра активного клипа на таймлайне (приоритет: самая верхняя видеодорожка и последний перемещенный клип)
         let active_clip = timeline
             .clips
             .iter()
-            .find(|c| !c.is_audio && c.contains_frame(timeline.playhead_frame));
+            .filter(|c| !c.is_audio && c.contains_frame(timeline.playhead_frame))
+            .min_by_key(|c| (c.track_index, if timeline.selected_clip_id == Some(c.id) { 0usize } else { 1usize }));
 
         if let Some(clip) = active_clip {
             if let Some(path) = &clip.source_path {
@@ -85,7 +86,50 @@ impl ViewerState {
                 let total_source_secs = clip.source_in_secs + time_secs;
                 let source_frame = (total_source_secs * clip.source_fps).round() as i64;
                 if timeline.is_playing {
-                    video_player.update_playback(source_frame, true, ctx);
+                    // Вычисляем ближайшую монтажную склейку (конец текущего клипа или начало клипа на более приоритетной дорожке V2 > V1)
+                    let clip_prio = (clip.track_index, if timeline.selected_clip_id == Some(clip.id) { 0usize } else { 1usize });
+                    let clip_end = clip.start_frame + clip.duration_frames;
+                    let cut_frame = timeline
+                        .clips
+                        .iter()
+                        .filter(|c| {
+                            !c.is_audio
+                                && c.id != clip.id
+                                && c.start_frame > timeline.playhead_frame
+                                && c.start_frame < clip_end
+                                && (c.track_index, if timeline.selected_clip_id == Some(c.id) { 0usize } else { 1usize }) < clip_prio
+                        })
+                        .map(|c| c.start_frame)
+                        .min()
+                        .unwrap_or(clip_end);
+
+                    let last_tl_frame = (cut_frame - 1).max(clip.start_frame);
+                    let last_src = ((clip.source_in_secs + (last_tl_frame - clip.start_frame) as f64 / timeline.fps.max(1) as f64) * clip.source_fps).round() as i64;
+
+                    let next_clip = timeline
+                        .clips
+                        .iter()
+                        .filter(|c| !c.is_audio && c.contains_frame(cut_frame))
+                        .min_by_key(|c| (c.track_index, if timeline.selected_clip_id == Some(c.id) { 0usize } else { 1usize }))
+                        .or_else(|| {
+                            timeline
+                                .clips
+                                .iter()
+                                .filter(|c| !c.is_audio && c.start_frame >= cut_frame)
+                                .min_by_key(|c| (c.start_frame, c.track_index))
+                        });
+
+                    let upcoming_cut = next_clip.and_then(|nc| {
+                        if nc.id != clip.id && nc.source_path.as_deref() == Some(path.as_path()) {
+                            let nc_tl_frame = cut_frame.max(nc.start_frame);
+                            let next_src = ((nc.source_in_secs + (nc_tl_frame - nc.start_frame) as f64 / timeline.fps.max(1) as f64) * nc.source_fps).round() as i64;
+                            Some((last_src, next_src))
+                        } else {
+                            None
+                        }
+                    });
+
+                    video_player.update_playback_with_cut(source_frame, true, upcoming_cut, ctx);
                 } else if ui.input(|i| i.pointer.any_released()) {
                     video_player.force_seek_frame(source_frame, ctx);
                 } else {
@@ -101,8 +145,24 @@ impl ViewerState {
                 }
             }
         } else {
-            // Если под плейхедом нет видеоклипа — отображаем чистый кадр без лишней нагрузки декодера
-            video_player.show_blank_frame(ctx);
+            // Если под плейхедом пауза — отображаем чистый кадр и при воспроизведении заранее готовим декодер к следующему клипу
+            let prefetch_src = if timeline.is_playing {
+                timeline
+                    .clips
+                    .iter()
+                    .filter(|c| !c.is_audio && c.start_frame > timeline.playhead_frame)
+                    .min_by_key(|c| (c.start_frame, c.track_index))
+                    .and_then(|c| {
+                        if c.source_path.as_deref() == video_player.current_path.as_deref() {
+                            Some((c.source_in_secs * c.source_fps).round() as i64)
+                        } else {
+                            None
+                        }
+                    })
+            } else {
+                None
+            };
+            video_player.show_blank_frame_with_prefetch(prefetch_src, ctx);
         }
 
         // Обновление реальных уровней громкости VU-метра
