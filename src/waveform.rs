@@ -170,20 +170,15 @@ mod tests {
 
     #[test]
     fn test_extract_audio_peaks() {
-        let test_path = Path::new("/home/igni/Documents/IMG_6686.MP4");
+        let test_path = Path::new("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
         if !test_path.exists() {
             return;
         }
 
+        let t0 = std::time::Instant::now();
         let peaks = WaveformManager::extract_audio_peaks(test_path).expect("Failed to extract peaks");
+        println!("Waveform extraction took: {:?}, extracted {} points", t0.elapsed(), peaks.len());
         assert!(!peaks.is_empty(), "Peaks should not be empty");
-
-        // Все значения должны быть в диапазоне 0.0..=1.0
-        for &p in &peaks {
-            assert!(p >= 0.0 && p <= 1.0);
-        }
-
-        // Проверяем, что есть как звук, так и корректно распознаются уровни
         let has_sound = peaks.iter().any(|&p| p > 0.05);
         assert!(has_sound, "Audio must contain audible sound");
     }

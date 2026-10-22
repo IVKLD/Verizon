@@ -84,9 +84,17 @@ impl ViewerState {
                 let time_secs = offset as f64 / timeline.fps as f64;
                 let total_source_secs = clip.source_in_secs + time_secs;
                 let source_frame = (total_source_secs * clip.source_fps).round() as i64;
-                video_player.seek_and_decode(source_frame, ctx);
+                if ui.input(|i| i.pointer.any_released()) {
+                    video_player.force_seek_frame(source_frame, ctx);
+                } else {
+                    video_player.seek_and_decode(source_frame, ctx);
+                }
             } else {
-                video_player.seek_and_decode(timeline.playhead_frame, ctx);
+                if ui.input(|i| i.pointer.any_released()) {
+                    video_player.force_seek_frame(timeline.playhead_frame, ctx);
+                } else {
+                    video_player.seek_and_decode(timeline.playhead_frame, ctx);
+                }
             }
         } else {
             // Если под плейхедом нет видеоклипа — отображаем чистый кадр без лишней нагрузки декодера
