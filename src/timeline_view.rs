@@ -54,8 +54,11 @@ impl TimelineView {
 
         let mouse_pos = ui.input(|i| i.pointer.hover_pos());
 
-        // 1. Взаимодействие со скраббингом исключительно по линейке времени (Ruler)
+        // 1. Взаимодействие со скраббингом курсора ИСКЛЮЧИТЕЛЬНО по линейке времени с цифрами (Ruler как в DaVinci Resolve)
         let ruler_sense = ui.interact(ruler_rect, ui.id().with("ruler_scrub"), egui::Sense::click_and_drag());
+        if ruler_sense.hovered() || ruler_sense.dragged() {
+            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
+        }
         if ruler_sense.dragged() || ruler_sense.clicked() {
             if let Some(m_pos) = mouse_pos {
                 let rel_x = m_pos.x - canvas_rect.min.x + timeline.scroll_x;
@@ -238,19 +241,20 @@ impl TimelineView {
             }
         }
 
-        // РЕЖИМ 2: Инструмент Selection (Стрелка) — клик по пустой области перемещает плейхед
+        // В области дорожек клик по пустому месту ТОЛЬКО снимает выделение с клипа
+        // (Управление курсором плейхеда происходит ИСКЛЮЧИТЕЛЬНО на линейке с цифрами как в DaVinci Resolve)
         if timeline.active_tool == Tool::Selection && timeline.moving_clip.is_none() && hovered_clip_id.is_none() && timeline.dragged_media.is_none() {
-            let canvas_sense = ui.interact(tracks_canvas_rect, ui.id().with("empty_tracks_canvas"), egui::Sense::click_and_drag());
-            if canvas_sense.clicked() || canvas_sense.dragged() {
-                if let Some(m_pos) = mouse_pos {
-                    let rel_x = m_pos.x - canvas_rect.min.x + timeline.scroll_x;
-                    let target_frame = (rel_x / timeline.zoom_factor).max(0.0) as i64;
-                    timeline.playhead_frame = target_frame;
-                    if canvas_sense.clicked() {
-                        timeline.selected_clip_id = None;
-                    }
-                }
+            let canvas_sense = ui.interact(tracks_canvas_rect, ui.id().with("empty_tracks_canvas"), egui::Sense::click());
+            if canvas_sense.clicked() {
+                timeline.selected_clip_id = None;
             }
+        }
+
+        // Индикация курсора мыши для перемещения клипов
+        if timeline.moving_clip.is_some() {
+            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
+        } else if hovered_clip_id.is_some() && timeline.active_tool == Tool::Selection {
+            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
         }
 
         // Применение действий с клипами
