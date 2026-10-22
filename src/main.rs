@@ -3,6 +3,7 @@ mod audio_player;
 mod inspector;
 mod media_page;
 mod media_pool;
+mod preferences;
 mod theme;
 mod timecode;
 mod timeline;

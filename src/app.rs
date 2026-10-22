@@ -5,6 +5,7 @@ use crate::audio_player::AudioPlayer;
 use crate::inspector::InspectorState;
 use crate::media_page::MediaPageState;
 use crate::media_pool::MediaPoolState;
+use crate::preferences::UserPreferences;
 use crate::theme::{apply_resolve_theme, ResolveColors};
 use crate::timeline::{TimelineState, Tool};
 use crate::timeline_view::TimelineView;
@@ -88,6 +89,8 @@ pub struct NleApp {
     pub timeline: TimelineState,
     pub video_player: VideoPlayer,
     pub audio_player: AudioPlayer,
+    pub preferences: UserPreferences,
+    pub show_preferences_window: bool,
     pub last_frame_time: std::time::Instant,
     pub notification: Option<(String, std::time::Instant)>,
 }
@@ -95,6 +98,9 @@ pub struct NleApp {
 impl NleApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         apply_resolve_theme(&cc.egui_ctx);
+
+        let prefs = UserPreferences::load();
+        cc.egui_ctx.set_zoom_factor(prefs.ui_scale);
 
         let mut app = Self {
             current_page: Page::Edit,
@@ -106,12 +112,21 @@ impl NleApp {
             timeline: TimelineState::new_empty(),
             video_player: VideoPlayer::new(),
             audio_player: AudioPlayer::new(),
+            preferences: prefs,
+            show_preferences_window: false,
             last_frame_time: std::time::Instant::now(),
             notification: None,
         };
 
         app.reset_dock_layout();
         app
+    }
+
+    pub fn set_ui_scale(&mut self, new_scale: f32, ctx: &Context) {
+        let clamped = new_scale.clamp(0.5, 4.0);
+        self.preferences.ui_scale = (clamped * 100.0).round() / 100.0;
+        ctx.set_zoom_factor(self.preferences.ui_scale);
+        self.preferences.save();
     }
 
     pub fn prompt_import_media(&mut self, ctx: &Context) {
@@ -219,6 +234,9 @@ impl NleApp {
 
     fn handle_keyboard_shortcuts(&mut self, ctx: &Context) {
         let mut import_requested = false;
+        let mut scale_change: Option<f32> = None;
+        let mut toggle_prefs = false;
+
         ctx.input(|i| {
             // Space: Play / Pause
             if i.key_pressed(egui::Key::Space) {
@@ -229,6 +247,22 @@ impl NleApp {
             // Ctrl+I: Import Media
             if (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::I) {
                 import_requested = true;
+            }
+
+            // Ctrl + , (Preferences / Настройки)
+            if (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::Comma) {
+                toggle_prefs = true;
+            }
+
+            // Масштабирование интерфейса для 4K: Ctrl + / Ctrl - / Ctrl 0
+            if i.modifiers.ctrl || i.modifiers.command {
+                if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
+                    scale_change = Some(self.preferences.ui_scale + 0.1);
+                } else if i.key_pressed(egui::Key::Minus) {
+                    scale_change = Some(self.preferences.ui_scale - 0.1);
+                } else if i.key_pressed(egui::Key::Num0) {
+                    scale_change = Some(1.0);
+                }
             }
 
             // J / K / L Shuttle
@@ -290,6 +324,14 @@ impl NleApp {
         if import_requested {
             self.prompt_import_media(ctx);
         }
+
+        if toggle_prefs {
+            self.show_preferences_window = !self.show_preferences_window;
+        }
+
+        if let Some(new_scale) = scale_change {
+            self.set_ui_scale(new_scale, ctx);
+        }
     }
 
     fn render_top_bar(&mut self, ui: &mut Ui) {
@@ -322,6 +364,11 @@ impl NleApp {
                             if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                                 self.media_pool.import_path(&folder);
                             }
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("⚙ Preferences... [Ctrl+,]").clicked() {
+                            self.show_preferences_window = true;
                             ui.close();
                         }
                     });
@@ -363,6 +410,11 @@ impl NleApp {
                             self.notification = Some(("✅ Расположение окон сброшено к дефолту".to_string(), std::time::Instant::now()));
                             ui.close();
                         }
+                        ui.separator();
+                        if ui.button("🔍 Масштаб интерфейса (4K / HiDPI)... [Ctrl+,]").clicked() {
+                            self.show_preferences_window = true;
+                            ui.close();
+                        }
                     });
 
                     ui.separator();
@@ -380,11 +432,26 @@ impl NleApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // 1. Кнопка открытия настроек
+                        if ui.button("⚙ Настройки [Ctrl+,]").on_hover_text("Настройки масштабирования интерфейса и программы").clicked() {
+                            self.show_preferences_window = true;
+                        }
+
+                        // 2. Быстрые кнопки масштабирования для 4K
+                        if ui.button("➕").on_hover_text("Увеличить масштаб интерфейса [Ctrl +]").clicked() {
+                            let s = self.preferences.ui_scale + 0.1;
+                            self.set_ui_scale(s, ui.ctx());
+                        }
                         ui.label(
-                            egui::RichText::new("Zero-Lag Audio/Video Active")
-                                .size(10.0)
-                                .color(ResolveColors::VU_GREEN),
+                            egui::RichText::new(format!("{:.0}%", self.preferences.ui_scale * 100.0))
+                                .strong()
+                                .color(ResolveColors::ACCENT_ORANGE),
                         );
+                        if ui.button("➖").on_hover_text("Уменьшить масштаб интерфейса [Ctrl -]").clicked() {
+                            let s = self.preferences.ui_scale - 0.1;
+                            self.set_ui_scale(s, ui.ctx());
+                        }
+                        ui.label(egui::RichText::new("🔍 UI:").size(11.0).color(ResolveColors::TEXT_MUTED));
                     });
                 });
             });
@@ -431,6 +498,106 @@ impl NleApp {
                     }
                 });
             });
+    }
+
+    fn render_preferences_window(&mut self, ctx: &Context) {
+        if !self.show_preferences_window {
+            return;
+        }
+
+        let mut open = self.show_preferences_window;
+        let mut close_clicked = false;
+
+        egui::Window::new("⚙ Настройки (Preferences)")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(480.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.heading(
+                    egui::RichText::new("Масштабирование интерфейса (HiDPI / 4K)")
+                        .color(ResolveColors::ACCENT_ORANGE)
+                        .size(15.0),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Выберите подходящий масштаб под разрешение вашего экрана:")
+                        .size(12.0)
+                        .color(ResolveColors::TEXT_PRIMARY),
+                );
+                ui.add_space(8.0);
+
+                let current_scale = self.preferences.ui_scale;
+                let mut chosen_scale = current_scale;
+
+                // Быстрые пресеты масштабирования для 1080p, 2K, 4K
+                ui.horizontal_wrapped(|ui| {
+                    let presets = [
+                        (1.0, "100% (FHD 1080p)"),
+                        (1.25, "125% (2K)"),
+                        (1.5, "150% (QHD)"),
+                        (1.75, "175% (3K)"),
+                        (2.0, "200% (4K UHD)"),
+                        (2.5, "250% (4K Ultra)"),
+                    ];
+
+                    for (scale, label) in presets {
+                        let is_active = (current_scale - scale).abs() < 0.02;
+                        let btn = egui::Button::new(label).fill(if is_active {
+                            ResolveColors::ACCENT_ORANGE
+                        } else {
+                            ResolveColors::BG_HEADER
+                        });
+                        if ui.add(btn).clicked() {
+                            chosen_scale = scale;
+                        }
+                    }
+                });
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                // Плавный ползунок точной настройки
+                ui.horizontal(|ui| {
+                    ui.label("Точный масштаб:");
+                    ui.add(
+                        egui::Slider::new(&mut chosen_scale, 0.75..=3.5)
+                            .step_by(0.05)
+                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                    );
+                });
+
+                if (chosen_scale - current_scale).abs() > 0.001 {
+                    self.set_ui_scale(chosen_scale, ctx);
+                }
+
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("💡 Горячие клавиши масштабирования: Ctrl + / Ctrl - / Ctrl 0")
+                        .size(11.0)
+                        .color(ResolveColors::TEXT_MUTED),
+                );
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Сбросить на 100%").clicked() {
+                        self.set_ui_scale(1.0, ctx);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("✔ Закрыть").clicked() {
+                            close_clicked = true;
+                        }
+                    });
+                });
+            });
+
+        if close_clicked {
+            open = false;
+        }
+        self.show_preferences_window = open;
     }
 }
 
@@ -524,5 +691,8 @@ impl eframe::App for NleApp {
                     .show_inside(ui, &mut tab_viewer);
             }
         }
+
+        // 8. Модальное окно настроек (Масштабирование UI для 4K)
+        self.render_preferences_window(&ctx);
     }
 }
