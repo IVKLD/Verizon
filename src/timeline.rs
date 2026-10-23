@@ -70,11 +70,8 @@ impl Clip {
 pub struct Track {
     pub name: String,
     pub is_video: bool,
-    #[allow(dead_code)]
     pub is_muted: bool,
-    #[allow(dead_code)]
     pub is_locked: bool,
-    #[allow(dead_code)]
     pub is_solo: bool,
 }
 
@@ -114,6 +111,7 @@ pub struct TimelineState {
     pub linked_selection: bool, // Связность клипов (Linked Selection Ctrl+Shift+L)
     pub selected_clip_id: Option<u64>,
     pub is_playing: bool,
+    pub is_scrubbing: bool,
     pub playback_speed: f64, // 1.0 = нормальная, 2.0 = 2x (L), -1.0 = реверс (J)
     pub frame_accumulator: f64,
 
@@ -131,6 +129,8 @@ pub struct TimelineState {
 
     // История для Undo
     pub history: Vec<Vec<Clip>>,
+    /// Стек повтора (Redo)
+    pub redo_stack: Vec<Vec<Clip>>,
 
     // Флаг необходимости пересчета аудиомикса
     pub audio_dirty: bool,
@@ -187,6 +187,7 @@ impl TimelineState {
             linked_selection: true, // По умолчанию связность включена как в Resolve
             selected_clip_id: None,
             is_playing: false,
+            is_scrubbing: false,
             playback_speed: 1.0,
             frame_accumulator: 0.0,
             dragged_media: None,
@@ -194,6 +195,7 @@ impl TimelineState {
             trim_session: None,
             pending_imports: Vec::new(),
             history: Vec::new(),
+            redo_stack: Vec::new(),
             audio_dirty: true,
         }
     }
@@ -245,11 +247,6 @@ impl TimelineState {
         self.audio_dirty = true;
     }
 
-    #[allow(dead_code)]
-    pub fn new_demo() -> Self {
-        Self::new_empty()
-    }
-
     /// Максимальный конечный кадр всех клипов на таймлайне
     pub fn timeline_end_frame(&self) -> i64 {
         self.clips.iter().map(|c| c.end_frame()).max().unwrap_or(0)
@@ -261,12 +258,21 @@ impl TimelineState {
             self.history.remove(0);
         }
         self.history.push(self.clips.clone());
+        self.redo_stack.clear();
     }
 
     /// Отменить последнее действие (Ctrl+Z)
     pub fn undo(&mut self) {
         if let Some(prev) = self.history.pop() {
-            self.clips = prev;
+            self.redo_stack.push(std::mem::replace(&mut self.clips, prev));
+            self.audio_dirty = true;
+        }
+    }
+
+    /// Повторить отменённое действие (Ctrl+Shift+Z / Ctrl+Y)
+    pub fn redo(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            self.history.push(std::mem::replace(&mut self.clips, next));
             self.audio_dirty = true;
         }
     }
@@ -424,7 +430,7 @@ impl TimelineState {
     }
 
     /// Перемещение клипа с учетом магнитного прилипания и связности клипов (Linked Clips)
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn move_clip(&mut self, clip_id: u64, raw_start: i64) {
         self.move_clip_to_track(clip_id, raw_start, None);
     }
@@ -493,46 +499,6 @@ impl TimelineState {
         self.audio_dirty = true;
     }
 
-    /// Подрезка начала клипа (Trim In) с сохранением A/V синхронизации
-    #[allow(dead_code)]
-    pub fn trim_clip_start(&mut self, clip_id: u64, raw_start: i64) {
-        let clip_idx = match self.clips.iter().position(|c| c.id == clip_id) {
-            Some(idx) => idx,
-            None => return,
-        };
-
-        let link_grp = self.clips[clip_idx].link_group;
-        let old_start = self.clips[clip_idx].start_frame;
-        let old_duration = self.clips[clip_idx].duration_frames;
-        let max_start = old_start + old_duration - 1; // Минимум 1 кадр остается
-        let target_start = raw_start.clamp(0, max_start);
-        let delta_frames = target_start - old_start;
-
-        if delta_frames == 0 {
-            return;
-        }
-
-        let apply_trim = |clip: &mut Clip| {
-            let fps = clip.source_fps.max(1.0);
-            clip.start_frame += delta_frames;
-            clip.duration_frames = (clip.duration_frames - delta_frames).max(1);
-            clip.source_in_frame = (clip.source_in_frame + delta_frames).max(0);
-            clip.source_in_secs = (clip.source_in_secs + delta_frames as f64 / fps).max(0.0);
-        };
-
-        if self.linked_selection && link_grp.is_some() {
-            for clip in &mut self.clips {
-                if clip.link_group == link_grp {
-                    apply_trim(clip);
-                }
-            }
-        } else {
-            apply_trim(&mut self.clips[clip_idx]);
-        }
-
-        self.audio_dirty = true;
-    }
-
     /// Подрезка начала клипа (Trim In) с привязкой к начальному состоянию сессии
     pub fn trim_clip_start_session(&mut self, session: &TrimSession, target_start: i64) {
         let clip_idx = match self.clips.iter().position(|c| c.id == session.clip_id) {
@@ -579,36 +545,6 @@ impl TimelineState {
         let min_end = session.init_start_frame + 1;
         let clamped_end = target_end.max(min_end);
         let new_duration = clamped_end - session.init_start_frame;
-
-        if self.linked_selection && link_grp.is_some() {
-            for clip in &mut self.clips {
-                if clip.link_group == link_grp {
-                    clip.duration_frames = new_duration;
-                }
-            }
-        } else {
-            self.clips[clip_idx].duration_frames = new_duration;
-        }
-
-        self.audio_dirty = true;
-    }
-
-    /// Подрезка конца клипа (Trim Out)
-    #[allow(dead_code)]
-    pub fn trim_clip_end(&mut self, clip_id: u64, raw_end: i64) {
-        let clip_idx = match self.clips.iter().position(|c| c.id == clip_id) {
-            Some(idx) => idx,
-            None => return,
-        };
-
-        let link_grp = self.clips[clip_idx].link_group;
-        let start_frame = self.clips[clip_idx].start_frame;
-        let target_end = raw_end.max(start_frame + 1);
-        let new_duration = target_end - start_frame;
-
-        if new_duration == self.clips[clip_idx].duration_frames {
-            return;
-        }
 
         if self.linked_selection && link_grp.is_some() {
             for clip in &mut self.clips {

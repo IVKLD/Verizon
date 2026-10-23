@@ -31,6 +31,8 @@ enum Stage {
     PlayFromStart,
     RazorAndMove,
     PlayAcrossCuts,
+    ScrubBackAndForth,
+    PlayAfterScrub,
     PlayToEnd,
     Done,
 }
@@ -290,6 +292,41 @@ impl Autopilot {
                     // За 10 с (600 кадров таймлайна 100..700) с паузой в 180..420 (240 кадров пустоты)
                     // и 2 монтажными склейками внутри 2-секундных GOP ожидается ~310-360 реальных видеокадров
                     self.report(app, 320.0, false);
+                    app.timeline.playhead_frame = 460;
+                    app.timeline.is_playing = true;
+                    app.timeline.is_scrubbing = true;
+                    app.timeline.frame_accumulator = 0.0;
+                    app.last_frame_time = Instant::now();
+                    self.begin_stage(app, Stage::ScrubBackAndForth);
+                }
+            }
+            Stage::ScrubBackAndForth => {
+                // 2.5 секунды быстро водим курсор туда-сюда (и через границы GOP, и внутри одного GOP),
+                // проверяя, что предпросмотр непрерывно выдаёт живые кадры (никогда не падает в 0 FPS на 2 с)
+                let t = elapsed.as_secs_f64();
+                if t < 2.5 {
+                    let wave = (t * std::f64::consts::TAU * 1.2).sin(); // 3 полных цикла туда-сюда за 2.5 с
+                    let center = 585.0;
+                    let amp = if t < 1.25 { 220.0 } else { 95.0 };
+                    app.timeline.is_scrubbing = true;
+                    app.timeline.is_playing = true;
+                    app.timeline.playhead_frame = (center + wave * amp).round() as i64;
+                } else {
+                    app.timeline.is_scrubbing = false;
+                    self.report(app, 35.0, false);
+                    // Останавливаем курсор в середине GOP (кадр 585) и сразу продолжаем воспроизведение,
+                    // проверяя отсутствие пост-скраббинговых подлагиваний ("и потом подлагивания")
+                    app.timeline.playhead_frame = 585;
+                    app.timeline.is_playing = true;
+                    app.timeline.frame_accumulator = 0.0;
+                    app.last_frame_time = Instant::now();
+                    self.begin_stage(app, Stage::PlayAfterScrub);
+                }
+            }
+            Stage::PlayAfterScrub => {
+                if elapsed >= Duration::from_secs(3) {
+                    app.timeline.is_playing = false;
+                    self.report(app, 3.0 * fps * 0.90, true);
                     let end = app.timeline.timeline_end_frame();
                     let target_start = (end - (4.0 * fps) as i64).max(0);
                     app.timeline.playhead_frame = target_start;

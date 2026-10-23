@@ -62,12 +62,16 @@ impl TimelineView {
         if ruler_sense.hovered() || ruler_sense.dragged() {
             ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
         }
-        if ruler_sense.dragged() || ruler_sense.clicked() {
+        if ruler_sense.dragged() || ruler_sense.clicked() || (ruler_sense.hovered() && ui.input(|i| i.pointer.primary_down())) {
+            timeline.is_scrubbing = ui.input(|i| i.pointer.primary_down());
+            timeline.frame_accumulator = 0.0;
             if let Some(m_pos) = mouse_pos {
                 let rel_x = m_pos.x - canvas_rect.min.x + timeline.scroll_x;
                 let target_frame = (rel_x / timeline.zoom_factor).max(0.0) as i64;
                 timeline.playhead_frame = target_frame;
             }
+        } else if ruler_sense.drag_stopped() {
+            timeline.is_scrubbing = false;
         }
 
         // 2. Навигация по таймлайну мышью и хоткеями как в DaVinci Resolve 21:

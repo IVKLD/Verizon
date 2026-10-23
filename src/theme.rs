@@ -1,10 +1,8 @@
 use egui::{Color32, Context, CornerRadius, Stroke, Visuals};
 
 /// Фирменные цвета DaVinci Resolve 21 (Blackmagic Design)
-#[allow(dead_code)]
 pub struct ResolveColors;
 
-#[allow(dead_code)]
 impl ResolveColors {
     // Фоновые цвета панелей
     pub const BG_MAIN: Color32 = Color32::from_rgb(0x13, 0x14, 0x17);
@@ -17,22 +15,15 @@ impl ResolveColors {
     // Фирменный сочный оранжевый акцент Resolve (Playhead, активные инструменты, выделения)
     pub const ACCENT_ORANGE: Color32 = Color32::from_rgb(0xff, 0x6e, 0x1f);
     pub const ACCENT_ORANGE_HOVER: Color32 = Color32::from_rgb(0xff, 0x85, 0x3d);
-    pub const ACCENT_ORANGE_DIM: Color32 = Color32::from_rgb(0xb3, 0x47, 0x10);
 
     // Дополнительные акцентные цвета Resolve (Fairlight / Cut / Fusion)
-    pub const ACCENT_CYAN: Color32 = Color32::from_rgb(0x0a, 0xb8, 0xe6);
-    pub const ACCENT_GREEN: Color32 = Color32::from_rgb(0x27, 0xc4, 0x68);
-    pub const ACCENT_PURPLE: Color32 = Color32::from_rgb(0x9b, 0x59, 0xb6);
 
     // Цвета дорожек и клипов (DaVinci Resolve 21 Color Palette)
     pub const VIDEO_CLIP: Color32 = Color32::from_rgb(0x27, 0x62, 0x97);
-    pub const VIDEO_CLIP_HEADER: Color32 = Color32::from_rgb(0x1d, 0x4a, 0x73);
     pub const VIDEO_CLIP_SELECTED: Color32 = Color32::from_rgb(0x38, 0x82, 0xc4);
 
     pub const AUDIO_CLIP: Color32 = Color32::from_rgb(0x24, 0x7a, 0x54);
-    pub const AUDIO_CLIP_HEADER: Color32 = Color32::from_rgb(0x1a, 0x5a, 0x3d);
     pub const AUDIO_CLIP_SELECTED: Color32 = Color32::from_rgb(0x32, 0x9e, 0x6e);
-    pub const AUDIO_WAVEFORM: Color32 = Color32::from_rgb(0x38, 0xdf, 0x8a);
 
     // Текст
     pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xeb, 0xef, 0xf5);

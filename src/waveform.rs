@@ -24,7 +24,7 @@ impl WaveformManager {
     }
 
     /// Принудительно положить пики в кэш (тесты / предзагрузка)
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn insert_waveform(&self, path: &Path, audio_track_index: usize, peaks: Vec<f32>) {
         self.insert_waveform_arc(path, audio_track_index, Arc::new(peaks));
     }
@@ -47,12 +47,6 @@ impl WaveformManager {
                 p.insert((path.to_path_buf(), idx));
             }
         }
-    }
-
-    /// Получить кэшированную волновую форму (первая дорожка по умолчанию)
-    #[allow(dead_code)]
-    pub fn get_waveform(&self, path: &Path) -> Option<Arc<Vec<f32>>> {
-        self.get_waveform_stream(path, 0)
     }
 
     /// Асинхронно запросить расшифровку аудиопотока в фоне через Tokio / Thread pool
@@ -113,11 +107,6 @@ impl WaveformManager {
                 p.retain(|(p_path, _)| p_path != &path_buf);
             }
         });
-    }
-
-    #[allow(dead_code)]
-    pub fn request_waveform(&self, path: &Path, ctx: egui::Context) {
-        self.request_waveform_stream(path, 0, ctx);
     }
 
     /// Однопроходная расшифровка волновых форм ВСЕХ аудиодорожек файла за один проход демультиплексора
@@ -247,6 +236,7 @@ impl WaveformManager {
     }
 
     /// Быстрая расшифровка амплитуд конкретного аудиопотока (100 замеров в секунду) через FFmpeg
+    #[cfg(test)]
     pub fn extract_audio_peaks_stream(path: &Path, audio_track_index: usize) -> Result<Vec<f32>, String> {
         let mut ictx = ffmpeg_next::format::input(path).map_err(|e| e.to_string())?;
 
@@ -353,7 +343,7 @@ impl WaveformManager {
         Ok(peaks)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn extract_audio_peaks(path: &Path) -> Result<Vec<f32>, String> {
         Self::extract_audio_peaks_stream(path, 0)
     }

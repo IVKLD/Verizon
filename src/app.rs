@@ -14,7 +14,6 @@ use crate::video_decoder::VideoPlayer;
 use crate::viewer::ViewerState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
 pub enum Page {
     Media,
     Cut,
@@ -502,8 +501,15 @@ impl NleApp {
             }
 
             // Undo: Ctrl + Z
-            if i.modifiers.ctrl && i.key_pressed(egui::Key::Z) {
+            if i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::Z) {
                 self.timeline.undo();
+            }
+
+            // Redo: Ctrl + Shift + Z или Ctrl + Y
+            if (i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::Z))
+                || (i.modifiers.ctrl && i.key_pressed(egui::Key::Y))
+            {
+                self.timeline.redo();
             }
         });
 
@@ -831,9 +837,21 @@ impl eframe::App for NleApp {
         let delta = now.duration_since(self.last_frame_time).as_secs_f64();
         self.last_frame_time = now;
 
-        if self.timeline.is_playing {
+        if self.autopilot.is_none() && !ctx.input(|i| i.pointer.primary_down()) {
+            self.timeline.is_scrubbing = false;
+        }
+
+        let is_prerolling = self.video_player.is_prerolling();
+        if self.timeline.is_playing && is_prerolling {
+            // Пре-ролл: держим плейхед, пока декодер не выдаст первый кадр, иначе кадры теряются сразу после старта
+            self.timeline.frame_accumulator = 0.0;
+            ctx.request_repaint();
+        } else if self.timeline.is_playing && !self.timeline.is_scrubbing {
             self.timeline.step_playback(delta);
             ctx.request_repaint(); // 144+ FPS перерисовка при активном воспроизведении
+        } else if self.timeline.is_scrubbing {
+            self.timeline.frame_accumulator = 0.0;
+            ctx.request_repaint();
         }
 
         // 2. Многодорожечный Audio Mixer (Multi-Track Audio Engine)
@@ -849,7 +867,7 @@ impl eframe::App for NleApp {
         self.audio_player.sync_playhead_frame(
             self.timeline.playhead_frame,
             self.timeline.fps,
-            self.timeline.is_playing,
+            self.timeline.is_playing && !self.video_player.is_prerolling(),
         );
 
         // 5. Верхний бар меню и Нижний бар переключения страниц DaVinci Resolve
@@ -904,7 +922,7 @@ impl eframe::App for NleApp {
         self.audio_player.sync_playhead_frame(
             self.timeline.playhead_frame,
             self.timeline.fps,
-            self.timeline.is_playing,
+            self.timeline.is_playing && !self.video_player.is_prerolling(),
         );
 
         // 8. Автопилот самопроверки ПОСЛЕ рендера Viewers (чтобы замерять актуальный декодированный кадр текущего тика)
@@ -919,7 +937,7 @@ impl eframe::App for NleApp {
             self.audio_player.sync_playhead_frame(
                 self.timeline.playhead_frame,
                 self.timeline.fps,
-                self.timeline.is_playing,
+                self.timeline.is_playing && !self.video_player.is_prerolling(),
             );
         }
 

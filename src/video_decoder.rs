@@ -1,6 +1,7 @@
-use egui::{ColorImage, Context, TextureHandle, TextureOptions};
+use egui::{ColorImage, Context, ImageData, TextureHandle, TextureOptions};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum DecoderCommand {
@@ -17,11 +18,20 @@ pub struct VideoPlayer {
     pub fps: f64,
     pub total_frames: i64,
     pub texture: Option<TextureHandle>,
+    /// Предыдущий показанный кадр (ping-pong с `texture`) для GPU-блендинга при несовпадении частоты видео и монитора
+    back_texture: Option<TextureHandle>,
+    /// Номер исходного кадра в `back_texture` (-1 — блендинг недоступен)
+    back_frame: i64,
+    /// Готов ли декодер выдавать кадры воспроизведения (false между командой Play и первым кадром)
+    playback_ready: bool,
+    /// Момент отправки последней команды Play (для ограничения времени пре-ролла)
+    play_requested_at: std::time::Instant,
     pub is_real_video: bool,
     pub last_decoded_frame: i64,
     pub last_exact_frame: i64,
     pub last_playback_target: i64,
     pub current_epoch: u64,
+    pub last_displayed_epoch: u64,
 
     // Высокопроизводительный движок рендеринга и декодирования
     pub gpu_accelerated: bool,
@@ -32,6 +42,7 @@ pub struct VideoPlayer {
     frame_rx: Option<std::sync::mpsc::Receiver<(u64, i64, ColorImage)>>,
     worker_handle: Option<std::thread::JoinHandle<()>>,
     pub frame_queue: VecDeque<(i64, ColorImage)>,
+    pub scrub_cache: VecDeque<(i64, Arc<ColorImage>)>,
     pub prefetch_target: Option<i64>,
     pub prefetch_epoch: u64,
     pub prefetch_queue: VecDeque<(i64, ColorImage)>,
@@ -53,8 +64,45 @@ pub struct VideoPlayer {
 
     /// Грубый отпечаток последнего показанного кадра (сетка 16x9, яркость) — для проверки точности кадра в тестах
     pub last_fingerprint: Vec<u8>,
+
+    // Фоновый канал для безынерционной асинхронной очистки кадров (исключает вызовы thread::spawn и mmap_lock в UI)
+    gc_tx: std::sync::mpsc::Sender<Vec<ColorImage>>,
 }
 
+
+/// Render-ноды DRM в порядке предпочтения для аппаратного декодирования.
+///
+/// При двух GPU декодируем на менее мощном (меньше VRAM, обычно встроенный): дискретная карта остаётся свободной
+/// для композитинга интерфейса и других приложений (браузер, YouTube), а декод 4K HEVC идёт на VCN встроенной графики.
+/// Явный выбор: переменная окружения `VERIZON_VAAPI_DEVICE=/dev/dri/renderDNNN`.
+fn vaapi_render_nodes() -> Vec<PathBuf> {
+    let mut nodes: Vec<(u64, PathBuf)> = std::fs::read_dir("/dev/dri")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("renderD"))
+        .map(|e| {
+            let vram = std::fs::read_to_string(format!("/sys/class/drm/{}/device/mem_info_vram_total", e.file_name().to_string_lossy()))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            (vram, e.path())
+        })
+        .collect();
+    nodes.sort();
+    let mut ordered: Vec<PathBuf> = nodes.into_iter().map(|(_, p)| p).collect();
+    if let Some(forced) = std::env::var_os("VERIZON_VAAPI_DEVICE") {
+        ordered.insert(0, PathBuf::from(forced));
+    }
+    ordered
+}
+
+/// Максимальное время ожидания первого кадра после старта воспроизведения (мс)
+const PREROLL_TIMEOUT_MS: u128 = 1000;
+/// Минимальный интервал между аппаратными запросами кадра при скраббинге (мс)
+const SCRUB_MIN_REQUEST_INTERVAL_MS: u128 = 80;
+/// Через сколько мс без доставки кадра запрос считается потерянным и отправляется заново
+const SCRUB_STALL_TIMEOUT_MS: u128 = 200;
 
 /// Грубый отпечаток кадра: средняя яркость в сетке 16x9 (по 3x3 выборкам на ячейку). Дёшево (~400 пикселей).
 pub fn image_fingerprint(img: &ColorImage) -> Vec<u8> {
@@ -100,17 +148,23 @@ impl VideoPlayer {
             fps: 24.0,
             total_frames: 0,
             texture: None,
+            back_texture: None,
+            back_frame: -1,
+            playback_ready: true,
+            play_requested_at: std::time::Instant::now(),
             is_real_video: false,
             last_decoded_frame: -1,
             last_exact_frame: -1,
             last_playback_target: -1,
             current_epoch: 1,
+            last_displayed_epoch: 0,
             gpu_accelerated: true,
             gpu_device_name: "Vulkan (wgpu) + Multi-Threaded Engine".to_string(),
             command_tx: None,
             frame_rx: None,
             worker_handle: None,
             frame_queue: VecDeque::new(),
+            scrub_cache: VecDeque::with_capacity(64),
             prefetch_target: None,
             prefetch_epoch: 0,
             prefetch_queue: VecDeque::new(),
@@ -124,6 +178,35 @@ impl VideoPlayer {
             fps_sample_time: std::time::Instant::now(),
             rendered_frames_in_sample: 0,
             last_fingerprint: Vec::new(),
+            gc_tx: {
+                let (tx, rx) = std::sync::mpsc::channel::<Vec<ColorImage>>();
+                std::thread::Builder::new()
+                    .name("verizon_gc".to_string())
+                    .spawn(move || {
+                        while let Ok(batch) = rx.recv() {
+                            drop(batch);
+                        }
+                    })
+                    .expect("Failed to spawn GC worker");
+                tx
+            },
+        }
+    }
+
+    /// Безопасная фоновая утилизация буферов изображений без системных вызовов в UI-потоке
+    #[inline]
+    pub fn recycle_images(&self, images: Vec<ColorImage>) {
+        if !images.is_empty() {
+            let _ = self.gc_tx.send(images);
+        }
+    }
+
+    /// Безопасная фоновая утилизация очереди кадров без системных вызовов в UI-потоке
+    #[inline]
+    pub fn recycle_queue(&self, q: VecDeque<(i64, ColorImage)>) {
+        if !q.is_empty() {
+            let images: Vec<ColorImage> = q.into_iter().map(|(_, img)| img).collect();
+            let _ = self.gc_tx.send(images);
         }
     }
 
@@ -179,6 +262,7 @@ impl VideoPlayer {
         self.command_tx = None;
         self.frame_rx = None;
         self.frame_queue.clear();
+        self.scrub_cache.clear();
         self.prefetch_target = None;
         self.prefetch_queue.clear();
 
@@ -194,7 +278,9 @@ impl VideoPlayer {
         self.last_exact_frame = -1;
         self.last_playback_target = -1;
         self.current_epoch = self.current_epoch.max(self.prefetch_epoch).wrapping_add(1);
+        self.last_displayed_epoch = 0;
         self.last_request_time = std::time::Instant::now();
+        self.real_playback_fps = fps as f32;
 
         // Создаем каналы для фонового воркера декодирования
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<DecoderCommand>();
@@ -229,25 +315,93 @@ impl VideoPlayer {
         Ok(())
     }
 
+    /// Сохраняет декодированный кадр в кольцевой кэш быстрого скраббинга (0 мс при движении курсора туда-сюда, не нагружая DRM/VCN)
+    fn cache_scrub_frame(&mut self, frame_num: i64, img: ColorImage, garbage: &mut Vec<ColorImage>) {
+        if frame_num < 0 {
+            garbage.push(img);
+            return;
+        }
+        if let Some(pos) = self.scrub_cache.iter().position(|(f, _)| *f == frame_num) {
+            if let Some(entry) = self.scrub_cache.remove(pos) {
+                self.scrub_cache.push_back(entry);
+            }
+            garbage.push(img);
+            return;
+        }
+        if self.scrub_cache.len() >= 120 {
+            if let Some((_, old_img)) = self.scrub_cache.pop_front() {
+                garbage.extend(Arc::try_unwrap(old_img).ok());
+            }
+        }
+        self.scrub_cache.push_back((frame_num, Arc::new(img)));
+    }
+
+    /// Мгновенная подстановка ближайшего кадра из RAM-кэша при перемещении курсора туда-сюда (0 обращений к DRM/VAAPI)
+    fn try_apply_scrub_cache(&mut self, target_frame: i64, max_dist: i64, ctx: &Context) -> Option<i64> {
+        let mut best_idx = None;
+        let mut best_dist = i64::MAX;
+        for (i, (f, _)) in self.scrub_cache.iter().enumerate() {
+            let d = (*f - target_frame).abs();
+            if d <= max_dist && d < best_dist {
+                best_dist = d;
+                best_idx = Some(i);
+            }
+        }
+        if let Some(idx) = best_idx {
+            let (cached_f, _) = self.scrub_cache[idx];
+            let current_dist = if self.last_decoded_frame >= 0 {
+                (self.last_decoded_frame - target_frame).abs()
+            } else {
+                i64::MAX
+            };
+            if cached_f != self.last_decoded_frame && (best_dist < current_dist || cached_f == target_frame) {
+                // Arc вместо копии кадра: никаких аллокаций 3.7 МБ и mmap/munmap в UI-потоке при каждом тике скраббинга
+                let img = Arc::clone(&self.scrub_cache[idx].1);
+                self.rendered_frames_in_sample += 1;
+                self.back_frame = -1;
+                self.last_fingerprint = image_fingerprint(&img);
+                let data = ImageData::Color(img);
+                if let Some(tex) = &mut self.texture {
+                    tex.set(data, TextureOptions::LINEAR);
+                } else {
+                    self.texture = Some(ctx.load_texture("video_frame", data, TextureOptions::LINEAR));
+                }
+                self.last_decoded_frame = cached_f;
+                if cached_f == target_frame {
+                    self.last_exact_frame = cached_f;
+                }
+            }
+            return Some(best_dist);
+        }
+        None
+    }
+
     /// Асинхронная очистка очередей кадров в фоновом потоке (исключает 60+ вызовов munmap и TLB shootdown в UI-потоке!)
     fn clear_queues_async(&mut self) {
         let mut q1 = std::mem::take(&mut self.frame_queue);
         let q2 = std::mem::take(&mut self.prefetch_queue);
-        let min_ep = self.current_epoch;
-        if let Some(rx) = &self.frame_rx {
-            while let Ok((ep, f_num, img)) = rx.try_recv() {
-                if ep < min_ep || f_num < 0 {
-                    q1.push_back((f_num, img));
-                } else {
-                    self.frame_queue.push_back((f_num, img));
+        // Переносим часть уже готовых кадров из очереди в scrub_cache без аллокаций и клонирования!
+        let step = (q1.len() / 12).max(1);
+        let mut idx = 0usize;
+        let mut drop_q = VecDeque::with_capacity(q1.len());
+        while let Some((f_num, img)) = q1.pop_front() {
+            if idx % step == 0 && f_num >= 0 && !self.scrub_cache.iter().any(|(f, _)| *f == f_num) {
+                if self.scrub_cache.len() >= 120 {
+                    if let Some((old_f, old)) = self.scrub_cache.pop_front() {
+                        drop_q.extend(Arc::try_unwrap(old).ok().map(|img| (old_f, img)));
+                    }
                 }
+                self.scrub_cache.push_back((f_num, Arc::new(img)));
+            } else {
+                drop_q.push_back((f_num, img));
             }
+            idx += 1;
         }
-        if !q1.is_empty() || !q2.is_empty() {
-            std::thread::spawn(move || {
-                drop(q1);
-                drop(q2);
-            });
+        if !drop_q.is_empty() {
+            self.recycle_queue(drop_q);
+        }
+        if !q2.is_empty() {
+            self.recycle_queue(q2);
         }
     }
 
@@ -278,18 +432,19 @@ impl VideoPlayer {
                 self.dropped_frames_count = 0;
                 self.rendered_frames_in_sample = 0;
                 self.fps_sample_time = std::time::Instant::now();
+                self.real_playback_fps = self.fps as f32;
                 self.is_dropping_frames = false;
                 if self.prefetch_target.map(|pf| (target_frame - pf).abs() <= 2).unwrap_or(false) {
                     self.current_epoch = self.prefetch_epoch;
                     let old_q = std::mem::replace(&mut self.frame_queue, std::mem::take(&mut self.prefetch_queue));
-                    if !old_q.is_empty() {
-                        std::thread::spawn(move || drop(old_q));
-                    }
+                    self.recycle_queue(old_q);
                     self.prefetch_target = None;
                 } else {
+                    self.try_apply_scrub_cache(target_frame, 30, ctx);
                     self.current_epoch = self.current_epoch.max(self.prefetch_epoch).wrapping_add(1);
                     self.clear_queues_async();
                     self.prefetch_target = None;
+                    self.begin_preroll();
                     if let Some(tx) = &self.command_tx {
                         let _ = tx.send(DecoderCommand::Play {
                             start_frame: target_frame,
@@ -299,36 +454,48 @@ impl VideoPlayer {
                 }
             } else {
                 let jump = target_frame - self.last_playback_target;
-                // Сбрасываем очередь и отправляем Play только при РЕАЛЬНОМ скачке пользователем или на склейке (назад или вперед >60 кадров)
-                if jump < -2 || jump > 60 {
+                // Сбрасываем очередь и отправляем Play только при РЕАЛЬНОМ скачке пользователем или на склейке (назад или вперед >8 кадров)
+                if jump < -2 || jump > 8 {
                     if self.prefetch_target.map(|pf| (target_frame - pf).abs() <= 2).unwrap_or(false) {
                         // Склейка уже предзагружена в фоновом потоке (Zero-Latency Cut)!
                         self.current_epoch = self.prefetch_epoch;
                         let old_q = std::mem::replace(&mut self.frame_queue, std::mem::take(&mut self.prefetch_queue));
-                        if !old_q.is_empty() {
-                            std::thread::spawn(move || drop(old_q));
-                        }
+                        self.recycle_queue(old_q);
                         self.prefetch_target = None;
+                        self.last_playback_target = target_frame;
                         if let Some(tx) = &self.command_tx {
                             let _ = tx.send(DecoderCommand::UpdatePlayhead { playhead_frame: target_frame });
                         }
                     } else {
-                        self.current_epoch = self.current_epoch.max(self.prefetch_epoch).wrapping_add(1);
-                        self.clear_queues_async();
-                        self.prefetch_target = None;
-                        if let Some(tx) = &self.command_tx {
-                            let _ = tx.send(DecoderCommand::Play {
-                                start_frame: target_frame,
-                                epoch: self.current_epoch,
-                            });
+                        let _ = self.try_apply_scrub_cache(target_frame, 45, ctx);
+                        let now = std::time::Instant::now();
+                        let elapsed = now.duration_since(self.last_request_time).as_millis();
+                        let prev_delivered = self.last_displayed_epoch >= self.current_epoch;
+                        if (prev_delivered && elapsed >= 32) || elapsed >= 55 {
+                            self.last_request_time = now;
+                            self.last_playback_target = target_frame;
+                            self.current_epoch = self.current_epoch.max(self.prefetch_epoch).wrapping_add(1);
+                            self.clear_queues_async();
+                            self.prefetch_target = None;
+                            self.begin_preroll();
+                            if let Some(tx) = &self.command_tx {
+                                let _ = tx.send(DecoderCommand::Play {
+                                    start_frame: target_frame,
+                                    epoch: self.current_epoch,
+                                });
+                            }
+                        } else if let Some(tx) = &self.command_tx {
+                            let _ = tx.send(DecoderCommand::UpdatePlayhead { playhead_frame: target_frame });
                         }
                     }
-                } else if self.prefetch_target.is_none() {
-                    if let Some(tx) = &self.command_tx {
-                        let _ = tx.send(DecoderCommand::UpdatePlayhead { playhead_frame: target_frame });
+                } else {
+                    if self.prefetch_target.is_none() && target_frame != self.last_playback_target {
+                        if let Some(tx) = &self.command_tx {
+                            let _ = tx.send(DecoderCommand::UpdatePlayhead { playhead_frame: target_frame });
+                        }
                     }
+                    self.last_playback_target = target_frame;
                 }
-                self.last_playback_target = target_frame;
             }
 
             self.poll_playback_frames_with_cut(target_frame, upcoming_cut, ctx);
@@ -356,31 +523,77 @@ impl VideoPlayer {
         ctx: &Context,
     ) {
         let cut_limit = upcoming_cut.map(|(last_src, _)| last_src).unwrap_or(i64::MAX);
+        let mut fallback_preview: Option<(u64, i64, ColorImage)> = None;
+        let mut newly_cached: Vec<(i64, ColorImage)> = Vec::new();
+        let mut garbage: Vec<ColorImage> = Vec::new();
         if let Some(rx) = &self.frame_rx {
-            while let Ok((epoch, frame_num, image)) = rx.try_recv() {
-                if frame_num < 0 {
+            while let Ok((epoch, raw_frame_num, image)) = rx.try_recv() {
+                if self.prefetch_target.is_some() && epoch == self.prefetch_epoch {
+                    if raw_frame_num < 0 {
+                        let pf = -raw_frame_num - 1;
+                        if self.prefetch_queue.is_empty() {
+                            self.prefetch_queue.push_back((pf, image));
+                        } else {
+                            garbage.push(image);
+                        }
+                    } else {
+                        let frame_num = raw_frame_num;
+                        if let Some(back) = self.prefetch_queue.back_mut() {
+                            if back.0 == frame_num {
+                                let old = std::mem::replace(&mut back.1, image);
+                                garbage.push(old);
+                                continue;
+                            }
+                        }
+                        self.prefetch_queue.push_back((frame_num, image));
+                    }
                     continue;
                 }
+                if raw_frame_num < 0 {
+                    let preview_f = -raw_frame_num - 1;
+                    if epoch <= self.current_epoch && (epoch == self.current_epoch || epoch > self.last_displayed_epoch) {
+                        newly_cached.push((preview_f, image.clone()));
+                        if let Some((_, _, old_prev)) = fallback_preview.replace((epoch, preview_f, image)) {
+                            garbage.push(old_prev);
+                        }
+                    } else {
+                        garbage.push(image);
+                    }
+                    continue;
+                }
+                let frame_num = raw_frame_num;
                 if epoch == self.current_epoch {
                     if frame_num <= cut_limit {
+                        if frame_num % 8 == 0 {
+                            newly_cached.push((frame_num, image.clone()));
+                        }
                         if let Some(back) = self.frame_queue.back_mut() {
                             if back.0 == frame_num {
-                                back.1 = image;
+                                let old = std::mem::replace(&mut back.1, image);
+                                garbage.push(old);
                                 continue;
                             }
                         }
                         self.frame_queue.push_back((frame_num, image));
+                    } else {
+                        garbage.push(image);
                     }
-                } else if self.prefetch_target.is_some() && epoch == self.prefetch_epoch {
-                    if let Some(back) = self.prefetch_queue.back_mut() {
-                        if back.0 == frame_num {
-                            back.1 = image;
-                            continue;
-                        }
+                } else if epoch < self.current_epoch && epoch > self.last_displayed_epoch {
+                    if let Some((_, _, old_prev)) = fallback_preview.replace((epoch, frame_num, image)) {
+                        garbage.push(old_prev);
                     }
-                    self.prefetch_queue.push_back((frame_num, image));
+                } else {
+                    garbage.push(image);
                 }
             }
+        }
+        for (cf, cimg) in newly_cached {
+            self.cache_scrub_frame(cf, cimg, &mut garbage);
+        }
+
+        // Первый кадр текущего сегмента уже в очереди — пре-ролл окончен, плейхед может идти (кадр может быть на 1 впереди цели)
+        if !self.playback_ready && !self.frame_queue.is_empty() {
+            self.playback_ready = true;
         }
 
         // Если все кадры текущего сегмента до монтажной склейки уже в очереди — мгновенно переключаем
@@ -391,11 +604,16 @@ impl VideoPlayer {
                 .back()
                 .map(|(f, _)| *f >= last_src && *f > self.last_playback_target)
                 .unwrap_or(false)
-                || (self.last_decoded_frame >= last_src && self.last_decoded_frame <= last_src + 2);
+                || (target_frame >= last_src.saturating_sub(2)
+                    && self.last_decoded_frame >= last_src
+                    && self.last_decoded_frame <= last_src + 2);
             if have_last_frame && self.prefetch_target != Some(next_src) {
                 self.prefetch_target = Some(next_src);
                 self.prefetch_epoch = self.current_epoch.max(self.prefetch_epoch).wrapping_add(1);
-                self.prefetch_queue.clear();
+                let old_pq = std::mem::take(&mut self.prefetch_queue);
+                for (_, img) in old_pq {
+                    garbage.push(img);
+                }
                 if let Some(tx) = &self.command_tx {
                     let _ = tx.send(DecoderCommand::Play {
                         start_frame: next_src,
@@ -428,9 +646,12 @@ impl VideoPlayer {
                     && !self.frame_queue.is_empty()
                     && self.frame_queue.front().unwrap().0 <= target_frame
                 {
+                    garbage.push(img);
                     dropped += 1;
                 } else {
-                    best_img = Some(img);
+                    if let Some(old_best) = best_img.replace(img) {
+                        garbage.push(old_best);
+                    }
                     best_frame = f;
                     // Если этот кадр отстал всего на 1 кадр из-за фазы 60Hz VSync — показываем его сейчас,
                     // а следующий кадр (f+1 == target_frame) оставляем в голове очереди на следующий тик!
@@ -445,21 +666,38 @@ impl VideoPlayer {
         self.dropped_frames_count += dropped;
 
         while self.frame_queue.len() > 90 {
-            self.frame_queue.pop_front();
+            if let Some((_, old_img)) = self.frame_queue.pop_front() {
+                garbage.push(old_img);
+            }
             self.dropped_frames_count += 1;
         }
 
         if let Some(img) = best_img {
-            self.rendered_frames_in_sample += 1;
-            self.last_fingerprint = image_fingerprint(&img);
-            if let Some(tex) = &mut self.texture {
-                tex.set(img, TextureOptions::LINEAR);
-            } else {
-                self.texture = Some(ctx.load_texture("video_frame", img, TextureOptions::LINEAR));
+            if let Some((_, _, old_prev)) = fallback_preview.take() {
+                garbage.push(old_prev);
             }
+            self.rendered_frames_in_sample += 1;
+            self.last_displayed_epoch = self.current_epoch;
+            self.last_fingerprint = image_fingerprint(&img);
+            self.present_playback_frame(ctx, img);
             self.last_decoded_frame = best_frame;
             self.last_exact_frame = best_frame;
+        } else if let Some((ep, prev_f, prev_img)) = fallback_preview {
+            self.rendered_frames_in_sample += 1;
+            self.last_displayed_epoch = ep;
+            self.last_fingerprint = image_fingerprint(&prev_img);
+            self.back_frame = -1;
+            if let Some(tex) = &mut self.texture {
+                tex.set(prev_img, TextureOptions::LINEAR);
+            } else {
+                self.texture = Some(ctx.load_texture("video_frame", prev_img, TextureOptions::LINEAR));
+            }
+            self.last_decoded_frame = prev_f;
+        } else {
+            let _ = self.try_apply_scrub_cache(target_frame, 18, ctx);
         }
+
+        self.recycle_images(garbage);
 
         // Обновление реального FPS воспроизведения каждые 500 мс
         let now = std::time::Instant::now();
@@ -472,6 +710,45 @@ impl VideoPlayer {
         }
     }
 
+    /// Начало пре-ролла: плейхед ждёт первого кадра после Play, чтобы не терять кадры (аналог пре-ролла DaVinci Resolve)
+    fn begin_preroll(&mut self) {
+        self.playback_ready = false;
+        self.play_requested_at = std::time::Instant::now();
+    }
+
+    /// Идёт ли пре-ролл: таймлайн и звук должны ждать, пока декодер выдаст первый кадр (не дольше `PREROLL_TIMEOUT_MS`)
+    pub fn is_prerolling(&self) -> bool {
+        self.is_real_video
+            && self.is_playing_mode
+            && !self.playback_ready
+            && self.play_requested_at.elapsed().as_millis() < PREROLL_TIMEOUT_MS
+    }
+
+    /// Выводит кадр воспроизведения через ping-pong двух текстур: предыдущий кадр остаётся на GPU для блендинга
+    fn present_playback_frame(&mut self, ctx: &Context, img: ColorImage) {
+        let data = ImageData::Color(Arc::new(img));
+        if self.texture.is_none() {
+            self.texture = Some(ctx.load_texture("video_frame", data, TextureOptions::LINEAR));
+            self.back_frame = -1;
+            return;
+        }
+        let next = match self.back_texture.take() {
+            Some(mut tex) => {
+                tex.set(data, TextureOptions::LINEAR);
+                tex
+            }
+            None => ctx.load_texture("video_frame_b", data, TextureOptions::LINEAR),
+        };
+        self.back_texture = self.texture.replace(next);
+        self.back_frame = self.last_decoded_frame;
+    }
+
+    /// Предыдущий кадр для временного блендинга, если он ровно на 1 кадр раньше текущего (плавное 60 fps на мониторе с другой частотой)
+    pub fn blend_source(&self) -> Option<&TextureHandle> {
+        let back = self.back_texture.as_ref()?;
+        (self.is_playing_mode && self.back_frame >= 0 && self.last_decoded_frame - self.back_frame == 1).then_some(back)
+    }
+
     /// Отобразить чистый нейтральный экран Resolve (а при воспроизведении паузы — заранее подготовить декодер к следующему клипу!)
     pub fn show_blank_frame_with_prefetch(&mut self, prefetch_frame: Option<i64>, ctx: &Context) {
         if let Some(next_src) = prefetch_frame {
@@ -480,9 +757,7 @@ impl VideoPlayer {
                 self.last_playback_target = next_src;
                 self.current_epoch = self.prefetch_epoch;
                 let old_q = std::mem::replace(&mut self.frame_queue, std::mem::take(&mut self.prefetch_queue));
-                if !old_q.is_empty() {
-                    std::thread::spawn(move || drop(old_q));
-                }
+                self.recycle_queue(old_q);
                 self.prefetch_target = None;
             } else if !self.is_playing_mode || self.last_playback_target != next_src {
                 self.is_playing_mode = true;
@@ -512,14 +787,13 @@ impl VideoPlayer {
                 while let Ok((_, _, img)) = rx.try_recv() {
                     stale.push(img);
                 }
-                if !stale.is_empty() {
-                    std::thread::spawn(move || drop(stale));
-                }
+                self.recycle_images(stale);
             }
         }
         if self.last_decoded_frame == -999 && self.texture.is_some() {
             return;
         }
+        self.back_frame = -1;
         let img = self.generate_placeholder();
         if let Some(tex) = &mut self.texture {
             tex.set(img, TextureOptions::NEAREST);
@@ -536,44 +810,63 @@ impl VideoPlayer {
 
     /// Неблокирующая выборка готовых кадров из фонового потока
     pub fn poll_frames(&mut self, ctx: &Context) {
+        let mut newly_cached: Vec<(i64, ColorImage)> = Vec::new();
+        let mut stale = Vec::new();
         if let Some(rx) = &self.frame_rx {
-            let mut stale = Vec::new();
             while let Ok((epoch, raw_frame_num, image)) = rx.try_recv() {
-                if epoch != self.current_epoch {
-                    stale.push(image);
-                    continue;
-                }
                 let is_preview = raw_frame_num < 0;
                 let frame_num = if is_preview { -raw_frame_num - 1 } else { raw_frame_num };
+                if epoch != self.current_epoch && epoch <= self.last_displayed_epoch {
+                    newly_cached.push((frame_num, image));
+                    continue;
+                }
+                newly_cached.push((frame_num, image.clone()));
+                self.last_displayed_epoch = self.last_displayed_epoch.max(epoch);
+                self.rendered_frames_in_sample += 1;
                 self.last_fingerprint = image_fingerprint(&image);
+                self.back_frame = -1;
                 if let Some(tex) = &mut self.texture {
                     tex.set(image, TextureOptions::LINEAR);
                 } else {
                     self.texture = Some(ctx.load_texture("video_frame", image, TextureOptions::LINEAR));
                 }
                 self.last_decoded_frame = frame_num;
-                if !is_preview {
+                if !is_preview && epoch == self.current_epoch {
                     self.last_exact_frame = frame_num;
                 }
             }
-            if stale.len() > 2 {
-                std::thread::spawn(move || drop(stale));
-            }
         }
+        for (cf, cimg) in newly_cached {
+            self.cache_scrub_frame(cf, cimg, &mut stale);
+        }
+        self.recycle_images(stale);
     }
 
     /// Прецизионное декодирование кадра по таймкоду (Frame-Accurate Zero-Lag)
     pub fn seek_and_decode(&mut self, target_frame: i64, ctx: &Context) {
         self.poll_frames(ctx);
 
-        if (target_frame == self.last_decoded_frame || target_frame == self.last_playback_target) && self.texture.is_some() {
+        if target_frame == self.last_exact_frame && target_frame == self.last_decoded_frame && self.texture.is_some() {
             return;
         }
 
         if self.is_real_video {
             let now = std::time::Instant::now();
             let elapsed = now.duration_since(self.last_request_time).as_millis();
-            if elapsed >= 16 || target_frame == 0 {
+            if let Some(dist) = self.try_apply_scrub_cache(target_frame, 45, ctx) {
+                if dist == 0 || (dist <= 15 && elapsed < 90) {
+                    self.last_playback_target = target_frame;
+                    return;
+                }
+            }
+            if target_frame == self.last_playback_target && self.texture.is_some() {
+                return;
+            }
+            let prev_delivered = self.last_displayed_epoch >= self.current_epoch;
+            // Обратное давление: новый аппаратный запрос к /dev/dri/renderD128 уходит только после доставки
+            // предыдущего (не чаще ~12 Hz). Каждый Seek декодирует GOP от ключевого кадра, и очередь запросов
+            // забивает VCN/DRM, из-за чего подвисает вся система (в т.ч. YouTube в браузере).
+            if (prev_delivered && elapsed >= SCRUB_MIN_REQUEST_INTERVAL_MS) || elapsed >= SCRUB_STALL_TIMEOUT_MS || target_frame == 0 {
                 self.last_request_time = now;
                 self.last_playback_target = target_frame;
                 self.current_epoch = self.current_epoch.wrapping_add(1);
@@ -583,6 +876,10 @@ impl VideoPlayer {
                         epoch: self.current_epoch,
                     });
                 }
+            } else {
+                // Гарантируем повторную попытку после паузы лимитера, чтобы финальный кадр скраббинга не потерялся
+                let wait_ms = SCRUB_MIN_REQUEST_INTERVAL_MS.saturating_sub(elapsed).max(1) as u64;
+                ctx.request_repaint_after(std::time::Duration::from_millis(wait_ms));
             }
             return;
         }
@@ -608,6 +905,7 @@ impl VideoPlayer {
             self.last_request_time = std::time::Instant::now();
             self.last_playback_target = target_frame;
             self.current_epoch = self.current_epoch.wrapping_add(1);
+            self.last_displayed_epoch = self.current_epoch.saturating_sub(1);
             if let Some(tx) = &self.command_tx {
                 let _ = tx.send(DecoderCommand::Seek {
                     target_frame,
@@ -618,7 +916,6 @@ impl VideoPlayer {
     }
 
     /// Ожидание декодирования целевого кадра (для детерминированных тестов)
-    #[allow(dead_code)]
     pub fn wait_for_frame(&mut self, target_frame: i64, ctx: &Context, timeout: std::time::Duration) -> bool {
         let start = std::time::Instant::now();
         self.force_seek_frame(target_frame, ctx);
@@ -684,9 +981,9 @@ impl VideoPlayer {
         };
         let tolerance = (frame_duration_pts / 2).max(1);
         let gop_max_pts = if time_base_f > 0.0 {
-            (3.0 / time_base_f).round() as i64
+            (2.1 / time_base_f).round() as i64
         } else {
-            180
+            126
         };
 
         let mut context_decoder = match ffmpeg_next::codec::context::Context::from_parameters(input_stream.parameters()) {
@@ -705,13 +1002,12 @@ impl VideoPlayer {
 
         unsafe {
             (*context_decoder.as_mut_ptr()).flags2 |= ffmpeg_next::ffi::AV_CODEC_FLAG2_FAST as i32;
-            (*context_decoder.as_mut_ptr()).thread_type = (ffmpeg_next::ffi::FF_THREAD_FRAME | ffmpeg_next::ffi::FF_THREAD_SLICE) as i32;
         }
 
         // Аппаратное ускорение на GPU (VAAPI для AMD Radeon RX 9070 XT)
         let mut hw_device_ctx: *mut ffmpeg_next::ffi::AVBufferRef = std::ptr::null_mut();
-        for dev in &["/dev/dri/renderD128", "/dev/dri/renderD129"] {
-            if let Ok(c_str) = std::ffi::CString::new(*dev) {
+        for dev in &vaapi_render_nodes() {
+            if let Ok(c_str) = std::ffi::CString::new(dev.as_os_str().as_encoded_bytes()) {
                 let ret = unsafe {
                     ffmpeg_next::ffi::av_hwdevice_ctx_create(
                         &mut hw_device_ctx,
@@ -730,12 +1026,22 @@ impl VideoPlayer {
         if !hw_device_ctx.is_null() {
             unsafe {
                 let c_ptr = context_decoder.as_mut_ptr();
+                // КРИТИЧНО ДЛЯ DRM/VCN И YOUTUBE В БРАУЗЕРЕ:
+                // Никогда не включаем FF_THREAD_FRAME на аппаратном VAAPI декодере!
+                // Многопоточная отправка кадров в VAAPI перегружает кольцевую очередь AMDGPU VCN (/dev/dri/renderD128)
+                // конкурентными 4K-задачами при каждом скраббинге и вызывает фризы видео в браузере (YouTube).
+                (*c_ptr).thread_count = 1;
+                (*c_ptr).thread_type = 0;
                 (*c_ptr).hw_device_ctx = ffmpeg_next::ffi::av_buffer_ref(hw_device_ctx);
                 (*c_ptr).get_format = Some(get_vaapi_format);
                 (*c_ptr).extra_hw_frames = 8;
             }
         } else {
             // Если аппаратный GPU VAAPI недоступен — используем многопоточный декодер CPU (все 32 потока)
+            unsafe {
+                (*context_decoder.as_mut_ptr()).thread_type =
+                    (ffmpeg_next::ffi::FF_THREAD_FRAME | ffmpeg_next::ffi::FF_THREAD_SLICE) as i32;
+            }
             let num_threads = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(16)
@@ -889,10 +1195,17 @@ impl VideoPlayer {
             };
 
             let mut resolved_cmd = active_cmd;
+            if let DecoderCommand::Play { start_frame, .. } = resolved_cmd {
+                playhead_frame = start_frame;
+            }
             while let Ok(newer) = cmd_rx.try_recv() {
                 match newer {
-                    DecoderCommand::Seek { .. } | DecoderCommand::Play { .. } | DecoderCommand::Pause { .. } => {
+                    DecoderCommand::Seek { .. } | DecoderCommand::Pause { .. } => {
                         resolved_cmd = newer;
+                    }
+                    DecoderCommand::Play { start_frame, epoch } => {
+                        playhead_frame = start_frame;
+                        resolved_cmd = DecoderCommand::Play { start_frame, epoch };
                     }
                     DecoderCommand::UpdatePlayhead { playhead_frame: new_pf } => {
                         playhead_frame = new_pf;
@@ -969,9 +1282,24 @@ impl VideoPlayer {
                     if found_image.is_none() {
                         for (st, packet) in ictx.packets() {
                             match cmd_rx.try_recv() {
-                                Ok(mut newer) => {
+                                Ok(first_cmd) => {
+                                    let mut newer = first_cmd;
+                                    if let DecoderCommand::Play { start_frame, .. } = newer {
+                                        playhead_frame = start_frame;
+                                    }
                                     while let Ok(even_newer) = cmd_rx.try_recv() {
-                                        newer = even_newer;
+                                        match even_newer {
+                                            DecoderCommand::Seek { .. } | DecoderCommand::Pause { .. } => {
+                                                newer = even_newer;
+                                            }
+                                            DecoderCommand::Play { start_frame, epoch } => {
+                                                playhead_frame = start_frame;
+                                                newer = DecoderCommand::Play { start_frame, epoch };
+                                            }
+                                            DecoderCommand::UpdatePlayhead { playhead_frame: pf } => {
+                                                playhead_frame = pf;
+                                            }
+                                        }
                                     }
                                     match newer {
                                         DecoderCommand::Seek { target_frame: newer_target, epoch: newer_epoch } => {
@@ -983,8 +1311,9 @@ impl VideoPlayer {
                                             } else {
                                                 target_frame
                                             };
-                                            if new_target_pts >= current_pts && (new_target_pts - current_pts) <= gop_max_pts {
+                                            if current_pts >= 0 && new_target_pts >= current_pts && (new_target_pts - current_pts) <= gop_max_pts {
                                                 target_pts = new_target_pts;
+                                                keyframe_sent = false;
                                             } else {
                                                 pending_cmd = Some(DecoderCommand::Seek { target_frame, epoch });
                                                 aborted_seek = true;
@@ -1051,7 +1380,7 @@ impl VideoPlayer {
                                                 h,
                                                 &mut rgba_buffer,
                                             ) {
-                                                if frame_tx.send((epoch, -(target_frame + 1), kf_img)).is_err() {
+                                                if frame_tx.send((epoch, -(f_num + 1), kf_img)).is_err() {
                                                     break 'worker_loop;
                                                 }
                                                 egui_ctx.request_repaint();
@@ -1130,7 +1459,8 @@ impl VideoPlayer {
                         && (target_pts - current_pts) <= gop_max_pts
                         && !waiting_for_keyframe;
 
-                    let mut keyframe_preview_sent = can_continue_forward;
+                    let mut keyframe_preview_sent = can_continue_forward && start_frame <= current_decoded_frame + 2;
+                    let mut last_catchup_preview: i64 = -999;
                     if can_continue_forward {
                         vaapi_fifo.retain(|(_, fn_out, _)| *fn_out >= start_frame);
                         for (ep, _, _) in vaapi_fifo.iter_mut() {
@@ -1219,20 +1549,15 @@ impl VideoPlayer {
                                     DecoderCommand::Play { start_frame: new_sf, epoch: new_ep } => {
                                         active_epoch = new_ep;
                                         playhead_frame = new_sf;
-                                        if new_sf < start_playback_frame.saturating_sub(2)
-                                            || new_sf < current_decoded_frame.saturating_sub(2)
-                                            || new_sf > current_decoded_frame.max(start_playback_frame) + 60
-                                        {
-                                            while let Some((ep, fn_out, front_f)) = vaapi_fifo.pop_front() {
-                                                if !transfer_and_send(ep, fn_out, front_f, &recycle_rx, &scale_tx) {
-                                                    break 'worker_loop;
-                                                }
-                                            }
+                                        let ref_f = if current_decoded_frame >= 0 { current_decoded_frame } else { start_playback_frame };
+                                        if new_sf < ref_f.saturating_sub(2) || new_sf > ref_f + 125 {
+                                            vaapi_fifo.clear();
                                             pending_cmd = Some(DecoderCommand::Play { start_frame: new_sf, epoch: new_ep });
                                             break_stream = true;
                                             break;
                                         } else {
                                             start_playback_frame = new_sf;
+                                            keyframe_preview_sent = false;
                                             vaapi_fifo.retain(|(_, fn_out, _)| *fn_out >= new_sf);
                                             for (ep, _, _) in vaapi_fifo.iter_mut() {
                                                 *ep = new_ep;
@@ -1290,16 +1615,21 @@ impl VideoPlayer {
                                     let f_num = (pts as f64 * time_base_f * fps).round() as i64;
                                     current_decoded_frame = f_num;
 
-                                    // При холодном старте или скачке в середину GOP мгновенно отдаем первый ключевой кадр
-                                    // с номером start_playback_frame напрямую в Thread B без задержки на vaapi_fifo!
-                                    if !keyframe_preview_sent && f_num < start_playback_frame {
-                                        keyframe_preview_sent = true;
-                                        let mut moved = ffmpeg_next::util::frame::Video::empty();
-                                        unsafe {
-                                            ffmpeg_next::ffi::av_frame_move_ref(moved.as_mut_ptr(), decoded_frame.as_mut_ptr());
-                                        }
-                                        if !transfer_and_send(active_epoch, start_playback_frame, moved, &recycle_rx, &scale_tx) {
-                                            break 'worker_loop;
+                                    // Пропускаем медленный трансфер из VRAM в RAM для кадров до live_target (но отдаем ключевой кадр
+                                    // и промежуточные превью каждые 15 кадров при холодном старте или скачке в середину GOP!),
+                                    // чтобы декодер мгновенно догонял живой playhead_frame и выдавал стабильные 60 FPS!
+                                    let live_target = playhead_frame.max(start_playback_frame);
+                                    if f_num < live_target.saturating_sub(1) {
+                                        if !keyframe_preview_sent || (f_num - last_catchup_preview >= 15) {
+                                            keyframe_preview_sent = true;
+                                            last_catchup_preview = f_num;
+                                            let mut moved = ffmpeg_next::util::frame::Video::empty();
+                                            unsafe {
+                                                ffmpeg_next::ffi::av_frame_move_ref(moved.as_mut_ptr(), decoded_frame.as_mut_ptr());
+                                            }
+                                            if !transfer_and_send(active_epoch, -(f_num + 1), moved, &recycle_rx, &scale_tx) {
+                                                break 'worker_loop;
+                                            }
                                         }
                                     } else if f_num >= start_playback_frame {
                                         keyframe_preview_sent = true;
@@ -1334,20 +1664,15 @@ impl VideoPlayer {
                                             Ok(DecoderCommand::Play { start_frame: new_sf, epoch: new_ep }) => {
                                                 active_epoch = new_ep;
                                                 playhead_frame = new_sf;
-                                                if new_sf < start_playback_frame.saturating_sub(2)
-                                                    || new_sf < current_decoded_frame.saturating_sub(2)
-                                                    || new_sf > current_decoded_frame.max(start_playback_frame) + 60
-                                                {
-                                                    while let Some((ep, fn_out, front_f)) = vaapi_fifo.pop_front() {
-                                                        if !transfer_and_send(ep, fn_out, front_f, &recycle_rx, &scale_tx) {
-                                                            break 'worker_loop;
-                                                        }
-                                                    }
+                                                let ref_f = if current_decoded_frame >= 0 { current_decoded_frame } else { start_playback_frame };
+                                                if new_sf < ref_f.saturating_sub(2) || new_sf > ref_f + 60 {
+                                                    vaapi_fifo.clear();
                                                     pending_cmd = Some(DecoderCommand::Play { start_frame: new_sf, epoch: new_ep });
                                                     break_stream = true;
                                                     break;
                                                 } else {
                                                     start_playback_frame = new_sf;
+                                                    keyframe_preview_sent = false;
                                                     vaapi_fifo.retain(|(_, fn_out, _)| *fn_out >= new_sf);
                                                     for (ep, _, _) in vaapi_fifo.iter_mut() {
                                                         *ep = new_ep;

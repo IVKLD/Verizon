@@ -32,10 +32,4 @@ impl Timecode {
         let frame = (seconds * fps as f64).round() as i64;
         Self::new(frame, fps)
     }
-
-    /// Получение времени в секундах
-    #[allow(dead_code)]
-    pub fn to_seconds(&self) -> f64 {
-        self.frame as f64 / self.fps as f64
-    }
 }

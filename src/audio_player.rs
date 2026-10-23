@@ -29,6 +29,7 @@ impl AudioStreamBuffer {
         })
     }
 
+    #[cfg(test)]
     pub fn from_vec(v: Vec<f32>) -> Arc<Self> {
         let len = v.len() & !1;
         let boxed: Box<[AtomicU32]> = v
@@ -48,22 +49,6 @@ impl AudioStreamBuffer {
     #[inline]
     pub fn len(&self) -> usize {
         self.decoded_len.load(Ordering::Acquire)
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub fn get(&self, idx: usize) -> Option<f32> {
-        if idx < self.decoded_len.load(Ordering::Acquire) {
-            self.samples.get(idx).map(|a| f32::from_bits(a.load(Ordering::Relaxed)))
-        } else {
-            None
-        }
     }
 
     /// Дописать порцию декодированных сэмплов и опубликовать новую длину (Release)
@@ -298,12 +283,13 @@ impl AudioPlayer {
     }
 
     /// Фоновый декодер первого аудиопотока через FFmpeg (обратная совместимость)
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn decode_audio_worker(path: &Path) -> Result<(Vec<f32>, u32), String> {
         Self::decode_audio_stream_worker(path, 0)
     }
 
     /// Прецизионный декодер конкретной аудиодорожки (потока) из медиафайла
+    #[cfg(test)]
     pub fn decode_audio_stream_worker(path: &Path, audio_track_index: usize) -> Result<(Vec<f32>, u32), String> {
         let mut ictx = ffmpeg_next::format::input(path).map_err(|e| e.to_string())?;
 
@@ -434,7 +420,7 @@ impl AudioPlayer {
     }
 
     /// Синхронное гарантированное получение полностью декодированного аудиопотока (для тестов)
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn ensure_audio_stream_cached_sync(&self, path: &Path, audio_track_index: usize) -> Option<Arc<AudioStreamBuffer>> {
         let key = (path.to_path_buf(), audio_track_index);
         if let Ok(cache) = self.audio_cache.lock() {
@@ -779,7 +765,7 @@ impl AudioPlayer {
     }
 
     /// Офлайн-рендер окна мастер-микса (для тестов и экспорта): [start_sample, start_sample + len) interleaved
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn render_mix_window(&self, start_sample: usize, len: usize) -> Vec<f32> {
         let mut out = vec![0.0f32; len];
         self.engine.snapshot.load().mix_block(start_sample & !1, &mut out);

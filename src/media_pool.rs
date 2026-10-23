@@ -11,8 +11,6 @@ pub struct MediaAsset {
     pub resolution: String,
     pub fps: String,
     pub fps_num: f64,
-    #[allow(dead_code)]
-    pub codec: String,
     pub duration: String,
     pub duration_secs: f64,
     pub has_video: bool,
@@ -24,8 +22,6 @@ pub struct MediaAsset {
 #[derive(Debug, Clone)]
 pub struct MediaPoolState {
     pub assets: Vec<MediaAsset>,
-    #[allow(dead_code)]
-    pub selected_bin: String,
     pub selected_asset_id: Option<u64>,
     pub next_id: u64,
 }
@@ -34,7 +30,6 @@ impl MediaPoolState {
     pub fn new_demo() -> Self {
         Self {
             assets: Vec::new(),
-            selected_bin: "Master".to_string(),
             selected_asset_id: None,
             next_id: 1,
         }
@@ -91,7 +86,6 @@ impl MediaPoolState {
         let mut res = if is_audio_ext { "48.0 kHz Stereo".to_string() } else { "1920x1080 FHD".to_string() };
         let mut fps_str = if is_audio_ext { "Audio Track".to_string() } else { "24.00 fps".to_string() };
         let mut fps_num = 24.0;
-        let mut codec_str = ext.to_uppercase();
         let mut dur_str = "00:00:10:00".to_string();
         let mut duration_secs = 10.0;
         let mut has_video = !is_audio_ext;
@@ -121,14 +115,12 @@ impl MediaPoolState {
                             fps_num = f;
                             fps_str = format!("{:.2} fps", f);
                         }
-                        codec_str = format!("{:?}", stream.parameters().id()).replace("Id(", "").replace(")", "");
                     }
                 }
             } else if let Some(stream) = a_stream {
                 if let Ok(decoder) = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters()) {
                     if let Ok(a_dec) = decoder.decoder().audio() {
                         res = format!("{} Hz {}ch", a_dec.rate(), a_dec.channels());
-                        codec_str = format!("{:?}", stream.parameters().id()).replace("Id(", "").replace(")", "");
                     }
                 }
             }
@@ -150,7 +142,6 @@ impl MediaPoolState {
             resolution: res,
             fps: fps_str,
             fps_num,
-            codec: codec_str,
             duration: dur_str,
             duration_secs,
             has_video,

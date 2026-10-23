@@ -810,9 +810,10 @@ fn bench_timeline_ui_frames(timeline: &mut TimelineState, wf: &crate::waveform::
             ..Default::default()
         };
         let t = Instant::now();
-        let out = ctx.run_ui(raw, |ui| {
+        let mut out = ctx.run_ui(raw, |ui| {
             crate::timeline_view::TimelineView::render(ui, timeline, wf);
         });
+        out.textures_delta.clear();
         let shape_count = out.shapes.len();
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         if i == 100 { let verts: usize = prims.iter().map(|p| match &p.primitive { egui::epaint::Primitive::Mesh(m) => m.vertices.len(), _ => 0 }).sum(); println!("     [probe] shapes={} vertices={}", shape_count, verts); }
@@ -1118,4 +1119,54 @@ fn test_real_frame_accuracy_including_tail() {
         if dist >= 1.0 { bad.push(f); }
     }
     assert!(bad.is_empty(), "Кадры не совпали с эталоном: {:?}", bad);
+}
+
+/// Диагностика плавности воспроизведения реального файла пользователя (путь из `VERIZON_USER_VIDEO`).
+/// Тик UI 144 Hz, плейхед идёт по wall-clock как в `step_playback`. Считает повторы и пропуски кадров.
+#[test]
+fn test_real_playback_smoothness_user_file() {
+    let Ok(path) = std::env::var("VERIZON_USER_VIDEO") else { return; };
+    let path = PathBuf::from(path);
+    let start_frame: i64 = std::env::var("VERIZON_START_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(3600);
+    let secs: f64 = 8.0;
+
+    let ctx = Context::default();
+    let mut player = VideoPlayer::new();
+    assert!(player.open_file(&path, &ctx).is_ok());
+    assert!(player.wait_for_frame(start_frame, &ctx, Duration::from_secs(5)), "старт");
+
+    let tick = Duration::from_nanos(6_944_444);
+    let t0 = Instant::now();
+    let mut next = t0;
+    let mut shown: Vec<(i64, i64)> = Vec::new(); // (target, displayed) на каждый новый показ
+    let mut last_disp = -1;
+    let mut ticks = 0u64;
+    let mut max_tick = Duration::ZERO;
+    while t0.elapsed().as_secs_f64() < secs {
+        next += tick;
+        let now = Instant::now();
+        if next > now { std::thread::sleep(next - now); }
+        let target = start_frame + (t0.elapsed().as_secs_f64() * 60.0) as i64;
+        let ts = Instant::now();
+        player.update_playback(target, true, &ctx);
+        max_tick = max_tick.max(ts.elapsed());
+        ticks += 1;
+        if player.last_decoded_frame != last_disp {
+            last_disp = player.last_decoded_frame;
+            shown.push((target, last_disp));
+        }
+    }
+    let n = shown.len();
+    let mut repeats = 0; let mut skips = 0; let mut back = 0; let mut max_lag = 0i64; let mut lag_sum = 0i64;
+    for w in shown.windows(2) {
+        let d = w[1].1 - w[0].1;
+        if d < 0 { back += 1; }
+        if d > 1 { skips += (d - 1) as usize; }
+    }
+    // повторы: сколько 60 Hz-слотов целей прошло без смены кадра
+    let total_slots = (secs * 60.0) as usize;
+    repeats += total_slots.saturating_sub(n);
+    for (t, d) in &shown { let lag = t - d; max_lag = max_lag.max(lag); lag_sum += lag; }
+    println!("[USER FILE] ticks={} shown={} / {} slots, repeats≈{}, skipped_frames={}, backward={}, avg_lag={:.2}, max_lag={}, max_update_tick={:?}, dropped_counter={}",
+        ticks, n, total_slots, repeats, skips, back, lag_sum as f64 / n.max(1) as f64, max_lag, max_tick, player.dropped_frames_count);
 }

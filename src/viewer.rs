@@ -85,7 +85,7 @@ impl ViewerState {
                 let time_secs = offset as f64 / timeline.fps as f64;
                 let total_source_secs = clip.source_in_secs + time_secs;
                 let source_frame = (total_source_secs * clip.source_fps).round() as i64;
-                if timeline.is_playing {
+                if timeline.is_playing && !timeline.is_scrubbing {
                     // Вычисляем ближайшую монтажную склейку (конец текущего клипа или начало клипа на более приоритетной дорожке V2 > V1)
                     let clip_prio = (clip.track_index, if timeline.selected_clip_id == Some(clip.id) { 0usize } else { 1usize });
                     let clip_end = clip.start_frame + clip.duration_frames;
@@ -130,16 +130,12 @@ impl ViewerState {
                     });
 
                     video_player.update_playback_with_cut(source_frame, true, upcoming_cut, ctx);
-                } else if ui.input(|i| i.pointer.any_released()) {
-                    video_player.force_seek_frame(source_frame, ctx);
                 } else {
                     video_player.update_playback(source_frame, false, ctx);
                 }
             } else {
-                if timeline.is_playing {
+                if timeline.is_playing && !timeline.is_scrubbing {
                     video_player.update_playback(timeline.playhead_frame, true, ctx);
-                } else if ui.input(|i| i.pointer.any_released()) {
-                    video_player.force_seek_frame(timeline.playhead_frame, ctx);
                 } else {
                     video_player.update_playback(timeline.playhead_frame, false, ctx);
                 }
@@ -470,12 +466,24 @@ impl ViewerState {
 
                 // Отрисовка живого кадра видео
                 if let Some(tex) = &video_player.texture {
-                    painter.image(
-                        tex.id(),
-                        video_box_rect,
-                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                        tint,
-                    );
+                    let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                    // Временной GPU-блендинг соседних кадров (как interpolation в mpv): при 60 fps на мониторе 75 Гц
+                    // кадры иначе повторяются неравномерно («заедающая пластинка»). Вес = доля до следующего кадра таймлайна.
+                    let is_blendable = timeline.is_playing
+                        && !timeline.is_scrubbing
+                        && (timeline.playback_speed - 1.0).abs() < 1e-6
+                        && alpha == 255
+                        && (top_clip.source_fps - timeline.fps as f64).abs() < 0.1;
+                    match video_player.blend_source().filter(|_| is_blendable) {
+                        Some(prev) => {
+                            let weight = timeline.frame_accumulator.clamp(0.0, 1.0) as f32;
+                            painter.image(prev.id(), video_box_rect, uv, tint);
+                            painter.image(tex.id(), video_box_rect, uv, tint.gamma_multiply(weight));
+                        }
+                        None => {
+                            painter.image(tex.id(), video_box_rect, uv, tint);
+                        }
+                    }
                 }
 
                 // Интерактивная рамка трансформации (Transform Overlay как в Resolve)
