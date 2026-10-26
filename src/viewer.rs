@@ -72,138 +72,119 @@ impl ViewerState {
     ) {
         // 1. Проверяем Render Cache: если кадр уже отрендерен — мгновенный 0 мс доступ без вызова FFmpeg/DRM
         let current_sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, timeline.playhead_frame);
-        let mut cache_hit = false;
-        if render_cache.mode != crate::render_cache::RenderCacheMode::None {
-            if let Some(cached_img) = render_cache.get(timeline.playhead_frame, current_sig) {
-                video_player.present_playback_frame(ctx, cached_img);
-                video_player.mark_playback_ready();
-                if let Some(clip) = timeline.active_video_clip_at(timeline.playhead_frame) {
-                    let src_f = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
-                    video_player.last_decoded_frame = src_f;
-                    video_player.last_playback_target = src_f;
+        let cached_img = if render_cache.mode != crate::render_cache::RenderCacheMode::None {
+            render_cache.get(timeline.playhead_frame, current_sig)
+        } else {
+            None
+        };
+
+        // Декодирование текущего кадра активного клипа на таймлайне (приоритет: самая верхняя видеодорожка и последний перемещенный клип)
+        let active_clip = timeline.active_video_clip_at(timeline.playhead_frame);
+
+        if let Some(clip) = active_clip {
+            if let Some(path) = &clip.source_path {
+                if video_player.current_path.as_deref() != Some(path.as_path()) {
+                    let _ = video_player.open_file(path, ctx);
                 }
+                let source_frame = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
                 if timeline.is_playing && !timeline.is_scrubbing {
-                    if !video_player.is_playing_mode {
-                        video_player.is_playing_mode = true;
-                        video_player.dropped_frames_count = 0;
-                    }
-                } else {
-                    video_player.pause();
-                    video_player.reset_blend();
-                }
-                cache_hit = true;
-            }
-        }
-
-        if !cache_hit {
-            // Декодирование текущего кадра активного клипа на таймлайне (приоритет: самая верхняя видеодорожка и последний перемещенный клип)
-            let active_clip = timeline.active_video_clip_at(timeline.playhead_frame);
-
-            if let Some(clip) = active_clip {
-                if let Some(path) = &clip.source_path {
-                    if video_player.current_path.as_deref() != Some(path.as_path()) {
-                        let _ = video_player.open_file(path, ctx);
-                    }
-                    let source_frame = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
-                    if timeline.is_playing && !timeline.is_scrubbing {
-                        // Вычисляем ближайшую монтажную склейку (конец текущего клипа или начало клипа на более приоритетной дорожке V2 > V1)
-                        let clip_prio = (clip.track_index, if timeline.selected_clip_id == Some(clip.id) { 0usize } else { 1usize });
-                        let clip_end = clip.start_frame + clip.duration_frames;
-                        let cut_frame = timeline
-                            .clips
-                            .iter()
-                            .filter(|c| {
-                                !c.is_audio
-                                    && c.id != clip.id
-                                    && c.start_frame > timeline.playhead_frame
-                                    && c.start_frame < clip_end
-                                    && (c.track_index, if timeline.selected_clip_id == Some(c.id) { 0usize } else { 1usize }) < clip_prio
-                            })
-                            .map(|c| c.start_frame)
-                            .min()
-                            .unwrap_or(clip_end);
-
-                        let last_tl_frame = (cut_frame - 1).max(clip.start_frame);
-                        let last_src = ((clip.source_in_secs + (last_tl_frame - clip.start_frame) as f64 / timeline.fps.max(1) as f64) * clip.source_fps).round() as i64;
-
-                        let next_clip = timeline
-                            .clips
-                            .iter()
-                            .filter(|c| !c.is_audio && c.contains_frame(cut_frame))
-                            .min_by_key(|c| (c.track_index, if timeline.selected_clip_id == Some(c.id) { 0usize } else { 1usize }))
-                            .or_else(|| {
-                                timeline
-                                    .clips
-                                    .iter()
-                                    .filter(|c| !c.is_audio && c.start_frame >= cut_frame)
-                                    .min_by_key(|c| (c.start_frame, c.track_index))
-                            });
-
-                        let upcoming_cut = next_clip.and_then(|nc| {
-                            if nc.id != clip.id && nc.source_path.as_deref() == Some(path.as_path()) {
-                                let nc_tl_frame = cut_frame.max(nc.start_frame);
-                                let next_src = ((nc.source_in_secs + (nc_tl_frame - nc.start_frame) as f64 / timeline.fps.max(1) as f64) * nc.source_fps).round() as i64;
-                                Some((last_src, next_src))
-                            } else {
-                                None
-                            }
-                        });
-
-                        video_player.update_playback_with_cut(source_frame, true, upcoming_cut, ctx);
-                    } else {
-                        video_player.update_playback(source_frame, false, ctx);
-                    }
-                } else {
-                    if timeline.is_playing && !timeline.is_scrubbing {
-                        video_player.update_playback(timeline.playhead_frame, true, ctx);
-                    } else {
-                        video_player.update_playback(timeline.playhead_frame, false, ctx);
-                    }
-                }
-            } else {
-                // Если под плейхедом пауза — отображаем чистый кадр и при воспроизведении заранее готовим декодер к следующему клипу
-                let prefetch_src = if timeline.is_playing {
-                    timeline
+                    // Вычисляем ближайшую монтажную склейку (конец текущего клипа или начало клипа на более приоритетной дорожке V2 > V1)
+                    let clip_prio = (clip.track_index, if timeline.selected_clip_id == Some(clip.id) { 0usize } else { 1usize });
+                    let clip_end = clip.start_frame + clip.duration_frames;
+                    let cut_frame = timeline
                         .clips
                         .iter()
-                        .filter(|c| !c.is_audio && c.start_frame > timeline.playhead_frame)
-                        .min_by_key(|c| (c.start_frame, c.track_index))
-                        .and_then(|c| {
-                            if c.source_path.as_deref() == video_player.current_path.as_deref() {
-                                Some((c.source_in_secs * c.source_fps).round() as i64)
-                            } else {
-                                None
-                            }
+                        .filter(|c| {
+                            !c.is_audio
+                                && c.id != clip.id
+                                && c.start_frame > timeline.playhead_frame
+                                && c.start_frame < clip_end
+                                && (c.track_index, if timeline.selected_clip_id == Some(c.id) { 0usize } else { 1usize }) < clip_prio
                         })
-                } else {
-                    None
-                };
-                video_player.show_blank_frame_with_prefetch(prefetch_src, ctx);
-            }
+                        .map(|c| c.start_frame)
+                        .min()
+                        .unwrap_or(clip_end);
 
-            // Автоматически сохраняем ТОЛЬКО реально декодированные кадры в Render Cache
-            if render_cache.mode != crate::render_cache::RenderCacheMode::None {
-                if let Some(clip) = active_clip {
-                    let expected_src = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
-                    // Сохраняем last_displayed_image только если номер кадра строго совпадает с ожидаемым (без дублирования и мерцания)
-                    if video_player.last_decoded_frame == expected_src {
-                        if let Some(ref img) = video_player.last_displayed_image {
-                            render_cache.insert(timeline.playhead_frame, std::sync::Arc::clone(img), current_sig);
+                    let last_tl_frame = (cut_frame - 1).max(clip.start_frame);
+                    let last_src = ((clip.source_in_secs + (last_tl_frame - clip.start_frame) as f64 / timeline.fps.max(1) as f64) * clip.source_fps).round() as i64;
+
+                    let next_clip = timeline
+                        .clips
+                        .iter()
+                        .filter(|c| !c.is_audio && c.contains_frame(cut_frame))
+                        .min_by_key(|c| (c.track_index, if timeline.selected_clip_id == Some(c.id) { 0usize } else { 1usize }))
+                        .or_else(|| {
+                            timeline
+                                .clips
+                                .iter()
+                                .filter(|c| !c.is_audio && c.start_frame >= cut_frame)
+                                .min_by_key(|c| (c.start_frame, c.track_index))
+                        });
+
+                    let upcoming_cut = next_clip.and_then(|nc| {
+                        if nc.id != clip.id && nc.source_path.as_deref() == Some(path.as_path()) {
+                            let nc_tl_frame = cut_frame.max(nc.start_frame);
+                            let next_src = ((nc.source_in_secs + (nc_tl_frame - nc.start_frame) as f64 / timeline.fps.max(1) as f64) * nc.source_fps).round() as i64;
+                            Some((last_src, next_src))
+                        } else {
+                            None
                         }
-                    }
-                    for (src_f, img) in video_player.newly_cached_frames.drain(..) {
-                        let tl_f = clip.timeline_frame_from_source(src_f, timeline.fps);
-                        if clip.contains_frame(tl_f) {
-                            let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
-                            render_cache.insert(tl_f, img, sig);
-                        }
-                    }
+                    });
+
+                    video_player.update_playback_with_cut(source_frame, true, upcoming_cut, cached_img.clone(), ctx);
                 } else {
-                    video_player.newly_cached_frames.clear();
+                    video_player.update_playback_with_cut(source_frame, false, None, cached_img.clone(), ctx);
+                }
+            } else {
+                if timeline.is_playing && !timeline.is_scrubbing {
+                    video_player.update_playback_with_cut(timeline.playhead_frame, true, None, cached_img.clone(), ctx);
+                } else {
+                    video_player.update_playback_with_cut(timeline.playhead_frame, false, None, cached_img.clone(), ctx);
+                }
+            }
+        } else {
+            // Если под плейхедом пауза — отображаем чистый кадр и при воспроизведении заранее готовим декодер к следующему клипу
+            let prefetch_src = if timeline.is_playing {
+                timeline
+                    .clips
+                    .iter()
+                    .filter(|c| !c.is_audio && c.start_frame > timeline.playhead_frame)
+                    .min_by_key(|c| (c.start_frame, c.track_index))
+                    .and_then(|c| {
+                        if c.source_path.as_deref() == video_player.current_path.as_deref() {
+                            Some((c.source_in_secs * c.source_fps).round() as i64)
+                        } else {
+                            None
+                        }
+                    })
+            } else {
+                None
+            };
+            video_player.show_blank_frame_with_prefetch(prefetch_src, ctx);
+        }
+
+        // Автоматически сохраняем ТОЛЬКО реально декодированные кадры в Render Cache
+        if render_cache.mode != crate::render_cache::RenderCacheMode::None && cached_img.is_none() {
+            if let Some(clip) = active_clip {
+                let expected_src = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
+                // Сохраняем last_displayed_image только если номер кадра строго совпадает с ожидаемым (без дублирования и мерцания)
+                if video_player.last_decoded_frame == expected_src {
+                    if let Some(ref img) = video_player.last_displayed_image {
+                        render_cache.insert(timeline.playhead_frame, std::sync::Arc::clone(img), current_sig);
+                    }
+                }
+                for (src_f, img) in video_player.newly_cached_frames.drain(..) {
+                    let tl_f = clip.timeline_frame_from_source(src_f, timeline.fps);
+                    if clip.contains_frame(tl_f) {
+                        let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
+                        render_cache.insert(tl_f, img, sig);
+                    }
                 }
             } else {
                 video_player.newly_cached_frames.clear();
             }
+        } else {
+            video_player.newly_cached_frames.clear();
         }
 
         // Обновление реальных уровней громкости VU-метра
@@ -370,17 +351,23 @@ impl ViewerState {
                 ui.separator();
 
                 // Индикатор частоты кадров и Drop Frame в стиле DaVinci Resolve
-                let (fps_color, fps_val) = if video_player.is_playing_mode {
-                    if video_player.is_dropping_frames {
-                        (Color32::from_rgb(255, 69, 58), video_player.real_playback_fps) // Красный (Drop Frame)
+                let is_active_playback = video_player.is_playing_mode;
+                let (fps_color, fps_val) = if is_active_playback {
+                    let cur_fps = if video_player.real_playback_fps > 0.0 {
+                        video_player.real_playback_fps
                     } else {
-                        (Color32::from_rgb(48, 209, 88), video_player.real_playback_fps) // Зеленый (Nominal Real-time)
+                        video_player.fps as f32
+                    };
+                    if video_player.is_dropping_frames {
+                        (Color32::from_rgb(255, 69, 58), cur_fps) // Красный (Drop Frame)
+                    } else {
+                        (Color32::from_rgb(48, 209, 88), cur_fps) // Зеленый (Nominal Real-time)
                     }
                 } else {
                     (ResolveColors::TEXT_MUTED, video_player.fps as f32)
                 };
 
-                let drop_info = if video_player.is_playing_mode && video_player.dropped_frames_count > 0 {
+                let drop_info = if is_active_playback && video_player.dropped_frames_count > 0 {
                     format!("● {:.1} fps (Drop: {})", fps_val, video_player.dropped_frames_count)
                 } else {
                     format!("● {:.1} fps", fps_val)
@@ -535,26 +522,10 @@ impl ViewerState {
                     ColorChannelMode::Monochrome => Color32::from_rgba_unmultiplied(200, 200, 200, alpha),
                 };
 
-                // Отрисовка живого кадра видео
+                // Отрисовка живого кадра видео (Frame-Accurate без двоения и мерцания)
                 if let Some(tex) = &video_player.texture {
                     let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-                    // Временной GPU-блендинг соседних кадров (как interpolation в mpv): при 60 fps на мониторе 75 Гц
-                    // кадры иначе повторяются неравномерно («заедающая пластинка»). Вес = доля до следующего кадра таймлайна.
-                    let is_blendable = timeline.is_playing
-                        && !timeline.is_scrubbing
-                        && (timeline.playback_speed - 1.0).abs() < 1e-6
-                        && alpha == 255
-                        && (top_clip.source_fps - timeline.fps as f64).abs() < 0.1;
-                    match video_player.blend_source().filter(|_| is_blendable) {
-                        Some(prev) => {
-                            let weight = timeline.frame_accumulator.clamp(0.0, 1.0) as f32;
-                            painter.image(prev.id(), video_box_rect, uv, tint);
-                            painter.image(tex.id(), video_box_rect, uv, tint.gamma_multiply(weight));
-                        }
-                        None => {
-                            painter.image(tex.id(), video_box_rect, uv, tint);
-                        }
-                    }
+                    painter.image(tex.id(), video_box_rect, uv, tint);
                 }
 
                 // Интерактивная рамка трансформации (Transform Overlay как в Resolve)

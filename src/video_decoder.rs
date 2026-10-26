@@ -18,10 +18,6 @@ pub struct VideoPlayer {
     pub fps: f64,
     pub total_frames: i64,
     pub texture: Option<TextureHandle>,
-    /// Предыдущий показанный кадр (ping-pong с `texture`) для GPU-блендинга при несовпадении частоты видео и монитора
-    back_texture: Option<TextureHandle>,
-    /// Номер исходного кадра в `back_texture` (-1 — блендинг недоступен)
-    back_frame: i64,
     /// Готов ли декодер выдавать кадры воспроизведения (false между командой Play и первым кадром)
     playback_ready: bool,
     /// Момент отправки последней команды Play (для ограничения времени пре-ролла)
@@ -150,8 +146,6 @@ impl VideoPlayer {
             fps: 24.0,
             total_frames: 0,
             texture: None,
-            back_texture: None,
-            back_frame: -1,
             playback_ready: true,
             play_requested_at: std::time::Instant::now(),
             is_real_video: false,
@@ -368,7 +362,6 @@ impl VideoPlayer {
                 // Arc вместо копии кадра: никаких аллокаций 3.7 МБ и mmap/munmap в UI-потоке при каждом тике скраббинга
                 let img = Arc::clone(&self.scrub_cache[idx].1);
                 self.rendered_frames_in_sample += 1;
-                self.back_frame = -1;
                 self.last_fingerprint = image_fingerprint(&img);
                 self.last_displayed_image = Some(Arc::clone(&img));
                 let data = ImageData::Color(img);
@@ -421,15 +414,39 @@ impl VideoPlayer {
     /// Автоматически разделяет непрерывное воспроизведение (Jitter Buffer Prefetch)
     /// и точечный скраббинг/перемотку (Frame-Accurate Seek)
     pub fn update_playback(&mut self, target_frame: i64, is_playing: bool, ctx: &Context) {
-        self.update_playback_with_cut(target_frame, is_playing, None, ctx);
+        self.update_playback_with_cut(target_frame, is_playing, None, None, ctx);
+    }
+
+    /// Дренирование свежих кадров из фонового воркера в очередь при воспроизведении по Render Cache,
+    /// чтобы фоновый декодер декодировал упреждающе и выход из закэшированной зоны был бесшовным
+    fn drain_incoming_into_cache(&mut self) {
+        if let Some(rx) = &self.frame_rx {
+            while let Ok((epoch, raw_frame_num, image)) = rx.try_recv() {
+                if epoch == self.current_epoch && raw_frame_num >= 0 {
+                    let arc_img = Arc::new(image);
+                    if let Some(back) = self.frame_queue.back_mut() {
+                        if back.0 == raw_frame_num {
+                            back.1 = arc_img;
+                            continue;
+                        }
+                    }
+                    self.frame_queue.push_back((raw_frame_num, arc_img));
+                    while self.frame_queue.len() > 64 {
+                        self.frame_queue.pop_front();
+                    }
+                }
+            }
+        }
     }
 
     /// Обновление воспроизведения с упреждающей подготовкой следующей монтажной склейки (Zero-Latency Cut)
+    /// и бесшовным воспроизведением из Render Cache (RAM Cache Hit)
     pub fn update_playback_with_cut(
         &mut self,
         target_frame: i64,
         is_playing: bool,
         upcoming_cut: Option<(i64, i64)>,
+        cached_image: Option<Arc<ColorImage>>,
         ctx: &Context,
     ) {
         if !self.is_real_video {
@@ -456,7 +473,11 @@ impl VideoPlayer {
                     self.current_epoch = self.current_epoch.max(self.prefetch_epoch).wrapping_add(1);
                     self.clear_queues_async();
                     self.prefetch_target = None;
-                    self.begin_preroll();
+                    if cached_image.is_none() {
+                        self.begin_preroll();
+                    } else {
+                        self.playback_ready = true;
+                    }
                     if let Some(tx) = &self.command_tx {
                         let _ = tx.send(DecoderCommand::Play {
                             start_frame: target_frame,
@@ -489,7 +510,11 @@ impl VideoPlayer {
                             self.current_epoch = self.current_epoch.max(self.prefetch_epoch).wrapping_add(1);
                             self.clear_queues_async();
                             self.prefetch_target = None;
-                            // Во время активного воспроизведения пре-ролл НЕ включается повторно — декодер догоняет звук через Drop Frame
+                            if cached_image.is_none() {
+                                self.begin_preroll();
+                            } else {
+                                self.playback_ready = true;
+                            }
                             if let Some(tx) = &self.command_tx {
                                 let _ = tx.send(DecoderCommand::Play {
                                     start_frame: target_frame,
@@ -510,10 +535,39 @@ impl VideoPlayer {
                 }
             }
 
-            self.poll_playback_frames_with_cut(target_frame, upcoming_cut, ctx);
+            if let Some(img) = cached_image {
+                // Если кадр уже отрендерен в Render Cache — мгновенный 0 мс доступ
+                self.playback_ready = true;
+                self.present_playback_frame(ctx, img);
+                self.last_decoded_frame = target_frame;
+                self.last_exact_frame = target_frame;
+                self.last_playback_target = target_frame;
+                self.rendered_frames_in_sample += 1;
+
+                // Дренируем свежие кадры воркера, чтобы фоновый декодер продолжал упреждать воспроизведение
+                self.drain_incoming_into_cache();
+
+                let now = std::time::Instant::now();
+                let elapsed = now.duration_since(self.fps_sample_time).as_secs_f32();
+                if elapsed >= 0.5 {
+                    self.real_playback_fps = (self.rendered_frames_in_sample as f32 / elapsed).round();
+                    self.rendered_frames_in_sample = 0;
+                    self.fps_sample_time = now;
+                    self.is_dropping_frames = self.real_playback_fps < (self.fps as f32 - 1.5) && self.dropped_frames_count > 0;
+                }
+            } else {
+                self.poll_playback_frames_with_cut(target_frame, upcoming_cut, ctx);
+            }
         } else {
             self.pause();
-            self.seek_and_decode(target_frame, ctx);
+            if let Some(img) = cached_image {
+                self.present_playback_frame(ctx, img);
+                self.last_decoded_frame = target_frame;
+                self.last_exact_frame = target_frame;
+                self.last_playback_target = target_frame;
+            } else {
+                self.seek_and_decode(target_frame, ctx);
+            }
         }
     }
 
@@ -698,7 +752,6 @@ impl VideoPlayer {
             self.rendered_frames_in_sample += 1;
             self.last_displayed_epoch = ep;
             self.last_fingerprint = image_fingerprint(&prev_img);
-            self.back_frame = -1;
             let data = ImageData::Color(prev_img);
             if let Some(tex) = &mut self.texture {
                 tex.set(data, TextureOptions::LINEAR);
@@ -737,16 +790,13 @@ impl VideoPlayer {
             && self.play_requested_at.elapsed().as_millis() < PREROLL_TIMEOUT_MS
     }
 
-    /// Пометить готовность кадра воспроизведения (снимает пре-ролл при Render Cache hit)
-    #[inline]
-    pub fn mark_playback_ready(&mut self) {
-        self.playback_ready = true;
-    }
-
     /// Принудительно перевести декодер в режим паузы с очисткой очередей
     pub fn pause(&mut self) {
         self.dropped_frames_count = 0;
         self.is_dropping_frames = false;
+        self.real_playback_fps = self.fps as f32;
+        self.rendered_frames_in_sample = 0;
+        self.fps_sample_time = std::time::Instant::now();
         if self.is_playing_mode {
             self.is_playing_mode = false;
             self.current_epoch = self.current_epoch.max(self.prefetch_epoch).wrapping_add(1);
@@ -758,41 +808,31 @@ impl VideoPlayer {
         }
     }
 
-    /// Выводит кадр воспроизведения через ping-pong двух текстур: предыдущий кадр остаётся на GPU для блендинга
+    /// Выводит кадр воспроизведения на GPU текстуру
     pub fn present_playback_frame(&mut self, ctx: &Context, img: Arc<ColorImage>) {
         self.last_displayed_image = Some(Arc::clone(&img));
         let data = ImageData::Color(img);
-        if self.texture.is_none() {
+        if let Some(tex) = &mut self.texture {
+            tex.set(data, TextureOptions::LINEAR);
+        } else {
             self.texture = Some(ctx.load_texture("video_frame", data, TextureOptions::LINEAR));
-            self.back_frame = -1;
-            return;
         }
-        let next = match self.back_texture.take() {
-            Some(mut tex) => {
-                tex.set(data, TextureOptions::LINEAR);
-                tex
-            }
-            None => ctx.load_texture("video_frame_b", data, TextureOptions::LINEAR),
-        };
-        self.back_texture = self.texture.replace(next);
-        self.back_frame = self.last_decoded_frame;
-    }
-
-    /// Предыдущий кадр для временного блендинга, если он ровно на 1 кадр раньше текущего (плавное 60 fps на мониторе с другой частотой)
-    pub fn blend_source(&self) -> Option<&TextureHandle> {
-        let back = self.back_texture.as_ref()?;
-        (self.is_playing_mode && self.back_frame >= 0 && self.last_decoded_frame - self.back_frame == 1).then_some(back)
-    }
-
-    /// Сбросить историю предыдущего кадра для GPU-блендинга (устраняет мерцание при переходах и скраббинге)
-    #[inline]
-    pub fn reset_blend(&mut self) {
-        self.back_frame = -1;
     }
 
     /// Отобразить чистый нейтральный экран Resolve (а при воспроизведении паузы — заранее подготовить декодер к следующему клипу!)
     pub fn show_blank_frame_with_prefetch(&mut self, prefetch_frame: Option<i64>, ctx: &Context) {
         self.playback_ready = true;
+        if self.is_playing_mode {
+            self.rendered_frames_in_sample += 1;
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(self.fps_sample_time).as_secs_f32();
+            if elapsed >= 0.5 {
+                self.real_playback_fps = (self.rendered_frames_in_sample as f32 / elapsed).round();
+                self.rendered_frames_in_sample = 0;
+                self.fps_sample_time = now;
+                self.is_dropping_frames = self.real_playback_fps < (self.fps as f32 - 1.5) && self.dropped_frames_count > 0;
+            }
+        }
         if let Some(next_src) = prefetch_frame {
             if self.prefetch_target.map(|pf| (next_src - pf).abs() <= 2).unwrap_or(false) {
                 self.is_playing_mode = true;
@@ -827,7 +867,6 @@ impl VideoPlayer {
         if self.last_decoded_frame == -999 && self.texture.is_some() {
             return;
         }
-        self.back_frame = -1;
         let img = Self::generate_placeholder();
         if let Some(tex) = &mut self.texture {
             tex.set(img, TextureOptions::NEAREST);
@@ -874,7 +913,6 @@ impl VideoPlayer {
                     self.rendered_frames_in_sample += 1;
                     self.last_fingerprint = image_fingerprint(&arc_img);
                     self.last_displayed_image = Some(Arc::clone(&arc_img));
-                    self.back_frame = -1;
                     let data = ImageData::Color(arc_img);
                     if let Some(tex) = &mut self.texture {
                         tex.set(data, TextureOptions::LINEAR);

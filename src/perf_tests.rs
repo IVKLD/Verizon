@@ -1526,3 +1526,30 @@ fn test_render_cache_stale_frame_duplication_prevented() {
     assert!(cache.get(1, sig1).is_none(), "Кадр 1 не должен дублировать кадр 0 при отсутствии в кэше");
 }
 
+#[test]
+fn test_render_cache_playback_sustains_fps_and_no_zero_fps() {
+    let ctx = egui::Context::default();
+    let mut player = VideoPlayer::new();
+    player.is_real_video = true;
+    player.fps = 60.0;
+    player.real_playback_fps = 60.0;
+
+    let dummy_img = std::sync::Arc::new(egui::ColorImage::example());
+
+    // 1. Воспроизведение по закэшированной зоне (30 кадров)
+    for f in 0..30 {
+        player.update_playback_with_cut(f, true, None, Some(std::sync::Arc::clone(&dummy_img)), &ctx);
+        assert_eq!(player.last_decoded_frame, f, "Кадр должен немедленно выводиться из Render Cache");
+        assert_eq!(player.dropped_frames_count, 0, "Воспроизведение из кэша не должно дропать кадры");
+        assert!(player.is_playing_mode, "Режим воспроизведения должен быть активен");
+    }
+
+    // Симулируем 510 мс воспроизведения для срабатывания таймера FPS
+    player.fps_sample_time = std::time::Instant::now() - std::time::Duration::from_millis(510);
+    player.update_playback_with_cut(30, true, None, Some(std::sync::Arc::clone(&dummy_img)), &ctx);
+
+    assert!(player.real_playback_fps >= 50.0, "FPS при воспроизведении из кэша должен быть номинальным (~60 fps), а не 0 fps (получено: {})", player.real_playback_fps);
+    assert!(!player.is_dropping_frames, "При кэше индикатор дроп-кадров не должен загораться красным");
+}
+
+
