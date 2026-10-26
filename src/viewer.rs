@@ -168,20 +168,28 @@ impl ViewerState {
             if let Some(clip) = active_clip {
                 let is_same_file = clip.source_path.as_deref() == video_player.current_path.as_deref();
                 if is_same_file {
-                    let expected_src = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
                     let mut inserted_any = false;
-                    if cached_img.is_none() && video_player.last_exact_frame == expected_src {
-                        if let Some(ref img) = video_player.last_displayed_image {
-                            render_cache.insert(timeline.playhead_frame, std::sync::Arc::clone(img), current_sig);
-                            inserted_any = true;
+                    if let Some(ref img) = video_player.last_displayed_image {
+                        let presented_src = video_player.last_exact_frame;
+                        if presented_src >= 0 {
+                            let tl_presented = clip.timeline_frame_from_source(presented_src, timeline.fps);
+                            if clip.contains_frame(tl_presented) {
+                                let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_presented);
+                                if !render_cache.is_cached(tl_presented) {
+                                    render_cache.insert(tl_presented, std::sync::Arc::clone(img), sig);
+                                    inserted_any = true;
+                                }
+                            }
                         }
                     }
                     for (src_f, img) in video_player.newly_cached_frames.drain(..) {
                         let tl_f = clip.timeline_frame_from_source(src_f, timeline.fps);
                         if clip.contains_frame(tl_f) {
                             let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
-                            render_cache.insert(tl_f, img, sig);
-                            inserted_any = true;
+                            if !render_cache.is_cached(tl_f) {
+                                render_cache.insert(tl_f, img, sig);
+                                inserted_any = true;
+                            }
                         }
                     }
                     if inserted_any {

@@ -1124,7 +1124,6 @@ impl eframe::App for NleApp {
         }
         if self.timeline.audio_dirty {
             self.audio_player.rebuild_timeline_audio(&self.timeline);
-            self.render_cache.invalidate_all();
             self.timeline.audio_dirty = false;
         }
         self.audio_player.sync_playhead_frame(
@@ -1140,7 +1139,6 @@ impl eframe::App for NleApp {
             self.autopilot = Some(ap);
             if self.timeline.audio_dirty {
                 self.audio_player.rebuild_timeline_audio(&self.timeline);
-                self.render_cache.invalidate_all();
                 self.timeline.audio_dirty = false;
             }
             self.audio_player.sync_playhead_frame(

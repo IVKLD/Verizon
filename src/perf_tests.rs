@@ -1901,6 +1901,65 @@ fn test_smart_cache_responsive_idle_and_intermediate_frame_precache() {
     assert_eq!(intervals, vec![(97, 100)], "Кадры 97..100 должны объединиться в один сплошной синий интервал");
 }
 
+#[test]
+fn test_playback_over_red_zone_creates_and_preserves_cache_without_audio_invalidation() {
+    use crate::timeline::{Clip, TimelineState};
+    use crate::render_cache::{RenderCacheManager, RenderCacheMode};
+
+    let mut timeline = TimelineState::new_empty();
+    let clip = Clip {
+        id: 1,
+        name: "TestClip".to_string(),
+        track_index: 0,
+        start_frame: 0,
+        duration_frames: 100,
+        is_audio: false,
+        source_path: Some(std::path::PathBuf::from("/tmp/video.mp4")),
+        source_in_secs: 0.0,
+        source_fps: 60.0,
+        speed: 1.0,
+        ..Default::default()
+    };
+    timeline.clips.push(clip.clone());
+
+    let cache = RenderCacheManager::new(RenderCacheMode::Smart, 200);
+
+    // Воспроизведение по красной зоне (кадры 10..20)
+    for f in 10..=20 {
+        timeline.playhead_frame = f;
+        let sig = RenderCacheManager::compute_frame_signature(&timeline, f);
+        let dummy_img = std::sync::Arc::new(egui::ColorImage::example());
+
+        // Имитация viewer.rs во время воспроизведения
+        let presented_src = clip.source_frame_from_timeline(f, timeline.fps);
+        let tl_presented = clip.timeline_frame_from_source(presented_src, timeline.fps);
+        assert_eq!(tl_presented, f);
+        cache.insert(tl_presented, dummy_img, sig);
+
+        // Имитация декодирования аудио во время воспроизведения (has_new_decoded_audio -> audio_dirty)
+        timeline.audio_dirty = true;
+        // В app.rs: audio_dirty НЕ должно вызывать invalidate_all()!
+        if timeline.audio_dirty {
+            timeline.audio_dirty = false;
+        }
+    }
+
+    // Проверяем, что все кадры 10..20 остались в кэше и НЕ были уничтожены аудио-декодером!
+    for f in 10..=20 {
+        assert!(cache.is_cached(f), "Кадр {} должен быть в Render Cache после воспроизведения", f);
+    }
+
+    let intervals = cache.cached_intervals();
+    assert_eq!(intervals, vec![(10, 20)], "Интервал 10..20 должен быть непрерывно синим");
+
+    // Повторное воспроизведение: все кадры берутся из кэша
+    for f in 10..=20 {
+        let sig = RenderCacheManager::compute_frame_signature(&timeline, f);
+        assert!(cache.get(f, sig).is_some(), "Кадр {} должен мгновенно читаться из кэша", f);
+    }
+}
+
+
 
 
 
