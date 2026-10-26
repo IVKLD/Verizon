@@ -63,6 +63,8 @@ pub struct VideoPlayer {
     pub last_fingerprint: Vec<u8>,
     /// Последнее фактически отображенное изображение кадра (для интеграции с Render Cache)
     pub last_displayed_image: Option<Arc<ColorImage>>,
+    /// Очередь свежедекодированных кадров для прямой регистрации в Render Cache
+    pub newly_cached_frames: Vec<(i64, Arc<ColorImage>)>,
 
     // Фоновый канал для безынерционной асинхронной очистки кадров (исключает вызовы thread::spawn и mmap_lock в UI)
     gc_tx: std::sync::mpsc::Sender<Vec<ColorImage>>,
@@ -177,6 +179,7 @@ impl VideoPlayer {
             rendered_frames_in_sample: 0,
             last_fingerprint: Vec::new(),
             last_displayed_image: None,
+            newly_cached_frames: Vec::with_capacity(64),
             gc_tx: {
                 let (tx, rx) = std::sync::mpsc::channel::<Vec<ColorImage>>();
                 std::thread::Builder::new()
@@ -408,6 +411,7 @@ impl VideoPlayer {
         if !q2.is_empty() {
             self.recycle_queue(q2);
         }
+        self.newly_cached_frames.clear();
     }
 
     /// Главный метод обновления кадра:
@@ -572,6 +576,10 @@ impl VideoPlayer {
                     if frame_num <= cut_limit {
                         if frame_num % 8 == 0 {
                             newly_cached.push((frame_num, Arc::clone(&arc_img)));
+                        }
+                        self.newly_cached_frames.push((frame_num, Arc::clone(&arc_img)));
+                        if self.newly_cached_frames.len() > 64 {
+                            self.newly_cached_frames.remove(0);
                         }
                         if let Some(back) = self.frame_queue.back_mut() {
                             if back.0 == frame_num {
@@ -835,21 +843,30 @@ impl VideoPlayer {
                 }
                 if !is_preview {
                     newly_cached.push((frame_num, Arc::clone(&arc_img)));
+                    self.newly_cached_frames.push((frame_num, Arc::clone(&arc_img)));
+                    if self.newly_cached_frames.len() > 64 {
+                        self.newly_cached_frames.remove(0);
+                    }
                 }
                 self.last_displayed_epoch = self.last_displayed_epoch.max(epoch);
-                self.rendered_frames_in_sample += 1;
-                self.last_fingerprint = image_fingerprint(&arc_img);
-                self.last_displayed_image = Some(Arc::clone(&arc_img));
-                self.back_frame = -1;
-                let data = ImageData::Color(arc_img);
-                if let Some(tex) = &mut self.texture {
-                    tex.set(data, TextureOptions::LINEAR);
-                } else {
-                    self.texture = Some(ctx.load_texture("video_frame", data, TextureOptions::LINEAR));
-                }
-                self.last_decoded_frame = frame_num;
-                if !is_preview && epoch == self.current_epoch {
-                    self.last_exact_frame = frame_num;
+
+                // Обновляем монитор только если кадр совпадает с целевым (плейхедом)
+                // или включен режим воспроизведения. Упреждающие кадры Smart Cache не сбивают текущий кадр паузы!
+                if self.is_playing_mode || frame_num == self.last_playback_target {
+                    self.rendered_frames_in_sample += 1;
+                    self.last_fingerprint = image_fingerprint(&arc_img);
+                    self.last_displayed_image = Some(Arc::clone(&arc_img));
+                    self.back_frame = -1;
+                    let data = ImageData::Color(arc_img);
+                    if let Some(tex) = &mut self.texture {
+                        tex.set(data, TextureOptions::LINEAR);
+                    } else {
+                        self.texture = Some(ctx.load_texture("video_frame", data, TextureOptions::LINEAR));
+                    }
+                    self.last_decoded_frame = frame_num;
+                    if !is_preview && epoch == self.current_epoch {
+                        self.last_exact_frame = frame_num;
+                    }
                 }
             }
         }

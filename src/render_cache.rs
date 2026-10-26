@@ -46,6 +46,7 @@ pub struct RenderCacheManager {
     cache: Arc<Mutex<HashMap<i64, CachedRenderFrame>>>,
     lru_order: Arc<Mutex<VecDeque<i64>>>,
     cached_set: Arc<RwLock<HashSet<i64>>>,
+    cached_intervals: Arc<RwLock<(u64, Vec<(i64, i64)>)>>,
     pub max_frames: usize,
     pub generation: Arc<AtomicU64>,
 }
@@ -63,8 +64,9 @@ impl RenderCacheManager {
             cache: Arc::new(Mutex::new(HashMap::with_capacity(max_frames))),
             lru_order: Arc::new(Mutex::new(VecDeque::with_capacity(max_frames))),
             cached_set: Arc::new(RwLock::new(HashSet::with_capacity(max_frames))),
+            cached_intervals: Arc::new(RwLock::new((0, Vec::new()))),
             max_frames: max_frames.max(1),
-            generation: Arc::new(AtomicU64::new(0)),
+            generation: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -114,6 +116,41 @@ impl RenderCacheManager {
             return None;
         }
         self.cached_set.read().ok()
+    }
+
+    /// Получить отсортированный список непрерывных интервалов кэшированных кадров (с O(1) переиспользованием по поколению)
+    pub fn cached_intervals(&self) -> Vec<(i64, i64)> {
+        if self.mode == RenderCacheMode::None {
+            return Vec::new();
+        }
+        let cur_gen = self.generation.load(Ordering::Acquire);
+        if let Ok(guard) = self.cached_intervals.read() {
+            if guard.0 == cur_gen {
+                return guard.1.clone();
+            }
+        }
+
+        let Ok(set) = self.cached_set.read() else {
+            return Vec::new();
+        };
+        let mut frames: Vec<i64> = set.iter().copied().collect();
+        frames.sort_unstable();
+
+        let mut intervals: Vec<(i64, i64)> = Vec::new();
+        for f in frames {
+            if let Some(last) = intervals.last_mut() {
+                if f == last.1 + 1 {
+                    last.1 = f;
+                    continue;
+                }
+            }
+            intervals.push((f, f));
+        }
+
+        if let Ok(mut guard) = self.cached_intervals.write() {
+            *guard = (cur_gen, intervals.clone());
+        }
+        intervals
     }
 
     /// Получить готовый кадр из Render Cache (0 мс доступ к RAM без декодирования)
@@ -171,6 +208,7 @@ impl RenderCacheManager {
             }
             lru.push_back(frame);
             set.insert(frame);
+            self.generation.fetch_add(1, Ordering::Release);
             return;
         }
 
@@ -187,6 +225,7 @@ impl RenderCacheManager {
         cache.insert(frame, CachedRenderFrame { frame, image, signature });
         lru.push_back(frame);
         set.insert(frame);
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Инвалидировать диапазон кадров (например, при разрезе или сдвиге клипа)

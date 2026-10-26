@@ -64,6 +64,23 @@ impl Clip {
     pub fn contains_frame(&self, frame: i64) -> bool {
         frame >= self.start_frame && frame < self.end_frame()
     }
+
+    /// Перевод глобального кадра таймлайна в локальный номер кадра исходного медиафайла
+    pub fn source_frame_from_timeline(&self, timeline_frame: i64, timeline_fps: u32) -> i64 {
+        let offset = timeline_frame - self.start_frame;
+        let time_secs = offset as f64 / timeline_fps.max(1) as f64;
+        let total_source_secs = self.source_in_secs + time_secs;
+        let fps = if self.source_fps > 0.0 { self.source_fps } else { timeline_fps as f64 };
+        (total_source_secs * fps).round() as i64
+    }
+
+    /// Обратный перевод номера кадра медиафайла в глобальный кадр таймлайна
+    pub fn timeline_frame_from_source(&self, source_frame: i64, timeline_fps: u32) -> i64 {
+        let fps = if self.source_fps > 0.0 { self.source_fps } else { timeline_fps as f64 };
+        let total_source_secs = source_frame as f64 / fps.max(1.0);
+        let time_secs = total_source_secs - self.source_in_secs;
+        self.start_frame + (time_secs * timeline_fps as f64).round() as i64
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1069,5 +1086,42 @@ mod tests {
         assert_eq!(tl.clips[0].source_in_frame, 0);
         assert_eq!(tl.clips[1].start_frame, 76);
         assert_eq!(tl.clips[1].source_in_frame, 0);
+    }
+
+    #[test]
+    fn test_clip_bidirectional_frame_conversion() {
+        let clip = Clip {
+            id: 1,
+            name: "TestClip".to_string(),
+            track_index: 0,
+            start_frame: 100,
+            duration_frames: 300,
+            is_audio: false,
+            color: Color32::RED,
+            source_path: None,
+            source_in_frame: 120,
+            source_in_secs: 2.0,
+            source_fps: 60.0,
+            link_group: None,
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            position_x: 0.0,
+            position_y: 0.0,
+            rotation: 0.0,
+            opacity: 100.0,
+            volume_db: 0.0,
+            pan: 0.0,
+            source_audio_stream: 0,
+        };
+
+        let tl_fps = 60;
+        // Кадр 160 на таймлайне (+1 сек от старта клипа на 100)
+        let src_f = clip.source_frame_from_timeline(160, tl_fps);
+        // source_in_secs (2.0) + 1.0 sec = 3.0 sec * 60 fps = 180
+        assert_eq!(src_f, 180);
+
+        // Обратный перевод: исходный кадр 180 -> таймлайн 160
+        let back_tl_f = clip.timeline_frame_from_source(src_f, tl_fps);
+        assert_eq!(back_tl_f, 160);
     }
 }

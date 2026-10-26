@@ -810,7 +810,7 @@ impl TimelineView {
         }
 
         // Индикатор Render Cache в стиле DaVinci Resolve (полоса синий/красный внизу линейки)
-        if let Some(cached_set) = render_cache.read_cached_set() {
+        if render_cache.mode != crate::render_cache::RenderCacheMode::None {
             let bar_y_min = rect.max.y - 3.0;
             let bar_y_max = rect.max.y;
             let blue_cache = Color32::from_rgb(0x29, 0x97, 0xff);
@@ -819,7 +819,9 @@ impl TimelineView {
             let visible_start_frame = ((timeline.scroll_x / timeline.zoom_factor).floor() as i64).max(0);
             let visible_end_frame = (((timeline.scroll_x + rect.width()) / timeline.zoom_factor).ceil() as i64).max(0);
 
+            let intervals = render_cache.cached_intervals();
             let mut cache_mesh = egui::Mesh::default();
+
             for clip in &timeline.clips {
                 if clip.is_audio {
                     continue;
@@ -830,23 +832,31 @@ impl TimelineView {
                     continue;
                 }
 
-                let mut seg_start = c_start;
-                let mut cur_cached = cached_set.contains(&seg_start);
-                for f in c_start + 1..=c_end {
-                    let cached = if f < c_end { cached_set.contains(&f) } else { !cur_cached };
-                    if cached != cur_cached || f == c_end {
-                        let seg_end = f;
-                        let x1 = rect.min.x + (seg_start as f32 * timeline.zoom_factor) - timeline.scroll_x;
-                        let x2 = rect.min.x + (seg_end as f32 * timeline.zoom_factor) - timeline.scroll_x;
+                // 1) Фоновая полоса клипа — красная (неотрендеренный сегмент)
+                let clip_x1 = rect.min.x + (c_start as f32 * timeline.zoom_factor) - timeline.scroll_x;
+                let clip_x2 = rect.min.x + (c_end as f32 * timeline.zoom_factor) - timeline.scroll_x;
+                if clip_x2 > rect.min.x && clip_x1 < rect.max.x {
+                    let r = Rect::from_min_max(
+                        pos2(clip_x1.max(rect.min.x), bar_y_min),
+                        pos2(clip_x2.min(rect.max.x), bar_y_max),
+                    );
+                    cache_mesh.add_colored_rect(r, red_dirty);
+                }
+
+                // 2) Поверх наносим синие сегменты готового кэша (O(1) на интервал вместо O(N) на кадр)
+                for &(i_start, i_end) in &intervals {
+                    let overlap_start = i_start.max(c_start);
+                    let overlap_end = (i_end + 1).min(c_end);
+                    if overlap_start < overlap_end {
+                        let x1 = rect.min.x + (overlap_start as f32 * timeline.zoom_factor) - timeline.scroll_x;
+                        let x2 = rect.min.x + (overlap_end as f32 * timeline.zoom_factor) - timeline.scroll_x;
                         if x2 > rect.min.x && x1 < rect.max.x {
                             let r = Rect::from_min_max(
                                 pos2(x1.max(rect.min.x), bar_y_min),
                                 pos2(x2.min(rect.max.x), bar_y_max),
                             );
-                            cache_mesh.add_colored_rect(r, if cur_cached { blue_cache } else { red_dirty });
+                            cache_mesh.add_colored_rect(r, blue_cache);
                         }
-                        seg_start = f;
-                        cur_cached = cached;
                     }
                 }
             }

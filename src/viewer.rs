@@ -95,10 +95,7 @@ impl ViewerState {
                     if video_player.current_path.as_deref() != Some(path.as_path()) {
                         let _ = video_player.open_file(path, ctx);
                     }
-                    let offset = timeline.playhead_frame - clip.start_frame;
-                    let time_secs = offset as f64 / timeline.fps as f64;
-                    let total_source_secs = clip.source_in_secs + time_secs;
-                    let source_frame = (total_source_secs * clip.source_fps).round() as i64;
+                    let source_frame = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
                     if timeline.is_playing && !timeline.is_scrubbing {
                         // Вычисляем ближайшую монтажную склейку (конец текущего клипа или начало клипа на более приоритетной дорожке V2 > V1)
                         let clip_prio = (clip.track_index, if timeline.selected_clip_id == Some(clip.id) { 0usize } else { 1usize });
@@ -175,11 +172,22 @@ impl ViewerState {
                 video_player.show_blank_frame_with_prefetch(prefetch_src, ctx);
             }
 
-            // Автоматически сохраняем успешно декодированный кадр в Render Cache для мгновенного повторного воспроизведения
+            // Автоматически сохраняем успешно декодированные кадры в Render Cache для мгновенного повторного воспроизведения
             if render_cache.mode != crate::render_cache::RenderCacheMode::None {
                 if let Some(ref img) = video_player.last_displayed_image {
                     render_cache.insert(timeline.playhead_frame, std::sync::Arc::clone(img), current_sig);
                 }
+                if let Some(clip) = active_clip {
+                    for (src_f, img) in video_player.newly_cached_frames.drain(..) {
+                        let tl_f = clip.timeline_frame_from_source(src_f, timeline.fps);
+                        if clip.contains_frame(tl_f) {
+                            let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
+                            render_cache.insert(tl_f, img, sig);
+                        }
+                    }
+                }
+            } else {
+                video_player.newly_cached_frames.clear();
             }
         }
 

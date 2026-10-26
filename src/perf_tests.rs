@@ -1272,3 +1272,69 @@ fn test_render_cache_signature_invalidation_and_lru() {
     assert!(cache.is_cached(4));
 }
 
+#[test]
+fn test_render_cache_cached_intervals_grouping_and_invalidation() {
+    use crate::render_cache::{RenderCacheManager, RenderCacheMode};
+    use std::sync::Arc;
+    use egui::{Color32, ColorImage};
+
+    let cache = RenderCacheManager::new(RenderCacheMode::Smart, 100);
+    let img = Arc::new(ColorImage::new([2, 2], vec![Color32::BLACK; 4]));
+    let sig = 100u64;
+
+    // Вставляем разрозненные кадры: 10, 11, 12 и 20, 21
+    cache.insert(10, Arc::clone(&img), sig);
+    cache.insert(11, Arc::clone(&img), sig);
+    cache.insert(12, Arc::clone(&img), sig);
+    cache.insert(20, Arc::clone(&img), sig);
+    cache.insert(21, Arc::clone(&img), sig);
+
+    let intervals = cache.cached_intervals();
+    assert_eq!(intervals, vec![(10, 12), (20, 21)]);
+
+    // Инвалидируем кадр 11 (разбиение первого интервала)
+    cache.invalidate_range(11, 11);
+    let intervals_split = cache.cached_intervals();
+    assert_eq!(intervals_split, vec![(10, 10), (12, 12), (20, 21)]);
+
+    // Очищаем весь кэш
+    cache.invalidate_all();
+    assert!(cache.cached_intervals().is_empty());
+}
+
+#[test]
+fn test_smart_cache_frame_capture_pipeline() {
+    let mkv = PathBuf::from("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
+    if !mkv.exists() {
+        return;
+    }
+    let ctx = egui::Context::default();
+    let mut player = VideoPlayer::new();
+    assert!(player.open_file(&mkv, &ctx).is_ok());
+
+    // Выполняем точный Seek на кадр 20
+    assert!(player.wait_for_frame(20, &ctx, Duration::from_millis(1500)));
+    assert_eq!(player.last_decoded_frame, 20);
+
+    // Очищаем очередь накопившихся кадров от Seek
+    player.newly_cached_frames.clear();
+
+    // Запускаем воспроизведение нескольких кадров (20..25)
+    for f in 20..=25 {
+        player.update_playback(f, true, &ctx);
+        std::thread::sleep(Duration::from_millis(16));
+    }
+
+    // Проверяем, что воспроизведение декодировало кадры и наполнило newly_cached_frames
+    assert!(
+        !player.newly_cached_frames.is_empty(),
+        "Воспроизведение должно наполнять очередь newly_cached_frames для Render Cache"
+    );
+    let captured_frames: Vec<i64> = player.newly_cached_frames.iter().map(|(f, _)| *f).collect();
+    assert!(
+        captured_frames.iter().any(|&f| f >= 20 && f <= 30),
+        "Захваченные кадры должны содержать кадры воспроизведения: {:?}",
+        captured_frames
+    );
+}
+
