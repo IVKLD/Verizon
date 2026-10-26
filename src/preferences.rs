@@ -216,135 +216,149 @@ impl PreferencesModalState {
                     .inner_margin(egui::Margin::symmetric(14, 10)),
             )
             .show(ctx, |ui| {
-                // 1. Верхний переключатель вкладок: SYSTEM | USER (В точности как в DaVinci Resolve Studio)
-                ui.horizontal(|ui| {
-                    ui.add_space(sidebar_width * 0.45);
+                ui.vertical(|ui| {
+                    // 1. Верхний переключатель вкладок: SYSTEM | USER (В точности как в DaVinci Resolve Studio)
+                    ui.horizontal(|ui| {
+                        ui.add_space(sidebar_width * 0.45);
 
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(0x1b, 0x1c, 0x22))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(0x28, 0x2a, 0x32)))
-                        .corner_radius(CornerRadius::same(4))
-                        .inner_margin(egui::Margin::symmetric(4, 2))
-                        .show(ui, |ui| {
-                            let sys_active = self.current_tab == PrefTab::System;
-                            let user_active = self.current_tab == PrefTab::User;
+                        egui::Frame::new()
+                            .fill(Color32::from_rgb(0x1b, 0x1c, 0x22))
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(0x28, 0x2a, 0x32)))
+                            .corner_radius(CornerRadius::same(4))
+                            .inner_margin(egui::Margin::symmetric(4, 2))
+                            .show(ui, |ui| {
+                                let sys_active = self.current_tab == PrefTab::System;
+                                let user_active = self.current_tab == PrefTab::User;
 
-                            let sys_btn = egui::Button::new(
-                                egui::RichText::new("  System  ")
-                                    .size(12.0)
-                                    .strong()
-                                    .color(if sys_active { Color32::WHITE } else { Color32::from_rgb(0x92, 0x97, 0xa5) }),
-                            )
-                            .fill(if sys_active { accent.gamma_multiply(0.28) } else { Color32::TRANSPARENT })
-                            .stroke(if sys_active { Stroke::new(1.0, accent) } else { Stroke::NONE })
-                            .corner_radius(CornerRadius::same(3));
+                                let sys_btn = egui::Button::new(
+                                    egui::RichText::new("  System  ")
+                                        .size(12.0)
+                                        .strong()
+                                        .color(if sys_active { Color32::WHITE } else { Color32::from_rgb(0x92, 0x97, 0xa5) }),
+                                )
+                                .fill(if sys_active { accent.gamma_multiply(0.28) } else { Color32::TRANSPARENT })
+                                .stroke(if sys_active { Stroke::new(1.0, accent) } else { Stroke::NONE })
+                                .corner_radius(CornerRadius::same(3));
 
-                            if ui.add(sys_btn).clicked() {
-                                self.current_tab = PrefTab::System;
-                                self.current_section = PrefSection::SystemMemoryGpu;
-                            }
+                                if ui.add(sys_btn).clicked() {
+                                    self.current_tab = PrefTab::System;
+                                    self.current_section = PrefSection::SystemMemoryGpu;
+                                }
 
-                            let user_btn = egui::Button::new(
-                                egui::RichText::new("  User  ")
-                                    .size(12.0)
-                                    .strong()
-                                    .color(if user_active { Color32::WHITE } else { Color32::from_rgb(0x92, 0x97, 0xa5) }),
-                            )
-                            .fill(if user_active { accent.gamma_multiply(0.28) } else { Color32::TRANSPARENT })
-                            .stroke(if user_active { Stroke::new(1.0, accent) } else { Stroke::NONE })
-                            .corner_radius(CornerRadius::same(3));
+                                let user_btn = egui::Button::new(
+                                    egui::RichText::new("  User  ")
+                                        .size(12.0)
+                                        .strong()
+                                        .color(if user_active { Color32::WHITE } else { Color32::from_rgb(0x92, 0x97, 0xa5) }),
+                                )
+                                .fill(if user_active { accent.gamma_multiply(0.28) } else { Color32::TRANSPARENT })
+                                .stroke(if user_active { Stroke::new(1.0, accent) } else { Stroke::NONE })
+                                .corner_radius(CornerRadius::same(3));
 
-                            if ui.add(user_btn).clicked() {
-                                self.current_tab = PrefTab::User;
-                                self.current_section = PrefSection::UserAppearance;
-                            }
-                        });
-                });
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(6.0);
-
-                // 2. Основная рабочая область: Слева меню категорий (Sidebar), Справа карточки параметров
-                ui.horizontal(|ui| {
-                    // Левый сайдбар со списком категорий
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(0x17, 0x18, 0x1c))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(0x23, 0x25, 0x2b)))
-                        .corner_radius(CornerRadius::same(4))
-                        .inner_margin(egui::Margin::symmetric(6, 6))
-                        .show(ui, |ui| {
-                            ui.set_width(sidebar_width);
-                            ui.set_height(content_height);
-                            self.render_sidebar(ui);
-                        });
+                                if ui.add(user_btn).clicked() {
+                                    self.current_tab = PrefTab::User;
+                                    self.current_section = PrefSection::UserAppearance;
+                                }
+                            });
+                    });
 
                     ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
 
-                    // Правая область с карточками настроек
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(0x13, 0x14, 0x17))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(0x23, 0x25, 0x2b)))
-                        .corner_radius(CornerRadius::same(4))
-                        .inner_margin(egui::Margin::symmetric(8, 8))
-                        .show(ui, |ui| {
-                            ui.set_width(content_width);
-                            ui.set_height(content_height);
-                            egui::ScrollArea::vertical()
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    self.render_content(ui);
+                    // 2. Основная рабочая область: Слева меню категорий (Sidebar), Справа карточки параметров
+                    ui.horizontal(|ui| {
+                        // Левый сайдбар со списком категорий
+                        egui::Frame::new()
+                            .fill(Color32::from_rgb(0x17, 0x18, 0x1c))
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(0x23, 0x25, 0x2b)))
+                            .corner_radius(CornerRadius::same(4))
+                            .inner_margin(egui::Margin::symmetric(6, 6))
+                            .show(ui, |ui| {
+                                ui.set_min_width(sidebar_width);
+                                ui.set_max_width(sidebar_width);
+                                ui.set_min_height(content_height);
+                                ui.vertical(|ui| {
+                                    self.render_sidebar(ui);
                                 });
-                        });
-                });
+                            });
 
-                // 3. Нижний бар действий: Сброс | Отмена | Сохранить
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(6.0);
+                        ui.add_space(8.0);
 
-                ui.horizontal(|ui| {
-                    let reset_btn = egui::Button::new(
-                        egui::RichText::new("⟲  Reset to Defaults")
-                            .size(11.0)
-                            .color(Color32::from_rgb(0xa2, 0xa8, 0xb6)),
-                    )
-                    .fill(Color32::from_rgb(0x1e, 0x20, 0x25))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(0x2b, 0x2e, 0x36)));
-
-                    if ui.add(reset_btn).clicked() {
-                        self.draft = UserPreferences::default();
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let save_btn = egui::Button::new(
-                            egui::RichText::new("  Save  ")
-                                .size(12.0)
-                                .color(Color32::WHITE)
-                                .strong(),
-                        )
-                        .fill(accent)
-                        .stroke(Stroke::new(1.0, accent))
-                        .min_size(Vec2::new(80.0, 26.0));
-
-                        if ui.add(save_btn).clicked() {
-                            apply_result = Some(self.draft.clone());
-                            should_close = true;
-                        }
-
-                        let cancel_btn = egui::Button::new(
-                            egui::RichText::new("  Cancel  ")
-                                .size(11.5)
-                                .color(Color32::from_rgb(0xd5, 0xda, 0xe5)),
-                        )
-                        .fill(Color32::from_rgb(0x22, 0x24, 0x2a))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(0x2f, 0x32, 0x3b)))
-                        .min_size(Vec2::new(70.0, 26.0));
-
-                        if ui.add(cancel_btn).clicked() {
-                            should_close = true;
-                        }
+                        // Правая область с карточками настроек
+                        egui::Frame::new()
+                            .fill(Color32::from_rgb(0x13, 0x14, 0x17))
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(0x23, 0x25, 0x2b)))
+                            .corner_radius(CornerRadius::same(4))
+                            .inner_margin(egui::Margin::symmetric(8, 8))
+                            .show(ui, |ui| {
+                                ui.set_min_width(content_width);
+                                ui.set_max_width(content_width);
+                                ui.set_min_height(content_height);
+                                egui::ScrollArea::vertical()
+                                    .auto_shrink([false, false])
+                                    .max_height(content_height)
+                                    .show(ui, |ui| {
+                                        ui.set_width(content_width - 16.0);
+                                        ui.vertical(|ui| {
+                                            self.render_content(ui);
+                                        });
+                                    });
+                            });
                     });
+
+                    // 3. Нижний бар действий: Сброс | Отмена | Сохранить
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    ui.horizontal(|ui| {
+                        let reset_btn = egui::Button::new(
+                            egui::RichText::new("⟲  Reset to Defaults")
+                                .size(11.0)
+                                .color(Color32::from_rgb(0xa2, 0xa8, 0xb6)),
+                        )
+                        .fill(Color32::from_rgb(0x1e, 0x20, 0x25))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(0x2b, 0x2e, 0x36)));
+
+                        if ui.add(reset_btn).clicked() {
+                            self.draft = UserPreferences::default();
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let save_btn = egui::Button::new(
+                                egui::RichText::new("  Save  ")
+                                    .size(12.0)
+                                    .color(Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(accent)
+                            .stroke(Stroke::new(1.0, accent))
+                            .min_size(Vec2::new(80.0, 26.0));
+
+                            if ui.add(save_btn).clicked() {
+                                apply_result = Some(self.draft.clone());
+                                should_close = true;
+                            }
+
+                            let cancel_btn = egui::Button::new(
+                                egui::RichText::new("  Cancel  ")
+                                    .size(11.5)
+                                    .color(Color32::from_rgb(0xd5, 0xda, 0xe5)),
+                            )
+                            .fill(Color32::from_rgb(0x22, 0x24, 0x2a))
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(0x2f, 0x32, 0x3b)))
+                            .min_size(Vec2::new(70.0, 26.0));
+
+                            if ui.add(cancel_btn).clicked() {
+                                should_close = true;
+                            }
+                        });
+                    });
+
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        should_close = true;
+                    }
                 });
             });
 
@@ -365,24 +379,26 @@ fn pref_card<R>(ui: &mut Ui, title: &str, subtitle: Option<&str>, add_contents: 
         .inner_margin(egui::Margin::symmetric(14, 10));
 
     frame.show(ui, |ui| {
-        ui.label(
-            egui::RichText::new(title)
-                .size(11.5)
-                .strong()
-                .color(Color32::from_rgb(0xec, 0xf0, 0xf8)),
-        );
-        if let Some(sub) = subtitle {
-            ui.add_space(2.0);
+        ui.vertical(|ui| {
             ui.label(
-                egui::RichText::new(sub)
-                    .size(10.0)
-                    .color(Color32::from_rgb(0x84, 0x8a, 0x99)),
+                egui::RichText::new(title)
+                    .size(11.5)
+                    .strong()
+                    .color(Color32::from_rgb(0xec, 0xf0, 0xf8)),
             );
-        }
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(6.0);
-        add_contents(ui)
+            if let Some(sub) = subtitle {
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(sub)
+                        .size(10.0)
+                        .color(Color32::from_rgb(0x84, 0x8a, 0x99)),
+                );
+            }
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(6.0);
+            add_contents(ui)
+        }).inner
     }).inner
 }
 
@@ -584,46 +600,48 @@ impl PreferencesModalState {
                 .corner_radius(CornerRadius::same(3))
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.set_min_width(50.0);
-                        ui.label(egui::RichText::new("ID").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                        ui.add_space(10.0);
-                        ui.set_min_width(220.0);
-                        ui.label(egui::RichText::new("Модель устройства").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                        ui.set_min_width(70.0);
-                        ui.label(egui::RichText::new("VRAM").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                        ui.set_min_width(90.0);
-                        ui.label(egui::RichText::new("Шина / DRM").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                        ui.label(egui::RichText::new("Статус").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                    });
-                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.set_min_width(50.0);
+                            ui.label(egui::RichText::new("ID").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
+                            ui.add_space(10.0);
+                            ui.set_min_width(220.0);
+                            ui.label(egui::RichText::new("Модель устройства").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
+                            ui.set_min_width(70.0);
+                            ui.label(egui::RichText::new("VRAM").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
+                            ui.set_min_width(90.0);
+                            ui.label(egui::RichText::new("Шина / DRM").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
+                            ui.label(egui::RichText::new("Статус").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
+                        });
+                        ui.separator();
 
-                    // GPU 0
-                    ui.horizontal(|ui| {
-                        ui.set_min_width(50.0);
-                        ui.label("GPU 0");
-                        ui.add_space(10.0);
-                        ui.set_min_width(220.0);
-                        ui.label("AMD Radeon RX 9070 XT (Navi 48)");
-                        ui.set_min_width(70.0);
-                        ui.label("16 GB");
-                        ui.set_min_width(90.0);
-                        ui.monospace("renderD129");
-                        ui.label(egui::RichText::new("● Active (Primary)").color(Color32::from_rgb(0x40, 0xd0, 0x70)));
-                    });
+                        // GPU 0
+                        ui.horizontal(|ui| {
+                            ui.set_min_width(50.0);
+                            ui.label("GPU 0");
+                            ui.add_space(10.0);
+                            ui.set_min_width(220.0);
+                            ui.label("AMD Radeon RX 9070 XT (Navi 48)");
+                            ui.set_min_width(70.0);
+                            ui.label("16 GB");
+                            ui.set_min_width(90.0);
+                            ui.monospace("renderD129");
+                            ui.label(egui::RichText::new("● Active (Primary)").color(Color32::from_rgb(0x40, 0xd0, 0x70)));
+                        });
 
-                    // GPU 1
-                    ui.horizontal(|ui| {
-                        ui.set_min_width(50.0);
-                        ui.label("GPU 1");
-                        ui.add_space(10.0);
-                        ui.set_min_width(220.0);
-                        ui.label("AMD Radeon 780M Graphics");
-                        ui.set_min_width(70.0);
-                        ui.label("2 GB");
-                        ui.set_min_width(90.0);
-                        ui.monospace("renderD128");
-                        ui.label(egui::RichText::new("○ Available (iGPU)").color(Color32::from_rgb(0x82, 0x88, 0x96)));
+                        // GPU 1
+                        ui.horizontal(|ui| {
+                            ui.set_min_width(50.0);
+                            ui.label("GPU 1");
+                            ui.add_space(10.0);
+                            ui.set_min_width(220.0);
+                            ui.label("AMD Radeon 780M Graphics");
+                            ui.set_min_width(70.0);
+                            ui.label("2 GB");
+                            ui.set_min_width(90.0);
+                            ui.monospace("renderD128");
+                            ui.label(egui::RichText::new("○ Available (iGPU)").color(Color32::from_rgb(0x82, 0x88, 0x96)));
+                        });
                     });
                 });
         });
@@ -638,45 +656,47 @@ impl PreferencesModalState {
                 .corner_radius(CornerRadius::same(3))
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.set_min_width(240.0);
-                        ui.label(egui::RichText::new("Точка монтирования / Путь").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                        ui.set_min_width(120.0);
-                        ui.label(egui::RichText::new("Роль тома").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                        ui.set_min_width(110.0);
-                        ui.label(egui::RichText::new("Свободно").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                        ui.label(egui::RichText::new("Действия").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                    });
-                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.set_min_width(240.0);
+                            ui.label(egui::RichText::new("Точка монтирования / Путь").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
+                            ui.set_min_width(120.0);
+                            ui.label(egui::RichText::new("Роль тома").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
+                            ui.set_min_width(110.0);
+                            ui.label(egui::RichText::new("Свободно").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
+                            ui.label(egui::RichText::new("Действия").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
+                        });
+                        ui.separator();
 
-                    // Строка 1: Кэш таймлайна
-                    ui.horizontal(|ui| {
-                        ui.set_min_width(240.0);
-                        let path_display = self.draft.cache_directory.to_string_lossy().to_string();
-                        ui.label(egui::RichText::new(path_display).monospace().size(11.0));
-                        ui.set_min_width(120.0);
-                        ui.label(egui::RichText::new("Scratch & Cache").color(Color32::from_rgb(0x56, 0xad, 0xee)));
-                        ui.set_min_width(110.0);
-                        ui.label("428.5 GB");
+                        // Строка 1: Кэш таймлайна
+                        ui.horizontal(|ui| {
+                            ui.set_min_width(240.0);
+                            let path_display = self.draft.cache_directory.to_string_lossy().to_string();
+                            ui.label(egui::RichText::new(path_display).monospace().size(11.0));
+                            ui.set_min_width(120.0);
+                            ui.label(egui::RichText::new("Scratch & Cache").color(Color32::from_rgb(0x56, 0xad, 0xee)));
+                            ui.set_min_width(110.0);
+                            ui.label("428.5 GB");
 
-                        if ui.button("🗑 Purge").clicked() {
-                            if let Ok(entries) = std::fs::read_dir(&self.draft.cache_directory) {
-                                for e in entries.flatten() {
-                                    let _ = std::fs::remove_file(e.path());
+                            if ui.button("🗑 Purge").clicked() {
+                                if let Ok(entries) = std::fs::read_dir(&self.draft.cache_directory) {
+                                    for e in entries.flatten() {
+                                        let _ = std::fs::remove_file(e.path());
+                                    }
                                 }
                             }
-                        }
-                    });
+                        });
 
-                    // Строка 2: Проектные диски
-                    ui.horizontal(|ui| {
-                        ui.set_min_width(240.0);
-                        ui.label(egui::RichText::new("/mnt/projects-and-games").monospace().size(11.0));
-                        ui.set_min_width(120.0);
-                        ui.label("Media Storage");
-                        ui.set_min_width(110.0);
-                        ui.label("1.8 TB");
-                        ui.label(egui::RichText::new("● Mounted").color(Color32::from_rgb(0x40, 0xd0, 0x70)));
+                        // Строка 2: Проектные диски
+                        ui.horizontal(|ui| {
+                            ui.set_min_width(240.0);
+                            ui.label(egui::RichText::new("/mnt/projects-and-games").monospace().size(11.0));
+                            ui.set_min_width(120.0);
+                            ui.label("Media Storage");
+                            ui.set_min_width(110.0);
+                            ui.label("1.8 TB");
+                            ui.label(egui::RichText::new("● Mounted").color(Color32::from_rgb(0x40, 0xd0, 0x70)));
+                        });
                     });
                 });
 
@@ -757,35 +777,37 @@ impl PreferencesModalState {
                 .corner_radius(CornerRadius::same(3))
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.set_min_width(120.0);
-                        ui.label(egui::RichText::new("Канал микшера").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                        ui.set_min_width(130.0);
-                        ui.label(egui::RichText::new("Динамик монитора").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                        ui.set_min_width(160.0);
-                        ui.label(egui::RichText::new("Порт PipeWire").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                        ui.label(egui::RichText::new("Статус").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                    });
-                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.set_min_width(120.0);
+                            ui.label(egui::RichText::new("Канал микшера").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
+                            ui.set_min_width(130.0);
+                            ui.label(egui::RichText::new("Динамик монитора").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
+                            ui.set_min_width(160.0);
+                            ui.label(egui::RichText::new("Порт PipeWire").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
+                            ui.label(egui::RichText::new("Статус").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
+                        });
+                        ui.separator();
 
-                    ui.horizontal(|ui| {
-                        ui.set_min_width(120.0);
-                        ui.label("Channel 1 (Left)");
-                        ui.set_min_width(130.0);
-                        ui.label("Left Front");
-                        ui.set_min_width(160.0);
-                        ui.monospace("playback_FL");
-                        ui.label(egui::RichText::new("● Connected").color(Color32::from_rgb(0x40, 0xd0, 0x70)));
-                    });
+                        ui.horizontal(|ui| {
+                            ui.set_min_width(120.0);
+                            ui.label("Channel 1 (Left)");
+                            ui.set_min_width(130.0);
+                            ui.label("Left Front");
+                            ui.set_min_width(160.0);
+                            ui.monospace("playback_FL");
+                            ui.label(egui::RichText::new("● Connected").color(Color32::from_rgb(0x40, 0xd0, 0x70)));
+                        });
 
-                    ui.horizontal(|ui| {
-                        ui.set_min_width(120.0);
-                        ui.label("Channel 2 (Right)");
-                        ui.set_min_width(130.0);
-                        ui.label("Right Front");
-                        ui.set_min_width(160.0);
-                        ui.monospace("playback_FR");
-                        ui.label(egui::RichText::new("● Connected").color(Color32::from_rgb(0x40, 0xd0, 0x70)));
+                        ui.horizontal(|ui| {
+                            ui.set_min_width(120.0);
+                            ui.label("Channel 2 (Right)");
+                            ui.set_min_width(130.0);
+                            ui.label("Right Front");
+                            ui.set_min_width(160.0);
+                            ui.monospace("playback_FR");
+                            ui.label(egui::RichText::new("● Connected").color(Color32::from_rgb(0x40, 0xd0, 0x70)));
+                        });
                     });
                 });
 
