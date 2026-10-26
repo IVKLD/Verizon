@@ -1220,6 +1220,7 @@ fn test_render_cache_signature_invalidation_and_lru() {
     use std::sync::Arc;
 
     let mut timeline = TimelineState::new_empty();
+    timeline.fps = 60;
     let clip = Clip {
         id: 1,
         name: "TestClip".to_string(),
@@ -1653,6 +1654,7 @@ fn test_smart_cache_prioritizes_frames_around_playhead() {
     use crate::render_cache::{RenderCacheManager, RenderCacheMode};
 
     let mut timeline = TimelineState::new_empty();
+    timeline.fps = 60;
     let clip = Clip {
         id: 1,
         name: "LongClip".to_string(),
@@ -1700,6 +1702,7 @@ fn test_interactive_transform_modifies_clip_position_and_zoom() {
     use crate::timeline::{Clip, TimelineState};
 
     let mut timeline = TimelineState::new_empty();
+    timeline.fps = 60;
     let clip = Clip {
         id: 42,
         name: "TransformTest".to_string(),
@@ -1907,6 +1910,7 @@ fn test_playback_over_red_zone_creates_and_preserves_cache_without_audio_invalid
     use crate::render_cache::{RenderCacheManager, RenderCacheMode};
 
     let mut timeline = TimelineState::new_empty();
+    timeline.fps = 60;
     let clip = Clip {
         id: 1,
         name: "TestClip".to_string(),
@@ -1957,6 +1961,174 @@ fn test_playback_over_red_zone_creates_and_preserves_cache_without_audio_invalid
         let sig = RenderCacheManager::compute_frame_signature(&timeline, f);
         assert!(cache.get(f, sig).is_some(), "Кадр {} должен мгновенно читаться из кэша", f);
     }
+}
+
+#[test]
+fn test_render_cache_multi_timeline_frames_per_source_frame_cached() {
+    use crate::timeline::{Clip, TimelineState};
+    use crate::render_cache::{RenderCacheManager, RenderCacheMode};
+
+    // Таймлайн 60 FPS, видеоклип 30 FPS (каждый кадр видео соответствует 2 кадрам таймлайна)
+    let mut timeline = TimelineState::new_empty();
+    timeline.fps = 60;
+    let clip = Clip {
+        id: 1,
+        name: "30fps_video".to_string(),
+        track_index: 0,
+        start_frame: 0,
+        duration_frames: 60, // 1 секунда = 60 кадров на таймлайне, 30 кадров в исходнике
+        is_audio: false,
+        source_path: Some(std::path::PathBuf::from("/tmp/video30.mp4")),
+        source_in_secs: 0.0,
+        source_fps: 30.0,
+        speed: 1.0,
+        ..Default::default()
+    };
+    timeline.clips.push(clip.clone());
+
+    let cache = RenderCacheManager::new(RenderCacheMode::Smart, 200);
+
+    // Имитируем декодирование кадров 0..30 из исходника
+    for src_f in 0..30 {
+        let dummy_img = std::sync::Arc::new(egui::ColorImage::example());
+        let base_tl = clip.timeline_frame_from_source(src_f, timeline.fps);
+        let search_range = ((timeline.fps as f64 / clip.source_fps.max(1.0) / clip.speed.abs().max(0.01)).ceil() as i64).max(1);
+        for tl_f in (base_tl - search_range)..=(base_tl + search_range) {
+            if clip.contains_frame(tl_f) && clip.source_frame_from_timeline(tl_f, timeline.fps) == src_f {
+                let sig = RenderCacheManager::compute_frame_signature(&timeline, tl_f);
+                cache.insert(tl_f, std::sync::Arc::clone(&dummy_img), sig);
+            }
+        }
+    }
+
+    // Проверяем, что ВСЕ 60 кадров таймлайна (0..59) закэшированы без единого пропуска!
+    for tl_f in 0..60 {
+        assert!(
+            cache.is_cached(tl_f),
+            "Кадр таймлайна {} обязан быть закэширован при 60fps таймлайне и 30fps клипе!",
+            tl_f
+        );
+    }
+    let intervals = cache.cached_intervals();
+    assert_eq!(intervals, vec![(0, 59)], "Все 60 кадров должны образовать единый непрерывный синий сегмент!");
+}
+
+#[test]
+fn test_render_cache_clip_tail_extension_and_hold_frame() {
+    use crate::timeline::{Clip, TimelineState};
+    use crate::render_cache::{RenderCacheManager, RenderCacheMode};
+
+    // Таймлайн 30 FPS, клип 30 кадров (1.0 сек), но реальное видео содержит только 15 кадров (0.5 сек)
+    // Имитация контейнера, где аудио длиннее видео на 0.5 сек
+    let mut timeline = TimelineState::new_empty();
+    timeline.fps = 30;
+    let clip = Clip {
+        id: 1,
+        name: "TailTestClip".to_string(),
+        track_index: 0,
+        start_frame: 0,
+        duration_frames: 30, // 30 кадров на таймлайне
+        is_audio: false,
+        source_path: Some(std::path::PathBuf::from("/tmp/video_tail.mp4")),
+        source_in_secs: 0.0,
+        source_fps: 30.0,
+        speed: 1.0,
+        ..Default::default()
+    };
+    timeline.clips.push(clip.clone());
+
+    let cache = RenderCacheManager::new(RenderCacheMode::Smart, 200);
+
+    // Собираем uncached_batch для BackgroundCacheEngine
+    let mut uncached_batch = Vec::new();
+    for tl_f in clip.start_frame..clip.end_frame() {
+        let src_f = clip.source_frame_from_timeline(tl_f, timeline.fps);
+        let sig = RenderCacheManager::compute_frame_signature(&timeline, tl_f);
+        uncached_batch.push((src_f, tl_f, sig));
+    }
+    assert_eq!(uncached_batch.len(), 30);
+
+    // Имитируем логику run_cache_worker с HashMap<i64, Vec<(i64, u64)>> и Hold Last Frame
+    let mut target_map: std::collections::HashMap<i64, Vec<(i64, u64)>> = std::collections::HashMap::new();
+    for (src_f, tl_f, sig) in uncached_batch {
+        target_map.entry(src_f).or_default().push((tl_f, sig));
+    }
+
+    let mut last_valid_img = None;
+    // Видео реально отдает только кадры 0..15 (0.5 сек)
+    for src_f in 0..15 {
+        let dummy_img = std::sync::Arc::new(egui::ColorImage::example());
+        last_valid_img = Some(std::sync::Arc::clone(&dummy_img));
+        if let Some(tl_targets) = target_map.remove(&src_f) {
+            for (tl_f, sig) in tl_targets {
+                cache.insert(tl_f, std::sync::Arc::clone(&dummy_img), sig);
+            }
+        }
+    }
+
+    // Видео поток закончился (EOF), но в target_map остались кадры 15..30 (0.5 сек)
+    assert!(!target_map.is_empty(), "В target_map должны остаться кадры хвоста контейнера");
+    if let Some(ref last_img) = last_valid_img {
+        for (_, tl_targets) in target_map.drain() {
+            for (tl_f, sig) in tl_targets {
+                cache.insert(tl_f, std::sync::Arc::clone(last_img), sig);
+            }
+        }
+    }
+
+    // Проверяем, что ВСЕ 30 кадров клипа закэшированы (100% синяя полоса, 0% красного сектора)
+    for tl_f in 0..30 {
+        assert!(
+            cache.is_cached(tl_f),
+            "Кадр {} обязан быть закэширован (включая полусекундный хвост клипа)!",
+            tl_f
+        );
+    }
+    let intervals = cache.cached_intervals();
+    assert_eq!(intervals, vec![(0, 29)], "Клип должен быть полностью синим от 0 до 29 кадра!");
+}
+
+#[test]
+fn test_media_asset_and_clip_separate_video_and_audio_duration() {
+    use crate::media_pool::MediaAsset;
+    use crate::timeline::TimelineState;
+
+    let mut timeline = TimelineState::new_empty();
+    timeline.fps = 30;
+
+    // Медиафайл, где видео длится 10.0 сек (300 кадров), а аудио/контейнер длится 10.5 сек (315 кадров)
+    let asset = MediaAsset {
+        id: 1,
+        filename: "obs_recording.mp4".to_string(),
+        path: Some(std::path::PathBuf::from("/tmp/obs_recording.mp4")),
+        resolution: "1920x1080".to_string(),
+        fps: "30.00 fps".to_string(),
+        fps_num: 30.0,
+        duration: "00:00:10:15".to_string(),
+        duration_secs: 10.0,
+        video_duration_secs: 10.0,
+        audio_duration_secs: 10.5,
+        summary: "1920x1080 | 00:00:10:15".to_string(),
+        has_video: true,
+        has_audio: true,
+        audio_tracks_count: 1,
+        is_audio_only: false,
+    };
+
+    let mut pool = crate::media_pool::MediaPoolState::new_demo();
+    pool.assets.push(asset);
+    pool.selected_asset_id = Some(1);
+
+    pool.insert_selected_to_timeline(&mut timeline);
+
+    assert_eq!(timeline.clips.len(), 2, "Должно быть создано 2 клипа: видео и аудио");
+    let v_clip = timeline.clips.iter().find(|c| !c.is_audio).unwrap();
+    let a_clip = timeline.clips.iter().find(|c| c.is_audio).unwrap();
+
+    // Видеоклип обязан иметь ровно 300 кадров (10.0 * 30), а НЕ 315!
+    assert_eq!(v_clip.duration_frames, 300, "Видеоклип должен длиться ровно 300 кадров!");
+    // Аудиоклип может длиться 315 кадров (10.5 * 30)
+    assert_eq!(a_clip.duration_frames, 315, "Аудиоклип должен длиться 315 кадров!");
 }
 
 

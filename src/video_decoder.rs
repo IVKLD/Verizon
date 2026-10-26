@@ -236,8 +236,29 @@ impl VideoPlayer {
             fps
         };
 
-        let duration_secs = ictx.duration() as f64 / f64::from(ffmpeg_next::ffi::AV_TIME_BASE);
-        let total_frames = if duration_secs > 0.0 {
+        let tb = input_stream.time_base();
+        let tb_f = tb.numerator() as f64 / tb.denominator() as f64;
+        let nb_frames = input_stream.frames();
+        let stream_dur = input_stream.duration();
+        let mut v_dur_exact = 0.0f64;
+        if nb_frames > 0 && fps > 0.0 {
+            v_dur_exact = nb_frames as f64 / fps;
+        } else if stream_dur > 0 && tb_f > 0.0 {
+            v_dur_exact = stream_dur as f64 * tb_f;
+        }
+
+        let container_dur_secs = ictx.duration() as f64 / f64::from(ffmpeg_next::ffi::AV_TIME_BASE);
+        let duration_secs = if v_dur_exact > 0.0 {
+            v_dur_exact
+        } else if container_dur_secs > 0.0 {
+            container_dur_secs
+        } else {
+            10.0
+        };
+
+        let total_frames = if nb_frames > 0 {
+            nb_frames
+        } else if duration_secs > 0.0 {
             (duration_secs * fps).round() as i64
         } else {
             1000
@@ -961,6 +982,12 @@ impl VideoPlayer {
     pub fn seek_and_decode(&mut self, target_frame: i64, ctx: &Context) {
         self.poll_frames(ctx);
 
+        let target_frame = if self.total_frames > 0 {
+            target_frame.clamp(0, self.total_frames - 1)
+        } else {
+            target_frame.max(0)
+        };
+
         if target_frame == self.last_exact_frame && target_frame == self.last_decoded_frame && self.texture.is_some() {
             return;
         }
@@ -1018,6 +1045,11 @@ impl VideoPlayer {
     /// Принудительный запрос кадра (когда скраббинг завершен)
     pub fn force_seek_frame(&mut self, target_frame: i64, ctx: &Context) {
         self.poll_frames(ctx);
+        let target_frame = if self.total_frames > 0 {
+            target_frame.clamp(0, self.total_frames - 1)
+        } else {
+            target_frame.max(0)
+        };
         if target_frame == self.last_exact_frame && target_frame == self.last_decoded_frame && self.texture.is_some() {
             return;
         }
@@ -1468,14 +1500,7 @@ impl VideoPlayer {
                             }
 
                             if st.index() == stream_idx {
-                                if waiting_for_keyframe {
-                                    if packet.is_key() {
-                                        waiting_for_keyframe = false;
-                                    } else {
-                                        continue;
-                                    }
-                                }
-
+                                waiting_for_keyframe = false;
                                 if video_decoder.send_packet(&packet).is_ok() {
                                     while video_decoder.receive_frame(&mut decoded_frame).is_ok() {
                                         let pts = decoded_frame.pts().unwrap_or(current_pts + frame_duration_pts);
@@ -1570,6 +1595,41 @@ impl VideoPlayer {
                                     h,
                                     &mut rgba_buffer,
                                 );
+                            }
+                            if found_image.is_none() && !last_drain_frame_ok && target_pts > 0 {
+                                // Если seek в самый конец не выдал пакетов (EOF), отматываемся назад на GOP и дренируем до конца файла
+                                let fallback_pts = (target_pts - gop_max_pts.max(30)).max(0);
+                                unsafe {
+                                    ffmpeg_next::ffi::av_seek_frame(
+                                        ictx.as_mut_ptr(),
+                                        stream_idx as i32,
+                                        fallback_pts,
+                                        ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
+                                    );
+                                }
+                                video_decoder.flush();
+                                for (st, packet) in ictx.packets() {
+                                    if st.index() == stream_idx && video_decoder.send_packet(&packet).is_ok() {
+                                        while video_decoder.receive_frame(&mut decoded_frame).is_ok() {
+                                            last_drain_frame_ok = true;
+                                        }
+                                    }
+                                }
+                                let _ = video_decoder.send_eof();
+                                while video_decoder.receive_frame(&mut decoded_frame).is_ok() {
+                                    last_drain_frame_ok = true;
+                                }
+                                if last_drain_frame_ok {
+                                    found_image = Self::scale_and_copy_frame(
+                                        &mut scaler,
+                                        &decoded_frame,
+                                        &mut sw_frame,
+                                        &mut rgba_frame,
+                                        w,
+                                        h,
+                                        &mut rgba_buffer,
+                                    );
+                                }
                             }
                             // После send_eof декодер нужно сбросить перед следующими пакетами
                             video_decoder.flush();
@@ -1743,14 +1803,7 @@ impl VideoPlayer {
                         }
 
                         if st.index() == stream_idx {
-                            if waiting_for_keyframe {
-                                if packet.is_key() {
-                                    waiting_for_keyframe = false;
-                                } else {
-                                    continue;
-                                }
-                            }
-
+                            waiting_for_keyframe = false;
                             if video_decoder.send_packet(&packet).is_ok() {
                                 while video_decoder.receive_frame(&mut decoded_frame).is_ok() {
                                     let pts = decoded_frame.pts().unwrap_or(current_pts + frame_duration_pts);

@@ -385,26 +385,19 @@ impl BackgroundCacheEngine {
         let mut decoded_frame = ffmpeg_next::util::frame::Video::empty();
         let mut rgb_frame = ffmpeg_next::util::frame::Video::empty();
 
-        let mut target_map: HashMap<i64, (i64, u64)> = HashMap::with_capacity(frames.len());
+        let mut target_map: HashMap<i64, Vec<(i64, u64)>> = HashMap::with_capacity(frames.len());
         for (src_f, tl_f, sig) in frames {
-            target_map.insert(src_f, (tl_f, sig));
+            target_map.entry(src_f).or_default().push((tl_f, sig));
         }
 
         let mut cached_count = 0;
-        let mut waiting_for_keyframe = true;
+        let mut last_valid_img: Option<Arc<ColorImage>> = None;
         for (stream, packet) in ictx.packets() {
             if cancel_flag.load(Ordering::Acquire) {
                 break;
             }
             if stream.index() != stream_idx {
                 continue;
-            }
-            if waiting_for_keyframe {
-                if packet.is_key() {
-                    waiting_for_keyframe = false;
-                } else {
-                    continue;
-                }
             }
 
             if decoder.send_packet(&packet).is_ok() {
@@ -433,7 +426,7 @@ impl BackgroundCacheEngine {
                     };
 
                     if let Some(key) = matched_key {
-                        let (tl_f, sig) = target_map.remove(&key).unwrap();
+                        let tl_targets = target_map.remove(&key).unwrap();
                         if scaler.run(&decoded_frame, &mut rgb_frame).is_ok() {
                             let data = rgb_frame.data(0);
                             let stride = rgb_frame.stride(0);
@@ -449,8 +442,12 @@ impl BackgroundCacheEngine {
                                 [scaled_w as usize, scaled_h as usize],
                                 &pixels,
                             );
-                            cache.insert(tl_f, Arc::new(color_img), sig);
-                            cached_count += 1;
+                            let arc_img = Arc::new(color_img);
+                            last_valid_img = Some(Arc::clone(&arc_img));
+                            for (tl_f, sig) in tl_targets {
+                                cache.insert(tl_f, Arc::clone(&arc_img), sig);
+                                cached_count += 1;
+                            }
                             if cached_count % 2 == 0 || target_map.is_empty() {
                                 egui_ctx.request_repaint();
                             }
@@ -493,7 +490,7 @@ impl BackgroundCacheEngine {
                 };
 
                 if let Some(key) = matched_key {
-                    let (tl_f, sig) = target_map.remove(&key).unwrap();
+                    let tl_targets = target_map.remove(&key).unwrap();
                     if scaler.run(&decoded_frame, &mut rgb_frame).is_ok() {
                         let data = rgb_frame.data(0);
                         let stride = rgb_frame.stride(0);
@@ -509,13 +506,31 @@ impl BackgroundCacheEngine {
                             [scaled_w as usize, scaled_h as usize],
                             &pixels,
                         );
-                        cache.insert(tl_f, Arc::new(color_img), sig);
-                        cached_count += 1;
+                        let arc_img = Arc::new(color_img);
+                        last_valid_img = Some(Arc::clone(&arc_img));
+                        for (tl_f, sig) in tl_targets {
+                            cache.insert(tl_f, Arc::clone(&arc_img), sig);
+                            cached_count += 1;
+                        }
                     }
                 }
 
                 if target_map.is_empty() {
                     break;
+                }
+            }
+
+            // Если декодер закончил отдавать кадры (EOF), а в target_map еще остались хвостовые кадры клипа
+            // (например, при расхождении длительностей аудио и видео в контейнере):
+            // заполняем их последним валидным кадром (Hold Frame), полностью устраняя красную зону!
+            if !target_map.is_empty() && !cancel_flag.load(Ordering::Acquire) {
+                if let Some(ref last_img) = last_valid_img {
+                    for (_, tl_targets) in target_map.drain() {
+                        for (tl_f, sig) in tl_targets {
+                            cache.insert(tl_f, Arc::clone(last_img), sig);
+                            cached_count += 1;
+                        }
+                    }
                 }
             }
         }

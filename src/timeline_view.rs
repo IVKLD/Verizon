@@ -558,8 +558,10 @@ impl TimelineView {
                             timeline.fps = media.source_fps.round().clamp(1.0, 240.0) as u32;
                         }
 
-                        let dur_from_secs = (media.duration_secs * timeline.fps as f64).round().max(1.0) as i64;
-                        let actual_dur_frames = if dur_from_secs > 0 { dur_from_secs } else { media.duration_frames };
+                        let v_dur_from_secs = (media.video_duration_secs * timeline.fps as f64).round().max(1.0) as i64;
+                        let a_dur_from_secs = (media.audio_duration_secs * timeline.fps as f64).round().max(1.0) as i64;
+                        let v_actual_dur = if v_dur_from_secs > 0 { v_dur_from_secs } else { media.duration_frames };
+                        let a_actual_dur = if a_dur_from_secs > 0 { a_dur_from_secs } else { media.duration_frames };
 
                         let num_audio = media.audio_tracks_count.max(if media.has_audio { 1 } else { 0 });
                         let link_id = if media.has_video && num_audio > 0 {
@@ -578,7 +580,7 @@ impl TimelineView {
                                 name: media.name.clone(),
                                 track_index: video_track,
                                 start_frame: drop_frame,
-                                duration_frames: actual_dur_frames,
+                                duration_frames: v_actual_dur,
                                 is_audio: false,
                                 color: ResolveColors::VIDEO_CLIP,
                                 source_path: media.path.clone(),
@@ -616,7 +618,7 @@ impl TimelineView {
                                     name: track_name,
                                     track_index: track_idx,
                                     start_frame: drop_frame,
-                                    duration_frames: actual_dur_frames,
+                                    duration_frames: a_actual_dur,
                                     is_audio: true,
                                     color: ResolveColors::AUDIO_CLIP,
                                     source_path: media.path.clone(),
@@ -644,7 +646,7 @@ impl TimelineView {
                                 name: media.name.clone(),
                                 track_index: target_track_idx,
                                 start_frame: drop_frame,
-                                duration_frames: actual_dur_frames,
+                                duration_frames: if media.is_audio { a_actual_dur } else { v_actual_dur },
                                 is_audio: media.is_audio,
                                 color: if media.is_audio {
                                     ResolveColors::AUDIO_CLIP

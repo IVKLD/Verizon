@@ -13,6 +13,8 @@ pub struct MediaAsset {
     pub fps_num: f64,
     pub duration: String,
     pub duration_secs: f64,
+    pub video_duration_secs: f64,
+    pub audio_duration_secs: f64,
     pub summary: String,
     pub has_video: bool,
     pub has_audio: bool,
@@ -93,6 +95,9 @@ impl MediaPoolState {
         let mut has_audio = is_audio_ext;
         let mut audio_tracks_count = if is_audio_ext { 1 } else { 0 };
 
+        let mut video_duration_secs = 10.0;
+        let mut audio_duration_secs = 10.0;
+
         if let Ok(ictx) = ffmpeg_next::format::input(path) {
             let v_stream = ictx.streams().best(ffmpeg_next::media::Type::Video);
             let a_stream = ictx.streams().best(ffmpeg_next::media::Type::Audio);
@@ -103,6 +108,9 @@ impl MediaPoolState {
                 .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Audio)
                 .count();
             has_audio = audio_tracks_count > 0 || a_stream.is_some();
+
+            let mut v_dur_exact = 0.0f64;
+            let mut a_dur_exact = 0.0f64;
 
             if let Some(stream) = v_stream {
                 let (w, h) = unsafe {
@@ -124,7 +132,18 @@ impl MediaPoolState {
                     fps_num = f;
                     fps_str = format!("{:.2} fps", f);
                 }
-            } else if let Some(stream) = a_stream {
+
+                let tb = stream.time_base();
+                let tb_f = tb.numerator() as f64 / tb.denominator() as f64;
+                let nb_frames = stream.frames();
+                let s_dur = stream.duration();
+                if nb_frames > 0 && fps_num > 0.0 {
+                    v_dur_exact = nb_frames as f64 / fps_num;
+                } else if s_dur > 0 && tb_f > 0.0 {
+                    v_dur_exact = s_dur as f64 * tb_f;
+                }
+            }
+            if let Some(stream) = a_stream {
                 let (sample_rate, channels) = unsafe {
                     let ptr = stream.parameters().as_ptr();
                     ((*ptr).sample_rate, (*ptr).ch_layout.nb_channels)
@@ -136,9 +155,31 @@ impl MediaPoolState {
                         res = format!("{} Hz {}ch", a_dec.rate(), a_dec.channels());
                     }
                 }
+                let tb = stream.time_base();
+                let tb_f = tb.numerator() as f64 / tb.denominator() as f64;
+                let s_dur = stream.duration();
+                if s_dur > 0 && tb_f > 0.0 {
+                    a_dur_exact = s_dur as f64 * tb_f;
+                }
             }
 
-            let d_secs = ictx.duration() as f64 / f64::from(ffmpeg_next::ffi::AV_TIME_BASE);
+            let container_dur_secs = ictx.duration() as f64 / f64::from(ffmpeg_next::ffi::AV_TIME_BASE);
+            video_duration_secs = if v_dur_exact > 0.0 {
+                v_dur_exact
+            } else if container_dur_secs > 0.0 {
+                container_dur_secs
+            } else {
+                10.0
+            };
+            audio_duration_secs = if a_dur_exact > 0.0 {
+                a_dur_exact
+            } else if container_dur_secs > 0.0 {
+                container_dur_secs
+            } else {
+                10.0
+            };
+
+            let d_secs = if has_video { video_duration_secs } else { audio_duration_secs };
             if d_secs > 0.0 {
                 duration_secs = d_secs;
                 let m = (d_secs / 60.0).floor() as u32;
@@ -158,6 +199,8 @@ impl MediaPoolState {
             fps_num,
             duration: dur_str,
             duration_secs,
+            video_duration_secs,
+            audio_duration_secs,
             summary,
             has_video,
             has_audio,
@@ -179,7 +222,8 @@ impl MediaPoolState {
                 }
 
                 timeline.push_history();
-                let dur = (asset.duration_secs * timeline.fps as f64).round().max(1.0) as i64;
+                let v_dur = (asset.video_duration_secs * timeline.fps as f64).round().max(1.0) as i64;
+                let a_dur = (asset.audio_duration_secs * timeline.fps as f64).round().max(1.0) as i64;
                 let start = timeline.playhead_frame;
                 let num_audio = asset.audio_tracks_count.max(if asset.has_audio { 1 } else { 0 });
                 let link_id = if asset.has_video && num_audio > 0 {
@@ -197,7 +241,7 @@ impl MediaPoolState {
                         name: asset.filename.clone(),
                         track_index: 1, // V1
                         start_frame: start,
-                        duration_frames: dur,
+                        duration_frames: v_dur,
                         is_audio: false,
                         color: ResolveColors::VIDEO_CLIP,
                         source_path: asset.path.clone(),
@@ -240,7 +284,7 @@ impl MediaPoolState {
                             name: track_title,
                             track_index: target_track,
                             start_frame: start,
-                            duration_frames: dur,
+                            duration_frames: a_dur,
                             is_audio: true,
                             color: ResolveColors::AUDIO_CLIP,
                             source_path: asset.path.clone(),
@@ -372,7 +416,7 @@ impl MediaPoolState {
                             if timeline.clips.is_empty() && asset.fps_num > 0.0 {
                                 timeline.fps = asset.fps_num.round().clamp(1.0, 240.0) as u32;
                             }
-                            let dur_frames = (asset.duration_secs * timeline.fps as f64).round().max(1.0) as i64;
+                            let dur_frames = ((if asset.has_video { asset.video_duration_secs } else { asset.audio_duration_secs }) * timeline.fps as f64).round().max(1.0) as i64;
                             timeline.dragged_media = Some(DraggedMedia {
                                 name: asset.filename.clone(),
                                 path: asset.path.clone(),
@@ -382,6 +426,8 @@ impl MediaPoolState {
                                 audio_tracks_count: asset.audio_tracks_count,
                                 duration_frames: dur_frames,
                                 duration_secs: asset.duration_secs,
+                                video_duration_secs: asset.video_duration_secs,
+                                audio_duration_secs: asset.audio_duration_secs,
                                 source_fps: asset.fps_num,
                                 link_group: None,
                             });

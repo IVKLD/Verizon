@@ -112,7 +112,7 @@ impl Clip {
         };
         let total_source_secs = self.source_in_secs + time_secs;
         let fps = if self.source_fps > 0.0 { self.source_fps } else { timeline_fps as f64 };
-        (total_source_secs * fps).round() as i64
+        ((total_source_secs * fps) + 1e-6).floor() as i64
     }
 
     /// Обратный перевод номера кадра медиафайла в глобальный кадр таймлайна
@@ -121,11 +121,11 @@ impl Clip {
         let total_source_secs = source_frame as f64 / fps.max(1.0);
         let time_secs = total_source_secs - self.source_in_secs;
         if self.speed < 0.0 {
-            let rev_offset = (time_secs / self.speed.abs() * timeline_fps as f64).round() as i64;
+            let rev_offset = ((time_secs / self.speed.abs() * timeline_fps as f64) + 1e-6).floor() as i64;
             self.start_frame + (self.duration_frames - 1 - rev_offset).max(0)
         } else {
             let eff_speed = if self.speed.abs() > 0.001 { self.speed } else { 1.0 };
-            self.start_frame + ((time_secs / eff_speed) * timeline_fps as f64).round() as i64
+            self.start_frame + (((time_secs / eff_speed) * timeline_fps as f64) + 1e-6).floor() as i64
         }
     }
 }
@@ -258,6 +258,8 @@ pub struct DraggedMedia {
     pub audio_tracks_count: usize,
     pub duration_frames: i64,
     pub duration_secs: f64,
+    pub video_duration_secs: f64,
+    pub audio_duration_secs: f64,
     pub source_fps: f64,
     pub link_group: Option<u64>,
 }

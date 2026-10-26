@@ -169,8 +169,20 @@ impl ViewerState {
                 let is_same_file = clip.source_path.as_deref() == video_player.current_path.as_deref();
                 if is_same_file {
                     let mut inserted_any = false;
+                    let target_src = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
+
+                    // 1) Точное кэширование текущего положения плейхеда при кликах и на паузе
                     if let Some(ref img) = video_player.last_displayed_image {
                         let presented_src = video_player.last_exact_frame;
+                        let is_match = presented_src == target_src
+                            || (video_player.total_frames > 0 && target_src >= video_player.total_frames && presented_src >= video_player.total_frames - 1);
+                        if is_match && clip.contains_frame(timeline.playhead_frame) {
+                            let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, timeline.playhead_frame);
+                            if !render_cache.is_cached(timeline.playhead_frame) {
+                                render_cache.insert(timeline.playhead_frame, std::sync::Arc::clone(img), sig);
+                                inserted_any = true;
+                            }
+                        }
                         if presented_src >= 0 {
                             let tl_presented = clip.timeline_frame_from_source(presented_src, timeline.fps);
                             if clip.contains_frame(tl_presented) {
@@ -182,13 +194,18 @@ impl ViewerState {
                             }
                         }
                     }
+
+                    // 2) Кэширование всех декодированных кадров из фоновой очереди (включая дублирующиеся таймлайн-кадры при 60fps/Retime)
                     for (src_f, img) in video_player.newly_cached_frames.drain(..) {
-                        let tl_f = clip.timeline_frame_from_source(src_f, timeline.fps);
-                        if clip.contains_frame(tl_f) {
-                            let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
-                            if !render_cache.is_cached(tl_f) {
-                                render_cache.insert(tl_f, img, sig);
-                                inserted_any = true;
+                        let base_tl = clip.timeline_frame_from_source(src_f, timeline.fps);
+                        let search_range = ((timeline.fps as f64 / clip.source_fps.max(1.0) / clip.speed.abs().max(0.01)).ceil() as i64).max(1);
+                        for tl_f in (base_tl - search_range)..=(base_tl + search_range) {
+                            if clip.contains_frame(tl_f) && clip.source_frame_from_timeline(tl_f, timeline.fps) == src_f {
+                                let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
+                                if !render_cache.is_cached(tl_f) {
+                                    render_cache.insert(tl_f, std::sync::Arc::clone(&img), sig);
+                                    inserted_any = true;
+                                }
                             }
                         }
                     }
