@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use egui::{Color32, Context, CornerRadius, Stroke, Ui, Vec2};
-use crate::theme::{ResolveColors, get_accent_colors};
+use crate::theme::get_accent_colors;
 
 /// Вкладки верхнего уровня (System / User) как в DaVinci Resolve 21
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,87 +190,103 @@ impl PreferencesModalState {
         let mut apply_result = None;
         let mut should_close = false;
 
-        let screen_size = ctx.input(|i| i.raw.screen_rect.map(|r| r.size()).unwrap_or(egui::vec2(1920.0, 1080.0)));
-        let win_width = (screen_size.x * 0.65).clamp(740.0, 960.0);
-        let win_height = (screen_size.y * 0.75).clamp(520.0, 720.0);
+        let win_width = 800.0;
+        let win_height = 540.0;
+        let sidebar_width = 190.0;
+        let content_width = win_width - sidebar_width - 32.0;
+        let content_height = 420.0;
 
-        egui::Window::new("⚙ Preferences (Настройки DaVinci Resolve 21)")
+        let (accent, _) = get_accent_colors(self.draft.theme_accent_idx);
+
+        egui::Window::new("⚙ Preferences")
             .open(open)
             .collapsible(false)
             .resizable(false)
             .fixed_size([win_width, win_height])
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(0x13, 0x14, 0x17))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(0x2a, 0x2d, 0x36)))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(14, 10)),
+            )
             .show(ctx, |ui| {
-                // 1. Верхние вкладки: SYSTEM | USER (Фирменный стиль DaVinci Resolve)
+                // 1. Верхний переключатель вкладок: SYSTEM | USER (В точности как в DaVinci Resolve Studio)
                 ui.horizontal(|ui| {
-                    ui.add_space(4.0);
-                    let (accent, _) = get_accent_colors(self.draft.theme_accent_idx);
+                    ui.add_space(sidebar_width * 0.45);
 
-                    let sys_active = self.current_tab == PrefTab::System;
-                    let user_active = self.current_tab == PrefTab::User;
+                    // Сегментированная пилюля переключения
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(0x1b, 0x1c, 0x22))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(0x28, 0x2a, 0x32)))
+                        .corner_radius(CornerRadius::same(4))
+                        .inner_margin(egui::Margin::symmetric(4, 2))
+                        .show(ui, |ui| {
+                            let sys_active = self.current_tab == PrefTab::System;
+                            let user_active = self.current_tab == PrefTab::User;
 
-                    let sys_btn = egui::Button::new(
-                        egui::RichText::new("  🖥  SYSTEM  ")
-                            .size(13.0)
-                            .strong()
-                            .color(if sys_active { Color32::WHITE } else { ResolveColors::TEXT_MUTED }),
-                    )
-                    .fill(if sys_active { accent.gamma_multiply(0.25) } else { ResolveColors::BG_HEADER })
-                    .stroke(Stroke::new(1.0, if sys_active { accent } else { ResolveColors::BORDER }));
+                            let sys_btn = egui::Button::new(
+                                egui::RichText::new("  System  ")
+                                    .size(12.0)
+                                    .strong()
+                                    .color(if sys_active { Color32::WHITE } else { Color32::from_rgb(0x92, 0x97, 0xa5) }),
+                            )
+                            .fill(if sys_active { accent.gamma_multiply(0.28) } else { Color32::TRANSPARENT })
+                            .stroke(if sys_active { Stroke::new(1.0, accent) } else { Stroke::NONE })
+                            .corner_radius(CornerRadius::same(3));
 
-                    if ui.add(sys_btn).clicked() {
-                        self.current_tab = PrefTab::System;
-                        self.current_section = PrefSection::SystemMemoryGpu;
-                    }
+                            if ui.add(sys_btn).clicked() {
+                                self.current_tab = PrefTab::System;
+                                self.current_section = PrefSection::SystemMemoryGpu;
+                            }
 
-                    let user_btn = egui::Button::new(
-                        egui::RichText::new("  👤  USER  ")
-                            .size(13.0)
-                            .strong()
-                            .color(if user_active { Color32::WHITE } else { ResolveColors::TEXT_MUTED }),
-                    )
-                    .fill(if user_active { accent.gamma_multiply(0.25) } else { ResolveColors::BG_HEADER })
-                    .stroke(Stroke::new(1.0, if user_active { accent } else { ResolveColors::BORDER }));
+                            let user_btn = egui::Button::new(
+                                egui::RichText::new("  User  ")
+                                    .size(12.0)
+                                    .strong()
+                                    .color(if user_active { Color32::WHITE } else { Color32::from_rgb(0x92, 0x97, 0xa5) }),
+                            )
+                            .fill(if user_active { accent.gamma_multiply(0.28) } else { Color32::TRANSPARENT })
+                            .stroke(if user_active { Stroke::new(1.0, accent) } else { Stroke::NONE })
+                            .corner_radius(CornerRadius::same(3));
 
-                    if ui.add(user_btn).clicked() {
-                        self.current_tab = PrefTab::User;
-                        self.current_section = PrefSection::UserAppearance;
-                    }
+                            if ui.add(user_btn).clicked() {
+                                self.current_tab = PrefTab::User;
+                                self.current_section = PrefSection::UserAppearance;
+                            }
+                        });
                 });
 
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 ui.separator();
-                ui.add_space(4.0);
+                ui.add_space(6.0);
 
-                // 2. Основная рабочая область: Слева меню категорий (Sidebar), Справа параметры (Content)
-                let avail_rect = ui.available_rect_before_wrap();
-                let bottom_bar_height = 44.0;
-                let main_area_height = (avail_rect.height() - bottom_bar_height).max(200.0);
-
+                // 2. Основная рабочая область: Слева меню категорий (Sidebar), Справа карточки параметров
                 ui.horizontal(|ui| {
                     // Левый сайдбар со списком категорий
                     egui::Frame::new()
-                        .fill(ResolveColors::BG_PANEL)
-                        .stroke(Stroke::new(1.0, ResolveColors::BORDER))
-                        .corner_radius(CornerRadius::same(2))
-                        .inner_margin(egui::Margin::same(4))
+                        .fill(Color32::from_rgb(0x17, 0x18, 0x1c))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(0x23, 0x25, 0x2b)))
+                        .corner_radius(CornerRadius::same(4))
+                        .inner_margin(egui::Margin::symmetric(6, 6))
                         .show(ui, |ui| {
-                            ui.set_width(200.0);
-                            ui.set_height(main_area_height);
+                            ui.set_width(sidebar_width);
+                            ui.set_height(content_height);
                             self.render_sidebar(ui);
                         });
 
-                    ui.add_space(4.0);
+                    ui.add_space(8.0);
 
-                    // Правая область с ползунками и настройками
+                    // Правая область с карточками настроек
                     egui::Frame::new()
-                        .fill(ResolveColors::BG_MAIN)
-                        .stroke(Stroke::new(1.0, ResolveColors::BORDER))
-                        .corner_radius(CornerRadius::same(2))
-                        .inner_margin(egui::Margin::same(12))
+                        .fill(Color32::from_rgb(0x13, 0x14, 0x17))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(0x23, 0x25, 0x2b)))
+                        .corner_radius(CornerRadius::same(4))
+                        .inner_margin(egui::Margin::symmetric(8, 8))
                         .show(ui, |ui| {
-                            ui.set_width(win_width - 240.0);
-                            ui.set_height(main_area_height);
+                            ui.set_width(content_width);
+                            ui.set_height(content_height);
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
@@ -280,31 +296,49 @@ impl PreferencesModalState {
                 });
 
                 // 3. Нижний бар действий: Сброс | Отмена | Сохранить
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 ui.separator();
-                ui.add_space(4.0);
+                ui.add_space(6.0);
 
                 ui.horizontal(|ui| {
-                    if ui.button(egui::RichText::new("⟲ Сбросить по умолчанию").size(11.0)).clicked() {
+                    let reset_btn = egui::Button::new(
+                        egui::RichText::new("⟲  Reset to Defaults")
+                            .size(11.0)
+                            .color(Color32::from_rgb(0xa2, 0xa8, 0xb6)),
+                    )
+                    .fill(Color32::from_rgb(0x1e, 0x20, 0x25))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(0x2b, 0x2e, 0x36)));
+
+                    if ui.add(reset_btn).clicked() {
                         self.draft = UserPreferences::default();
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (accent, _) = get_accent_colors(self.draft.theme_accent_idx);
                         let save_btn = egui::Button::new(
-                            egui::RichText::new(" ✔ Сохранить и применить ")
+                            egui::RichText::new("  Save  ")
                                 .size(12.0)
                                 .color(Color32::WHITE)
                                 .strong(),
                         )
-                        .fill(accent);
+                        .fill(accent)
+                        .stroke(Stroke::new(1.0, accent))
+                        .min_size(Vec2::new(80.0, 26.0));
 
                         if ui.add(save_btn).clicked() {
                             apply_result = Some(self.draft.clone());
                             should_close = true;
                         }
 
-                        if ui.button(" Отмена ").clicked() {
+                        let cancel_btn = egui::Button::new(
+                            egui::RichText::new("  Cancel  ")
+                                .size(11.5)
+                                .color(Color32::from_rgb(0xd5, 0xda, 0xe5)),
+                        )
+                        .fill(Color32::from_rgb(0x22, 0x24, 0x2a))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(0x2f, 0x32, 0x3b)))
+                        .min_size(Vec2::new(70.0, 26.0));
+
+                        if ui.add(cancel_btn).clicked() {
                             should_close = true;
                         }
                     });
@@ -317,35 +351,83 @@ impl PreferencesModalState {
 
         apply_result
     }
+}
+
+/// Фирменная карточка группы настроек DaVinci Resolve
+fn pref_card<R>(ui: &mut Ui, title: &str, subtitle: Option<&str>, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    let frame = egui::Frame::new()
+        .fill(Color32::from_rgb(0x18, 0x19, 0x1e))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(0x27, 0x2a, 0x32)))
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(14, 10));
+
+    frame.show(ui, |ui| {
+        ui.label(
+            egui::RichText::new(title)
+                .size(11.5)
+                .strong()
+                .color(Color32::from_rgb(0xec, 0xf0, 0xf8)),
+        );
+        if let Some(sub) = subtitle {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(sub)
+                    .size(10.0)
+                    .color(Color32::from_rgb(0x84, 0x8a, 0x99)),
+            );
+        }
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(6.0);
+        add_contents(ui)
+    }).inner
+}
+
+/// Строка настройки в стиле DaVinci Resolve (Метка слева, Элемент управления справа)
+fn pref_row<R>(ui: &mut Ui, label: &str, add_widget: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.horizontal(|ui| {
+        ui.set_min_width(170.0);
+        ui.label(
+            egui::RichText::new(label)
+                .size(11.5)
+                .color(Color32::from_rgb(0xa2, 0xa8, 0xb8)),
+        );
+        add_widget(ui)
+    }).inner
+}
+
+impl PreferencesModalState {
 
     fn render_sidebar(&mut self, ui: &mut Ui) {
         let (accent, _) = get_accent_colors(self.draft.theme_accent_idx);
 
         let sections = match self.current_tab {
             PrefTab::System => vec![
-                (PrefSection::SystemMemoryGpu, "🧠 Memory and GPU"),
-                (PrefSection::SystemMediaStorage, "📁 Media Storage"),
-                (PrefSection::SystemAudio, "🔊 Audio I/O"),
-                (PrefSection::SystemHardware, "⚡ Hardware Decode"),
+                (PrefSection::SystemMemoryGpu, "🧠", "Memory and GPU"),
+                (PrefSection::SystemMediaStorage, "📁", "Media Storage"),
+                (PrefSection::SystemAudio, "🔊", "Audio I/O"),
+                (PrefSection::SystemHardware, "⚡", "Hardware Decode"),
             ],
             PrefTab::User => vec![
-                (PrefSection::UserAppearance, "🖥 UI and Appearance"),
-                (PrefSection::UserEditing, "🎞 Editing & Timeline"),
-                (PrefSection::UserPlaybackCache, "⚡ Playback & Cache"),
-                (PrefSection::UserColorScopes, "🎨 Color & Scopes"),
+                (PrefSection::UserAppearance, "🖥", "UI & Appearance"),
+                (PrefSection::UserEditing, "🎞", "Editing & Timeline"),
+                (PrefSection::UserPlaybackCache, "⚡", "Playback & Cache"),
+                (PrefSection::UserColorScopes, "🎨", "Color & Scopes"),
             ],
         };
 
-        for (sec, title) in sections {
+        for (sec, icon, title) in sections {
             let is_selected = self.current_section == sec;
+            let btn_text = format!(" {}  {}", icon, title);
             let btn = egui::Button::new(
-                egui::RichText::new(title)
-                    .size(12.0)
-                    .color(if is_selected { Color32::WHITE } else { ResolveColors::TEXT_PRIMARY }),
+                egui::RichText::new(btn_text)
+                    .size(11.5)
+                    .color(if is_selected { Color32::WHITE } else { Color32::from_rgb(0xa4, 0xaa, 0xb8) }),
             )
-            .fill(if is_selected { accent.gamma_multiply(0.35) } else { Color32::TRANSPARENT })
-            .stroke(if is_selected { Stroke::new(1.0, accent) } else { Stroke::NONE })
-            .min_size(Vec2::new(190.0, 28.0));
+            .fill(if is_selected { Color32::from_rgb(0x23, 0x25, 0x2c) } else { Color32::TRANSPARENT })
+            .stroke(if is_selected { Stroke::new(1.0, accent.gamma_multiply(0.6)) } else { Stroke::NONE })
+            .corner_radius(CornerRadius::same(3))
+            .min_size(Vec2::new(176.0, 32.0));
 
             if ui.add(btn).clicked() {
                 self.current_section = sec;
@@ -368,44 +450,25 @@ impl PreferencesModalState {
     }
 
     fn render_system_memory_gpu(&mut self, ui: &mut Ui) {
-        let (accent, _) = get_accent_colors(self.draft.theme_accent_idx);
-
-        ui.heading(
-            egui::RichText::new("🧠 Memory and GPU Configuration")
-                .color(accent)
-                .size(15.0),
-        );
-        ui.label(
-            egui::RichText::new("Настройки распределения оперативной памяти и графических процессоров:")
-                .size(11.0)
-                .color(ResolveColors::TEXT_MUTED),
-        );
-        ui.add_space(10.0);
-
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Оперативная память (System RAM)").strong().size(12.0));
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("Лимит памяти для Render Cache:");
+        pref_card(ui, "SYSTEM MEMORY & RENDER CACHE", Some("Лимиты оперативной памяти для фонового рендера и кэширования"), |ui| {
+            pref_row(ui, "Render Cache RAM Budget:", |ui| {
                 ui.add(
                     egui::Slider::new(&mut self.draft.render_cache_ram_mb, 256..=16384)
                         .step_by(256.0)
                         .suffix(" MB"),
                 );
             });
+            ui.add_space(4.0);
             ui.label(
-                egui::RichText::new("💡 Выделение 2048-4096 МБ обеспечивает мгновенный предпросмотр сложных эффектов и переходов без падения FPS.")
+                egui::RichText::new("💡 Выделение 2048-4096 МБ обеспечивает мгновенный реал-тайм 60 FPS предпросмотр без дропов.")
                     .size(10.0)
-                    .color(ResolveColors::TEXT_MUTED),
+                    .color(Color32::from_rgb(0x82, 0x88, 0x96)),
             );
         });
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Конфигурация GPU (GPU Processing Mode)").strong().size(12.0));
-            ui.add_space(4.0);
-
+        pref_card(ui, "GPU PROCESSING MODE", Some("Выбор графического процессора и параметров аппаратного блендинга"), |ui| {
             ui.radio_value(&mut self.draft.gpu_mode, 0, "Auto (Автоматический выбор высокопроизводительного GPU)");
             ui.radio_value(&mut self.draft.gpu_mode, 1, "VAAPI Hardware (AMD Radeon Navi 48 / Intel Iris Xe)");
             ui.radio_value(&mut self.draft.gpu_mode, 2, "CPU Software Fallback (Без GPU ускорения)");
@@ -414,7 +477,7 @@ impl PreferencesModalState {
             ui.separator();
             ui.add_space(4.0);
 
-            ui.label(egui::RichText::new("Обнаруженные видеокарты в системе:").size(11.0).color(ResolveColors::TEXT_PRIMARY));
+            ui.label(egui::RichText::new("Обнаруженные видеокарты в системе:").size(11.0).color(Color32::from_rgb(0xec, 0xf0, 0xf8)));
             ui.monospace(" • GPU 0: AMD Radeon RX 9070 XT (Navi 48) - /dev/dri/renderD129 [High-Performance]");
             ui.monospace(" • GPU 1: AMD Radeon 780M Graphics - /dev/dri/renderD128 [Integrated]");
 
@@ -424,27 +487,9 @@ impl PreferencesModalState {
     }
 
     fn render_system_media_storage(&mut self, ui: &mut Ui) {
-        let (accent, _) = get_accent_colors(self.draft.theme_accent_idx);
-
-        ui.heading(
-            egui::RichText::new("📁 Media Storage & Cache Locations")
-                .color(accent)
-                .size(15.0),
-        );
-        ui.label(
-            egui::RichText::new("Пути размещения дискового кэша рендера и временных файлов прокси:")
-                .size(11.0)
-                .color(ResolveColors::TEXT_MUTED),
-        );
-        ui.add_space(10.0);
-
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Дисковый кэш рендера (Render Cache Disk Location)").strong().size(12.0));
-            ui.add_space(4.0);
-
+        pref_card(ui, "RENDER CACHE SCRATCH DISK", Some("Пути размещения дискового кэша рендера и временных файлов"), |ui| {
             let mut path_str = self.draft.cache_directory.to_string_lossy().to_string();
-            ui.horizontal(|ui| {
-                ui.label("Каталог кэша:");
+            pref_row(ui, "Каталог кэша:", |ui| {
                 if ui.text_edit_singleline(&mut path_str).changed() {
                     self.draft.cache_directory = PathBuf::from(path_str);
                 }
@@ -459,14 +504,11 @@ impl PreferencesModalState {
             ui.checkbox(&mut self.draft.auto_cleanup_proxies, "Автоматически очищать временные прокси и кэш при закрытии проекта");
         });
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Управление дисковым пространством").strong().size(12.0));
-            ui.add_space(4.0);
-
+        pref_card(ui, "STORAGE MANAGEMENT", Some("Очистка дискового пространства от устаревших кэшей"), |ui| {
             ui.horizontal(|ui| {
-                if ui.button("🗑 Очистить дисковый кэш рендера (Purge Cache)").clicked() {
+                if ui.button("🗑  Очистить дисковый кэш рендера (Purge Cache)").clicked() {
                     if let Ok(entries) = std::fs::read_dir(&self.draft.cache_directory) {
                         for e in entries.flatten() {
                             let _ = std::fs::remove_file(e.path());
@@ -474,43 +516,24 @@ impl PreferencesModalState {
                     }
                 }
             });
+            ui.add_space(4.0);
             ui.label(
                 egui::RichText::new("Освобождает место на диске, удаляя устаревшие кэшированные кадры таймлайна.")
                     .size(10.0)
-                    .color(ResolveColors::TEXT_MUTED),
+                    .color(Color32::from_rgb(0x82, 0x88, 0x96)),
             );
         });
     }
 
     fn render_system_audio(&mut self, ui: &mut Ui) {
-        let (accent, _) = get_accent_colors(self.draft.theme_accent_idx);
-
-        ui.heading(
-            egui::RichText::new("🔊 Audio I/O Configuration")
-                .color(accent)
-                .size(15.0),
-        );
-        ui.label(
-            egui::RichText::new("Настройка аудиовывода PipeWire / ALSA и мастер-мониторинга:")
-                .size(11.0)
-                .color(ResolveColors::TEXT_MUTED),
-        );
-        ui.add_space(10.0);
-
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Устройство воспроизведения").strong().size(12.0));
-            ui.add_space(4.0);
+        pref_card(ui, "AUDIO OUTPUT DEVICE", Some("Активное аудиоустройство воспроизведения"), |ui| {
             ui.monospace(" • PipeWire ALSA / Komplete Audio 1 Pro (Cinema Reference 48 kHz)");
         });
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Параметры аудиопотока").strong().size(12.0));
-            ui.add_space(4.0);
-
-            ui.horizontal(|ui| {
-                ui.label("Частота дискретизации:");
+        pref_card(ui, "AUDIO STREAM & LATENCY", Some("Параметры дискретизации и буферизации аудиодвижка"), |ui| {
+            pref_row(ui, "Частота дискретизации:", |ui| {
                 egui::ComboBox::from_id_salt("audio_sr_combo")
                     .selected_text(match self.draft.audio_sample_rate {
                         44100 => "44.1 kHz (CD Audio)",
@@ -526,8 +549,7 @@ impl PreferencesModalState {
 
             ui.add_space(4.0);
 
-            ui.horizontal(|ui| {
-                ui.label("Размер буфера (Latency):");
+            pref_row(ui, "Размер буфера (Latency):", |ui| {
                 egui::ComboBox::from_id_salt("audio_buf_combo")
                     .selected_text(match self.draft.audio_buffer_size {
                         128 => "128 семплов (2.6 мс - Low Latency)",
@@ -544,14 +566,10 @@ impl PreferencesModalState {
             });
         });
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Мастер-громкость и мониторинг").strong().size(12.0));
-            ui.add_space(4.0);
-
-            ui.horizontal(|ui| {
-                ui.label("Громкость аудиовывода:");
+        pref_card(ui, "MASTER MONITORING", Some("Уровень аппаратного мастер-выхода и скраббинг"), |ui| {
+            pref_row(ui, "Громкость вывода:", |ui| {
                 ui.add(
                     egui::Slider::new(&mut self.draft.master_volume, 0.0..=1.5)
                         .step_by(0.05)
@@ -559,66 +577,32 @@ impl PreferencesModalState {
                 );
             });
 
-            ui.add_space(4.0);
+            ui.add_space(6.0);
             ui.checkbox(&mut self.draft.mute_on_scrub, "Mute audio while scrubbing (Заглушать звук при перемотке/скраббинге)");
         });
     }
 
     fn render_system_hardware(&mut self, ui: &mut Ui) {
-        let (accent, _) = get_accent_colors(self.draft.theme_accent_idx);
-
-        ui.heading(
-            egui::RichText::new("⚡ Hardware Video Acceleration")
-                .color(accent)
-                .size(15.0),
-        );
-        ui.label(
-            egui::RichText::new("Аппаратное декодирование медиапотоков через VAAPI и Vulkan Video:")
-                .size(11.0)
-                .color(ResolveColors::TEXT_MUTED),
-        );
-        ui.add_space(10.0);
-
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Аппаратные декодеры кодеков").strong().size(12.0));
-            ui.add_space(4.0);
+        pref_card(ui, "HARDWARE VIDEO ACCELERATION", Some("Аппаратное декодирование через VAAPI и Vulkan Video"), |ui| {
             ui.checkbox(&mut self.draft.hardware_decoding_enabled, "Аппаратное декодирование H.264 / AVC (AMD / Intel VAAPI)");
             ui.checkbox(&mut self.draft.gpu_blending_enabled, "Zero-copy трансфер текстур в Wayland через DMABUF");
         });
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Оптимизация реал-тайм воспроизведения").strong().size(12.0));
+        pref_card(ui, "REALTIME PLAYBACK TUNING", Some("Синхронизация звука и видео в режиме реального времени 1.0x"), |ui| {
+            ui.checkbox(&mut self.draft.drop_frames_enabled, "Drop frames during playback (Пропускать кадры при нехватке скорости)");
             ui.add_space(4.0);
-            ui.checkbox(&mut self.draft.drop_frames_enabled, "Drop frames during playback (Пропускать кадры при нехватке скорости декодирования)");
             ui.label(
-                egui::RichText::new("💡 При включении таймлайн сохраняет реальную скорость 1x даже на тяжелых 4K/8K файлах, дропая отстающие кадры.")
+                egui::RichText::new("💡 При включении таймлайн сохраняет реальную скорость 1x даже на тяжелых 4K/8K файлах, не давая звуку рассинхронизироваться.")
                     .size(10.0)
-                    .color(ResolveColors::TEXT_MUTED),
+                    .color(Color32::from_rgb(0x82, 0x88, 0x96)),
             );
         });
     }
 
     fn render_user_appearance(&mut self, ui: &mut Ui) {
-        let (accent, _) = get_accent_colors(self.draft.theme_accent_idx);
-
-        ui.heading(
-            egui::RichText::new("🖥 UI & Appearance")
-                .color(accent)
-                .size(15.0),
-        );
-        ui.label(
-            egui::RichText::new("Масштабирование экранов 4K/HiDPI, темы оформления и таймкод:")
-                .size(11.0)
-                .color(ResolveColors::TEXT_MUTED),
-        );
-        ui.add_space(10.0);
-
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Масштабирование интерфейса (HiDPI / 4K)").strong().size(12.0));
-            ui.add_space(4.0);
-
+        pref_card(ui, "DISPLAY SCALING (HiDPI / 4K)", Some("Масштабирование экранов высокого разрешения"), |ui| {
             ui.horizontal_wrapped(|ui| {
                 let presets = [
                     (1.0, "100% (FHD 1080p)"),
@@ -631,10 +615,11 @@ impl PreferencesModalState {
 
                 for (scale, label) in presets {
                     let is_active = (self.draft.ui_scale - scale).abs() < 0.02;
+                    let (accent, _) = get_accent_colors(self.draft.theme_accent_idx);
                     let btn = egui::Button::new(label).fill(if is_active {
                         accent
                     } else {
-                        ResolveColors::BG_HEADER
+                        Color32::from_rgb(0x22, 0x24, 0x2a)
                     });
                     if ui.add(btn).clicked() {
                         self.draft.ui_scale = scale;
@@ -643,8 +628,7 @@ impl PreferencesModalState {
             });
 
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label("Точный масштаб:");
+            pref_row(ui, "Точный масштаб:", |ui| {
                 ui.add(
                     egui::Slider::new(&mut self.draft.ui_scale, 0.75..=3.5)
                         .step_by(0.05)
@@ -656,26 +640,20 @@ impl PreferencesModalState {
             ui.label(
                 egui::RichText::new("💡 Горячие клавиши масштабирования: Ctrl + / Ctrl - / Ctrl 0")
                     .size(10.0)
-                    .color(ResolveColors::TEXT_MUTED),
+                    .color(Color32::from_rgb(0x82, 0x88, 0x96)),
             );
         });
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Отображение времени и таймкода").strong().size(12.0));
-            ui.add_space(4.0);
-
+        pref_card(ui, "TIMECODE DISPLAY FORMAT", Some("Формат отображения текущего положения плейхеда"), |ui| {
             ui.radio_value(&mut self.draft.timecode_display_frames, false, "SMPTE Timecode (ЧЧ:ММ:СС:КК / 01:21:30:03)");
             ui.radio_value(&mut self.draft.timecode_display_frames, true, "Кадры таймлайна (Frames: 0, 1, 2 .. N)");
         });
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Цветовая палитра акцентов DaVinci Resolve").strong().size(12.0));
-            ui.add_space(4.0);
-
+        pref_card(ui, "DAVINCI RESOLVE ACCENT PALETTE", Some("Цветовая схема элементов управления и подсветки"), |ui| {
             ui.horizontal(|ui| {
                 let themes = [
                     (0, "🟠 DaVinci Orange"),
@@ -687,9 +665,9 @@ impl PreferencesModalState {
                     let (btn_accent, _) = get_accent_colors(idx);
                     let btn = egui::Button::new(
                         egui::RichText::new(name)
-                            .color(if is_active { Color32::WHITE } else { ResolveColors::TEXT_PRIMARY }),
+                            .color(if is_active { Color32::WHITE } else { Color32::from_rgb(0xa2, 0xa8, 0xb8) }),
                     )
-                    .fill(if is_active { btn_accent } else { ResolveColors::BG_HEADER });
+                    .fill(if is_active { btn_accent } else { Color32::from_rgb(0x22, 0x24, 0x2a) });
 
                     if ui.add(btn).clicked() {
                         self.draft.theme_accent_idx = idx;
@@ -700,27 +678,10 @@ impl PreferencesModalState {
     }
 
     fn render_user_editing(&mut self, ui: &mut Ui) {
-        let (accent, _) = get_accent_colors(self.draft.theme_accent_idx);
-
-        ui.heading(
-            egui::RichText::new("🎞 Editing & Timeline Preferences")
-                .color(accent)
-                .size(15.0),
-        );
-        ui.label(
-            egui::RichText::new("Параметры работы таймлайна, прилипания и создание новых проектов:")
-                .size(11.0)
-                .color(ResolveColors::TEXT_MUTED),
-        );
-        ui.add_space(10.0);
-
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Магнитное прилипание (Snapping)").strong().size(12.0));
-            ui.add_space(4.0);
-
+        pref_card(ui, "SNAPPING & MAGNETIC TIMELINE", Some("Поведение прилипания курсора и границ клипов"), |ui| {
             ui.checkbox(&mut self.draft.snapping_enabled, "Включить магнитное прилипание клипов [N]");
-            ui.horizontal(|ui| {
-                ui.label("Дистанция прилипания:");
+            ui.add_space(4.0);
+            pref_row(ui, "Дистанция прилипания:", |ui| {
                 ui.add(
                     egui::Slider::new(&mut self.draft.snapping_threshold_px, 2.0..=30.0)
                         .suffix(" px"),
@@ -728,25 +689,18 @@ impl PreferencesModalState {
             });
         });
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Связность клипов и воспроизведение").strong().size(12.0));
-            ui.add_space(4.0);
-
+        pref_card(ui, "CLIP LINKING & PLAYBACK", Some("Связность аудио/видео клипов и навигация"), |ui| {
             ui.checkbox(&mut self.draft.linked_selection, "Связанное выделение видео и аудиодорожек (Linked Selection [Ctrl+Shift+L])");
             ui.checkbox(&mut self.draft.stop_at_timeline_end, "Останавливать воспроизведение в конце таймлайна");
             ui.checkbox(&mut self.draft.loop_enabled, "Зацикливать воспроизведение (Loop Playback)");
         });
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Параметры нового проекта по умолчанию").strong().size(12.0));
-            ui.add_space(4.0);
-
-            ui.horizontal(|ui| {
-                ui.label("Частота кадров (FPS):");
+        pref_card(ui, "NEW PROJECT DEFAULTS", Some("Параметры по умолчанию для новых проектов"), |ui| {
+            pref_row(ui, "Частота кадров (FPS):", |ui| {
                 egui::ComboBox::from_id_salt("pref_fps_combo")
                     .selected_text(format!("{} fps", self.draft.default_fps))
                     .show_ui(ui, |ui| {
@@ -760,8 +714,7 @@ impl PreferencesModalState {
 
             ui.add_space(4.0);
 
-            ui.horizontal(|ui| {
-                ui.label("Разрешение таймлайна:");
+            pref_row(ui, "Разрешение таймлайна:", |ui| {
                 let cur_res_str = format!("{} x {}", self.draft.default_width, self.draft.default_height);
                 egui::ComboBox::from_id_salt("pref_res_combo")
                     .selected_text(cur_res_str)
@@ -788,44 +741,23 @@ impl PreferencesModalState {
     }
 
     fn render_user_playback_cache(&mut self, ui: &mut Ui) {
-        let (accent, _) = get_accent_colors(self.draft.theme_accent_idx);
-
-        ui.heading(
-            egui::RichText::new("⚡ Playback & Render Cache")
-                .color(accent)
-                .size(15.0),
-        );
-        ui.label(
-            egui::RichText::new("Интеллектуальный кэш DaVinci Resolve для плавного воспроизведения:")
-                .size(11.0)
-                .color(ResolveColors::TEXT_MUTED),
-        );
-        ui.add_space(10.0);
-
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Режим Render Cache").strong().size(12.0));
-            ui.add_space(4.0);
-
+        pref_card(ui, "RENDER CACHE MODE (DaVinci Resolve)", Some("Интеллектуальное кэширование эффектов и склеек"), |ui| {
             ui.radio_value(&mut self.draft.render_cache_mode, 0, "None (Кэширование выключено)");
             ui.radio_value(&mut self.draft.render_cache_mode, 1, "Smart Cache (Автоматический кэш DaVinci Resolve - Рекомендуется)");
             ui.radio_value(&mut self.draft.render_cache_mode, 2, "User Cache (Кэшировать клипы по выбору пользователя)");
 
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             ui.label(
                 egui::RichText::new("💡 В режиме Smart Cache система сама определяет ресурсоемкие участки, переходы и цветокоррекцию и кэширует их в фоне.")
                     .size(10.0)
-                    .color(ResolveColors::TEXT_MUTED),
+                    .color(Color32::from_rgb(0x82, 0x88, 0x96)),
             );
         });
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Параметры фонового кэширования").strong().size(12.0));
-            ui.add_space(4.0);
-
-            ui.horizontal(|ui| {
-                ui.label("Задержка старта фонового кэширования при простое:");
+        pref_card(ui, "BACKGROUND CACHE TIMING", Some("Таймаут запуска фонового рендера"), |ui| {
+            pref_row(ui, "Задержка при простое:", |ui| {
                 ui.add(
                     egui::Slider::new(&mut self.draft.auto_cache_idle_secs, 0.5..=10.0)
                         .step_by(0.5)
@@ -836,26 +768,8 @@ impl PreferencesModalState {
     }
 
     fn render_color_scopes(&mut self, ui: &mut Ui) {
-        let (accent, _) = get_accent_colors(self.draft.theme_accent_idx);
-
-        ui.heading(
-            egui::RichText::new("🎨 Color Science & Scopes")
-                .color(accent)
-                .size(15.0),
-        );
-        ui.label(
-            egui::RichText::new("Цветовые пространства, точность мониторинга и скоупы (Waveform, Vectorscope):")
-                .size(11.0)
-                .color(ResolveColors::TEXT_MUTED),
-        );
-        ui.add_space(10.0);
-
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Цветовое управление (Color Management)").strong().size(12.0));
-            ui.add_space(4.0);
-
-            ui.horizontal(|ui| {
-                ui.label("Color Science:");
+        pref_card(ui, "COLOR MANAGEMENT", Some("Цветовые пространства и калибровка"), |ui| {
+            pref_row(ui, "Color Science:", |ui| {
                 egui::ComboBox::from_id_salt("cs_science_combo")
                     .selected_text(match self.draft.color_science {
                         1 => "DaVinci YRGB Color Managed (RCM)",
@@ -871,8 +785,7 @@ impl PreferencesModalState {
 
             ui.add_space(4.0);
 
-            ui.horizontal(|ui| {
-                ui.label("Цветовое пространство таймлайна:");
+            pref_row(ui, "Цветовое пространство:", |ui| {
                 egui::ComboBox::from_id_salt("cs_space_combo")
                     .selected_text(match self.draft.timeline_color_space {
                         1 => "Rec.709 (Scene)",
@@ -889,15 +802,12 @@ impl PreferencesModalState {
             });
         });
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Параметры видеомониторов и скоупов (Scopes)").strong().size(12.0));
-            ui.add_space(4.0);
-
+        pref_card(ui, "VIDEO MONITORS & SCOPES", Some("Параметры графиков Waveform, Vectorscope и Histogram"), |ui| {
             ui.checkbox(&mut self.draft.scopes_quality_high, "Высокая точность скоупов 10-bit (High Precision Scopes)");
-            ui.horizontal(|ui| {
-                ui.label("Яркость трассировки скоупов:");
+            ui.add_space(4.0);
+            pref_row(ui, "Яркость трассировки:", |ui| {
                 ui.add(
                     egui::Slider::new(&mut self.draft.scopes_brightness, 0.1..=1.0)
                         .step_by(0.05)

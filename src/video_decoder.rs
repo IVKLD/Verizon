@@ -641,15 +641,18 @@ impl VideoPlayer {
             }
         }
 
+        let is_continuous_playback = self.is_playing_mode
+            && self.last_decoded_frame >= 0
+            && (target_frame - self.last_decoded_frame).abs() <= 5;
+
         let mut dropped = 0;
         while let Some(&(f_num, _)) = self.frame_queue.front() {
             if f_num <= target_frame {
                 let Some((f, img)) = self.frame_queue.pop_front() else { break; };
-                // Если включен режим Drop Frame (по умолчанию как в Resolve) и в очереди есть более актуальный кадр,
-                // при этом текущий кадр реально отстал от плейхеда минимум на 2 кадра (устраняет ложные дропы от 60Hz VSync фазового биения),
-                // устаревший кадр отбрасывается без отображения для поддержания точной скорости 1.0x
-                let really_late = target_frame - f >= 2 || self.frame_queue.len() >= 2 && self.frame_queue[1].0 <= target_frame;
+                // Кадр реально отстал от живого воспроизведения минимум на 2 кадра
+                let really_late = target_frame - f >= 2;
                 if self.drop_frames_enabled
+                    && is_continuous_playback
                     && really_late
                     && self.frame_queue.front().map(|(next_f, _)| *next_f <= target_frame).unwrap_or(false)
                 {
@@ -660,8 +663,6 @@ impl VideoPlayer {
                         garbage.extend(Arc::try_unwrap(old_best).ok());
                     }
                     best_frame = f;
-                    // Если этот кадр отстал всего на 1 кадр из-за фазы 60Hz VSync — показываем его сейчас,
-                    // а следующий кадр (f+1 == target_frame) оставляем в голове очереди на следующий тик!
                     if !really_late {
                         break;
                     }
@@ -670,13 +671,17 @@ impl VideoPlayer {
                 break;
             }
         }
-        self.dropped_frames_count += dropped;
+        if is_continuous_playback {
+            self.dropped_frames_count += dropped;
+        }
 
         while self.frame_queue.len() > 90 {
             if let Some((_, old_img)) = self.frame_queue.pop_front() {
                 garbage.extend(Arc::try_unwrap(old_img).ok());
             }
-            self.dropped_frames_count += 1;
+            if is_continuous_playback {
+                self.dropped_frames_count += 1;
+            }
         }
 
         if let Some(img) = best_img {
@@ -714,7 +719,7 @@ impl VideoPlayer {
             self.real_playback_fps = (self.rendered_frames_in_sample as f32 / elapsed).round();
             self.rendered_frames_in_sample = 0;
             self.fps_sample_time = now;
-            self.is_dropping_frames = self.real_playback_fps < (self.fps as f32 - 1.5) || self.dropped_frames_count > 0;
+            self.is_dropping_frames = self.real_playback_fps < (self.fps as f32 - 1.5) && self.dropped_frames_count > 0;
         }
     }
 
@@ -740,12 +745,13 @@ impl VideoPlayer {
 
     /// Принудительно перевести декодер в режим паузы с очисткой очередей
     pub fn pause(&mut self) {
+        self.dropped_frames_count = 0;
+        self.is_dropping_frames = false;
         if self.is_playing_mode {
             self.is_playing_mode = false;
             self.current_epoch = self.current_epoch.max(self.prefetch_epoch).wrapping_add(1);
             self.clear_queues_async();
             self.prefetch_target = None;
-            self.is_dropping_frames = false;
             if let Some(tx) = &self.command_tx {
                 let _ = tx.send(DecoderCommand::Pause { epoch: self.current_epoch });
             }
@@ -2160,5 +2166,33 @@ mod tests {
         for w in rendered_frames.windows(2) {
             assert!(w[0] < w[1], "Кадры должны идти строго последовательно: {} -> {}", w[0], w[1]);
         }
+    }
+
+    #[test]
+    fn test_drop_frame_counter_ignores_seek_and_scrubbing() {
+        let mut player = VideoPlayer::new();
+        let dummy_img = Arc::new(ColorImage::new([2, 2], vec![egui::Color32::BLACK; 4]));
+        
+        // Добавляем фиктивные кадры в очередь с большими разрывами
+        player.frame_queue.push_back((10, dummy_img.clone()));
+        player.frame_queue.push_back((20, dummy_img.clone()));
+        player.frame_queue.push_back((30, dummy_img.clone()));
+
+        // Режим скраббинга / перехода (is_playing = false)
+        let ctx = egui::Context::default();
+        player.is_playing_mode = false;
+        player.last_decoded_frame = 0;
+        
+        // Прыжок на 10 000 кадров вперед (как часто бывает при скраббинге таймлайна)
+        player.update_playback(10_000, false, &ctx);
+        assert_eq!(player.dropped_frames_count, 0, "Скраббинг и перемещение плейхеда не должны увеличивать дроп-кадры");
+        assert!(!player.is_dropping_frames);
+
+        // Переключение в паузу сбрасывает счетчик
+        player.dropped_frames_count = 42;
+        player.is_dropping_frames = true;
+        player.pause();
+        assert_eq!(player.dropped_frames_count, 0);
+        assert!(!player.is_dropping_frames);
     }
 }

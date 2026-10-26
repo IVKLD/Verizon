@@ -83,8 +83,12 @@ impl ViewerState {
                     video_player.last_playback_target = src_f;
                 }
                 if timeline.is_playing && !timeline.is_scrubbing {
-                    video_player.is_playing_mode = true;
+                    if !video_player.is_playing_mode {
+                        video_player.is_playing_mode = true;
+                        video_player.dropped_frames_count = 0;
+                    }
                 } else {
+                    video_player.pause();
                     video_player.reset_blend();
                 }
                 cache_hit = true;

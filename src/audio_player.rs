@@ -210,7 +210,8 @@ impl AudioPlayer {
         self.engine.volume_bits.store(vol.to_bits(), Ordering::Relaxed);
     }
 
-    /// Получить текущий уровень мастер-громкости
+    /// Получить текущий уровень мастер-громкости (для тестов)
+    #[cfg(test)]
     pub fn get_master_volume(&self) -> f32 {
         f32::from_bits(self.engine.volume_bits.load(Ordering::Relaxed))
     }
