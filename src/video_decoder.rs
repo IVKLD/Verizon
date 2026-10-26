@@ -51,9 +51,6 @@ pub struct VideoPlayer {
     // Время последнего отправленного запроса (для троттлинга скраббинга)
     pub last_request_time: std::time::Instant,
 
-    // Преаллоцированный буфер для плейсхолдера
-    placeholder_buffer: Vec<u8>,
-
     // Мониторинг производительности реального времени (DaVinci Drop Frame Indicator)
     pub real_playback_fps: f32,
     pub dropped_frames_count: u64,
@@ -170,7 +167,6 @@ impl VideoPlayer {
             prefetch_queue: VecDeque::new(),
             is_playing_mode: false,
             last_request_time: std::time::Instant::now(),
-            placeholder_buffer: Vec::new(),
             real_playback_fps: 24.0,
             dropped_frames_count: 0,
             is_dropping_frames: false,
@@ -801,7 +797,7 @@ impl VideoPlayer {
             return;
         }
         self.back_frame = -1;
-        let img = self.generate_placeholder();
+        let img = Self::generate_placeholder();
         if let Some(tex) = &mut self.texture {
             tex.set(img, TextureOptions::NEAREST);
         } else {
@@ -900,7 +896,7 @@ impl VideoPlayer {
         }
 
         // Если файл не открыт, отображаем нейтральный экран Resolve
-        let img = self.generate_placeholder();
+        let img = Self::generate_placeholder();
         if let Some(tex) = &mut self.texture {
             tex.set(img, TextureOptions::NEAREST);
         } else {
@@ -1842,25 +1838,8 @@ impl VideoPlayer {
     }
 
     /// Чистый экран ожидания медиа
-    fn generate_placeholder(&mut self) -> ColorImage {
-        let w = 640;
-        let h = 360;
-        if self.placeholder_buffer.len() != w * h * 4 {
-            self.placeholder_buffer.resize(w * h * 4, 0);
-        }
-
-        for y in 0..h {
-            let row = y * w * 4;
-            for x in 0..w {
-                let idx = row + x * 4;
-                self.placeholder_buffer[idx] = 18;      // #121315 DaVinci Dark
-                self.placeholder_buffer[idx + 1] = 19;
-                self.placeholder_buffer[idx + 2] = 21;
-                self.placeholder_buffer[idx + 3] = 255;
-            }
-        }
-
-        ColorImage::from_rgba_unmultiplied([w, h], &self.placeholder_buffer)
+    fn generate_placeholder() -> ColorImage {
+        ColorImage::new([2, 2], vec![egui::Color32::from_rgb(18, 19, 21); 4])
     }
 }
 
