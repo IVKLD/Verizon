@@ -427,13 +427,13 @@ impl ViewerState {
             painter.rect_filled(rect, CornerRadius::same(2), Color32::from_rgb(0x0a, 0x0b, 0x0d));
             painter.rect_stroke(rect, CornerRadius::same(2), Stroke::new(1.0, ResolveColors::BORDER), StrokeKind::Inside);
 
-            let active_clips: Vec<_> = timeline
+            let top_clip = timeline
                 .clips
                 .iter()
-                .filter(|c| !c.is_audio && c.contains_frame(timeline.playhead_frame))
-                .collect();
+                .rev()
+                .find(|c| !c.is_audio && c.contains_frame(timeline.playhead_frame));
 
-            if let Some(top_clip) = active_clips.last() {
+            if let Some(top_clip) = top_clip {
                 let center = rect.center();
 
                 // Применение зума монитора (Fit / 50% / 100% / 200%)

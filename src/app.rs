@@ -854,23 +854,7 @@ impl eframe::App for NleApp {
             ctx.request_repaint();
         }
 
-        // 2. Многодорожечный Audio Mixer (Multi-Track Audio Engine)
-        if self.audio_player.has_new_decoded_audio() {
-            self.audio_player.export_waveforms_to(&self.waveform_mgr);
-            self.timeline.audio_dirty = true;
-            ctx.request_repaint();
-        }
-        if self.timeline.audio_dirty {
-            self.audio_player.rebuild_timeline_audio(&self.timeline);
-            self.timeline.audio_dirty = false;
-        }
-        self.audio_player.sync_playhead_frame(
-            self.timeline.playhead_frame,
-            self.timeline.fps,
-            self.timeline.is_playing && !self.video_player.is_prerolling(),
-        );
-
-        // 5. Верхний бар меню и Нижний бар переключения страниц DaVinci Resolve
+        // 2. Верхний бар меню и Нижний бар переключения страниц DaVinci Resolve
         self.render_top_bar(ui);
         self.render_bottom_page_bar(ui);
 

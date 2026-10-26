@@ -104,21 +104,33 @@ impl MediaPoolState {
             has_audio = audio_tracks_count > 0 || a_stream.is_some();
 
             if let Some(stream) = v_stream {
-                if let Ok(decoder) = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters()) {
+                let (w, h) = unsafe {
+                    let ptr = stream.parameters().as_ptr();
+                    ((*ptr).width, (*ptr).height)
+                };
+                if w > 0 && h > 0 {
+                    res = format!("{}x{}", w, h);
+                } else if let Ok(decoder) = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters()) {
                     if let Ok(v_dec) = decoder.decoder().video() {
                         res = format!("{}x{}", v_dec.width(), v_dec.height());
-                        let mut f = f64::from(stream.avg_frame_rate());
-                        if f <= 0.0 || f.is_nan() {
-                            f = f64::from(stream.rate());
-                        }
-                        if f > 0.0 && !f.is_nan() {
-                            fps_num = f;
-                            fps_str = format!("{:.2} fps", f);
-                        }
                     }
                 }
+                let mut f = f64::from(stream.avg_frame_rate());
+                if f <= 0.0 || f.is_nan() {
+                    f = f64::from(stream.rate());
+                }
+                if f > 0.0 && !f.is_nan() {
+                    fps_num = f;
+                    fps_str = format!("{:.2} fps", f);
+                }
             } else if let Some(stream) = a_stream {
-                if let Ok(decoder) = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters()) {
+                let (sample_rate, channels) = unsafe {
+                    let ptr = stream.parameters().as_ptr();
+                    ((*ptr).sample_rate, (*ptr).ch_layout.nb_channels)
+                };
+                if sample_rate > 0 {
+                    res = format!("{} Hz {}ch", sample_rate, channels);
+                } else if let Ok(decoder) = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters()) {
                     if let Ok(a_dec) = decoder.decoder().audio() {
                         res = format!("{} Hz {}ch", a_dec.rate(), a_dec.channels());
                     }

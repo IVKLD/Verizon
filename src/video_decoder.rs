@@ -909,6 +909,12 @@ impl VideoPlayer {
             return;
         }
         if self.is_real_video {
+            if let Some(dist) = self.try_apply_scrub_cache(target_frame, 0, ctx) {
+                if dist == 0 {
+                    self.last_playback_target = target_frame;
+                    return;
+                }
+            }
             self.last_request_time = std::time::Instant::now();
             self.last_playback_target = target_frame;
             self.current_epoch = self.current_epoch.wrapping_add(1);
@@ -1816,7 +1822,7 @@ impl VideoPlayer {
                     if src_start + w * 4 > data.len() {
                         return None;
                     }
-                    px.extend(bytemuck::pod_collect_to_vec::<u8, egui::Color32>(&data[src_start..src_start + w * 4]));
+                    px.extend_from_slice(bytemuck::cast_slice::<u8, egui::Color32>(&data[src_start..src_start + w * 4]));
                 }
                 px
             };

@@ -974,6 +974,10 @@ impl TimelineView {
 
                         let mut x = visible_start_x;
                         let step_px = 2.0;
+                        let mut mesh = egui::Mesh::default();
+                        let wave_color = Color32::from_rgb(0x38, 0xd4, 0x8a);
+                        let silence_color = Color32::from_rgba_unmultiplied(255, 255, 255, 45);
+
                         while x < visible_end_x {
                             let rel_x = x - rect.min.x;
                             let sec_in_clip = rel_x as f64 * sec_per_px as f64;
@@ -984,17 +988,20 @@ impl TimelineView {
 
                             if amp > 0.005 {
                                 let bar_h = (amp * half_h).max(1.0);
-                                painter.line_segment(
-                                    [pos2(x, mid_y - bar_h), pos2(x, mid_y + bar_h)],
-                                    Stroke::new(1.5, Color32::from_rgb(0x38, 0xd4, 0x8a)), // Зеленый цвет Resolve Audio Waveform
+                                mesh.add_colored_rect(
+                                    Rect::from_min_max(pos2(x - 0.75, mid_y - bar_h), pos2(x + 0.75, mid_y + bar_h)),
+                                    wave_color,
                                 );
                             } else {
-                                painter.line_segment(
-                                    [pos2(x, mid_y), pos2(x + step_px, mid_y)],
-                                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 45)),
+                                mesh.add_colored_rect(
+                                    Rect::from_min_max(pos2(x, mid_y - 0.5), pos2(x + step_px, mid_y + 0.5)),
+                                    silence_color,
                                 );
                             }
                             x += step_px;
+                        }
+                        if !mesh.is_empty() {
+                            painter.add(egui::Shape::mesh(mesh));
                         }
                     } else {
                         waveform_mgr.request_waveform_stream(path, clip.source_audio_stream, ctx.clone());
