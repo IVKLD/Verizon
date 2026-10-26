@@ -247,6 +247,19 @@ impl ViewerState {
                                     }
                                 }
                             }
+
+                            // Если это самый первый кадр клипа, гарантируем кэширование от самого начала клипа clip.start_frame
+                            if src_f == 0 && clip.source_in_secs <= 0.001 {
+                                for tl_f in clip.start_frame..=base_tl {
+                                    if clip.contains_frame(tl_f) {
+                                        let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
+                                        if !render_cache.is_cached(tl_f) {
+                                            render_cache.insert(tl_f, std::sync::Arc::clone(&img), sig);
+                                            inserted_any = true;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -705,8 +718,14 @@ impl ViewerState {
                     }
 
                     if clip_mutated {
-                        timeline.structure_dirty = true;
                         ui.ctx().request_repaint();
+                    }
+
+                    let any_drag_stopped = body_resp.drag_stopped()
+                        || resp_lt.drag_stopped() || resp_rt.drag_stopped() || resp_lb.drag_stopped() || resp_rb.drag_stopped()
+                        || resp_tc.drag_stopped() || resp_bc.drag_stopped() || resp_lc.drag_stopped() || resp_rc.drag_stopped();
+                    if any_drag_stopped {
+                        let _ = timeline.save_scene_file(&crate::preferences::UserPreferences::scene_path());
                     }
 
                     // Отрисовка ручек поверх рамки

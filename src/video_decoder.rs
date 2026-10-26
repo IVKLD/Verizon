@@ -521,8 +521,9 @@ impl VideoPlayer {
                 }
             } else {
                 let jump = target_frame - self.last_playback_target;
-                // Сбрасываем очередь и отправляем Play только при РЕАЛЬНОМ скачке пользователем или на склейке (назад или вперед >8 кадров)
-                if jump < -2 || jump > 8 {
+                // Сбрасываем очередь и отправляем Play только при РЕАЛЬНОМ скачке пользователем (назад или вперед >60 кадров, т.е. целый GOP)
+                // Не сбрасываем конвейер при небольших задержках UI (потеря фокуса, драг окна), чтобы воспроизведение не заикалось!
+                if jump < -2 || jump > 60 {
                     if self.prefetch_target.map(|pf| (target_frame - pf).abs() <= 2).unwrap_or(false) {
                         // Склейка уже предзагружена в фоновом потоке (Zero-Latency Cut)!
                         self.current_epoch = self.prefetch_epoch;

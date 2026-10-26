@@ -961,7 +961,8 @@ impl eframe::App for NleApp {
             if let Some(clip) = self.timeline.active_video_clip_at(cur_playhead) {
                 if !clip.is_disabled {
                     if let Some(ref path) = clip.source_path {
-                        for tl_f in cur_playhead..clip.end_frame() {
+                        let start_f = (cur_playhead - 30).max(clip.start_frame);
+                        for tl_f in start_f..clip.end_frame() {
                             if !self.render_cache.is_cached(tl_f) {
                                 let src_f = clip.source_frame_from_timeline(tl_f, self.timeline.fps);
                                 let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(&self.timeline, tl_f);
@@ -1071,6 +1072,7 @@ impl eframe::App for NleApp {
         } else if self.timeline.is_playing && !self.timeline.is_scrubbing {
             self.timeline.step_playback(delta);
             ctx.request_repaint(); // 144+ FPS перерисовка при активном воспроизведении
+            ctx.request_repaint_after(std::time::Duration::from_millis(16)); // Гарантирует тактирование даже при потере фокуса
         } else if self.timeline.is_scrubbing {
             self.timeline.frame_accumulator = 0.0;
             ctx.request_repaint();

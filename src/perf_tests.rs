@@ -1730,14 +1730,14 @@ fn test_interactive_transform_modifies_clip_position_and_zoom() {
         target_clip.zoom_x = (target_clip.zoom_x + zoom_change).clamp(0.05, 10.0);
         target_clip.zoom_y = (target_clip.zoom_y + zoom_change).clamp(0.05, 10.0);
     }
-    timeline.structure_dirty = true;
+    // Интерактивный Transform не должен взводить structure_dirty, чтобы воспроизведение не заикалось!
+    assert!(!timeline.structure_dirty);
 
     let updated = timeline.clips.iter().find(|c| c.id == 42).unwrap();
     assert_eq!(updated.position_x, 50.0);
     assert_eq!(updated.position_y, -25.0);
     assert_eq!(updated.zoom_x, 1.25);
     assert_eq!(updated.zoom_y, 1.25);
-    assert!(timeline.structure_dirty);
 }
 
 #[test]
@@ -2337,6 +2337,91 @@ fn test_real_file_seek_prerenders_full_gop_sector() {
         "При переходе на кадр 30 он обязан попасть в newly_cached_frames! Всего: {}",
         player.newly_cached_frames.len()
     );
+}
+
+/// 16. Тест: трансформация клипа во время воспроизведения не сбрасывает декодер и не вызывает заиканий
+#[test]
+fn test_transform_during_playback_does_not_flush_player_or_stutter() {
+    let mut timeline = TimelineState::new_empty();
+    timeline.fps = 60;
+    timeline.is_playing = true;
+    let clip = Clip {
+        id: 77,
+        name: "PlayTransform".to_string(),
+        track_index: 0,
+        start_frame: 0,
+        duration_frames: 300,
+        position_x: 0.0,
+        position_y: 0.0,
+        zoom_x: 1.0,
+        zoom_y: 1.0,
+        ..Default::default()
+    };
+    timeline.clips.push(clip);
+
+    let mut player = VideoPlayer::new();
+    player.is_real_video = true;
+    let (tx, _rx) = std::sync::mpsc::channel();
+    player.command_tx = Some(tx);
+    let ctx = egui::Context::default();
+
+    // Запускаем воспроизведение
+    player.update_playback(10, true, &ctx);
+    let epoch_before = player.current_epoch;
+
+    // Пользователь на лету меняет Transform (интерактивный драг мыши)
+    if let Some(target) = timeline.clips.iter_mut().find(|c| c.id == 77) {
+        target.position_x += 15.0;
+        target.zoom_x = 1.2;
+    }
+    // Transform НЕ должен сбрасывать structure_dirty
+    assert!(!timeline.structure_dirty, "Transform не должен взводить structure_dirty!");
+
+    // Следующий кадр воспроизведения
+    player.update_playback(11, true, &ctx);
+
+    // Эпоха не должна смениться, очередь не сброшена!
+    assert_eq!(player.current_epoch, epoch_before, "Эпоха декодера не должна сбрасываться при трансформации!");
+}
+
+/// 17. Тест: потеря фокуса (задержки UI на 10-25 кадров) не перезапускает поток декодера и не дергает аудио
+#[test]
+fn test_playback_focus_loss_does_not_restart_decoder_or_yank_audio() {
+    let ctx = egui::Context::default();
+    let mut player = VideoPlayer::new();
+    player.is_real_video = true;
+    let (tx, rx) = std::sync::mpsc::channel();
+    player.command_tx = Some(tx);
+
+    let audio = AudioPlayer::new();
+
+    // Старт воспроизведения
+    player.update_playback(100, true, &ctx);
+    audio.sync_playhead_frame(100, 60, true);
+    let epoch_initial = player.current_epoch;
+    let audio_sample_initial = audio.engine.pos.load(std::sync::atomic::Ordering::Acquire);
+
+    // Дренируем команды старта
+    while rx.try_recv().is_ok() {}
+
+    // Окно теряет фокус в Wayland: UI пропускает 15 кадров (~250 мс)
+    player.update_playback(115, true, &ctx);
+
+    // Проверяем, что декодер НЕ сбросил эпоху и не отправил повторный Play (только UpdatePlayhead)
+    assert_eq!(player.current_epoch, epoch_initial, "Потеря фокуса не должна сбрасывать эпоху видеодекодера!");
+    let mut saw_play_restart = false;
+    while let Ok(cmd) = rx.try_recv() {
+        if let crate::video_decoder::DecoderCommand::Play { .. } = cmd {
+            saw_play_restart = true;
+        }
+    }
+    assert!(!saw_play_restart, "Потеря фокуса не должна перезапускать Play в декодере!");
+
+    // Аудио поток продолжает играть плавно (не дергается назад/вперед)
+    audio.sync_playhead_frame(115, 60, true);
+    // Позиция аудио не должна быть аварийно сброшена
+    let cur_pos = audio.engine.pos.load(std::sync::atomic::Ordering::Acquire);
+    assert_eq!(cur_pos, audio_sample_initial, "Аудио поток не должен дергаться при небольших лагах интерфейса!");
 }
 
 

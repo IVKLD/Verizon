@@ -905,7 +905,9 @@ impl AudioPlayer {
                 } else {
                     let cur = engine.pos.load(Ordering::Acquire);
                     let diff = (cur as isize - target_sample as isize).abs();
-                    let threshold = (rate * 0.25 * 2.0) as isize;
+                    // Порог синхронизации 0.75с: обновляем только при реальной перемотке пользователем,
+                    // но никогда не сбиваем аппаратный буфер аудио при потере фокуса или микролагах GUI
+                    let threshold = (rate * 0.75 * 2.0) as isize;
                     if diff > threshold {
                         engine.pos.store(target_sample, Ordering::Release);
                     }
