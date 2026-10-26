@@ -266,7 +266,7 @@ impl MediaPageState {
             ui.separator();
 
             // Зона Drag & Drop
-            let (drop_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), egui::Sense::hover());
+            let (drop_rect, _) = ui.allocate_exact_size(vec2(ui.available_width().max(32.0), 32.0), egui::Sense::hover());
             let painter = ui.painter_at(drop_rect);
             painter.rect_filled(drop_rect, CornerRadius::same(2), Color32::from_rgb(0x1a, 0x1d, 0x22));
             painter.rect_stroke(

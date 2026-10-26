@@ -514,7 +514,8 @@ impl PreferencesModalState {
             let ratio = (nle_ram_mb / total_ram_mb).clamp(0.02, 0.95);
 
             let bar_height = 22.0;
-            let (bar_rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width() - 4.0, bar_height), egui::Sense::hover());
+            let bar_width = (ui.available_width() - 4.0).max(120.0);
+            let (bar_rect, _) = ui.allocate_exact_size(Vec2::new(bar_width, bar_height), egui::Sense::hover());
             let painter = ui.painter();
 
             // Фон всей шкалы
@@ -1176,5 +1177,42 @@ mod tests {
         assert_eq!(modal.draft.theme_accent_idx, 1);
         assert_eq!(modal.draft.ui_scale, 2.0);
         assert_eq!(modal.draft.proxy_resolution, 2);
+    }
+
+    #[test]
+    fn test_preferences_render_all_sections_no_panic() {
+        let ctx = Context::default();
+        let mut modal = PreferencesModalState::new();
+        let mut open = true;
+
+        let sections = [
+            (PrefTab::System, PrefSection::SystemMemoryGpu),
+            (PrefTab::System, PrefSection::SystemMediaStorage),
+            (PrefTab::System, PrefSection::SystemAudio),
+            (PrefTab::System, PrefSection::SystemHardware),
+            (PrefTab::User, PrefSection::UserAppearance),
+            (PrefTab::User, PrefSection::UserEditing),
+            (PrefTab::User, PrefSection::UserPlaybackCache),
+            (PrefTab::User, PrefSection::UserColorScopes),
+        ];
+
+        for (tab, sec) in sections {
+            modal.current_tab = tab;
+            modal.current_section = sec;
+
+            // Тест со стандартным размером
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ctx| {
+                let _ = modal.render(ctx, &mut open);
+            });
+            out.textures_delta.clear();
+
+            // Тест с критически малым размером экрана (проверка на отсутствие Negative child size)
+            let mut small_input = egui::RawInput::default();
+            small_input.screen_rect = Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(10.0, 10.0)));
+            let mut out_small = ctx.run_ui(small_input, |ctx| {
+                let _ = modal.render(ctx, &mut open);
+            });
+            out_small.textures_delta.clear();
+        }
     }
 }
