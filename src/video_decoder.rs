@@ -261,6 +261,9 @@ impl VideoPlayer {
         // Сбрасываем и корректно завершаем предыдущий фоновый воркер (если файл уже был открыт)
         self.command_tx = None;
         self.frame_rx = None;
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
         self.frame_queue.clear();
         self.scrub_cache.clear();
         self.prefetch_target = None;
@@ -627,24 +630,24 @@ impl VideoPlayer {
         let mut best_frame = self.last_decoded_frame;
 
         // Если еще ничего не отобразили или произошел скачок назад за пределы старого кадра
-        if (self.last_decoded_frame < 0 || self.last_decoded_frame > target_frame + 5) && !self.frame_queue.is_empty() {
-            let (f, img) = self.frame_queue.pop_front().unwrap();
-            best_img = Some(img);
-            best_frame = f;
+        if self.last_decoded_frame < 0 || self.last_decoded_frame > target_frame + 5 {
+            if let Some((f, img)) = self.frame_queue.pop_front() {
+                best_img = Some(img);
+                best_frame = f;
+            }
         }
 
         let mut dropped = 0;
         while let Some(&(f_num, _)) = self.frame_queue.front() {
             if f_num <= target_frame {
-                let (f, img) = self.frame_queue.pop_front().unwrap();
+                let Some((f, img)) = self.frame_queue.pop_front() else { break; };
                 // Если включен режим Drop Frame (по умолчанию как в Resolve) и в очереди есть более актуальный кадр,
                 // при этом текущий кадр реально отстал от плейхеда минимум на 2 кадра (устраняет ложные дропы от 60Hz VSync фазового биения),
                 // устаревший кадр отбрасывается без отображения для поддержания точной скорости 1.0x
                 let really_late = target_frame - f >= 2 || self.frame_queue.len() >= 2 && self.frame_queue[1].0 <= target_frame;
                 if self.drop_frames_enabled
                     && really_late
-                    && !self.frame_queue.is_empty()
-                    && self.frame_queue.front().unwrap().0 <= target_frame
+                    && self.frame_queue.front().map(|(next_f, _)| *next_f <= target_frame).unwrap_or(false)
                 {
                     garbage.push(img);
                     dropped += 1;
@@ -817,10 +820,14 @@ impl VideoPlayer {
                 let is_preview = raw_frame_num < 0;
                 let frame_num = if is_preview { -raw_frame_num - 1 } else { raw_frame_num };
                 if epoch != self.current_epoch && epoch <= self.last_displayed_epoch {
-                    newly_cached.push((frame_num, image));
+                    if !is_preview {
+                        newly_cached.push((frame_num, image));
+                    }
                     continue;
                 }
-                newly_cached.push((frame_num, image.clone()));
+                if !is_preview {
+                    newly_cached.push((frame_num, image.clone()));
+                }
                 self.last_displayed_epoch = self.last_displayed_epoch.max(epoch);
                 self.rendered_frames_in_sample += 1;
                 self.last_fingerprint = image_fingerprint(&image);
@@ -1380,7 +1387,7 @@ impl VideoPlayer {
                                                 h,
                                                 &mut rgba_buffer,
                                             ) {
-                                                if frame_tx.send((epoch, -(f_num + 1), kf_img)).is_err() {
+                                                if frame_tx.send((epoch, -(target_frame + 1), kf_img)).is_err() {
                                                     break 'worker_loop;
                                                 }
                                                 egui_ctx.request_repaint();
@@ -2103,7 +2110,7 @@ mod tests {
         let mut rendered_frames = Vec::new();
         for target_frame in 0..60 {
             player.update_playback(target_frame, true, &ctx);
-            if player.last_decoded_frame >= 0 && (rendered_frames.is_empty() || *rendered_frames.last().unwrap() != player.last_decoded_frame) {
+            if player.last_decoded_frame >= 0 && rendered_frames.last() != Some(&player.last_decoded_frame) {
                 rendered_frames.push(player.last_decoded_frame);
             }
             std::thread::sleep(std::time::Duration::from_millis(16));
@@ -2113,7 +2120,7 @@ mod tests {
         for _ in 0..15 {
             std::thread::sleep(std::time::Duration::from_millis(16));
             player.update_playback(59, true, &ctx);
-            if player.last_decoded_frame >= 0 && (rendered_frames.is_empty() || *rendered_frames.last().unwrap() != player.last_decoded_frame) {
+            if player.last_decoded_frame >= 0 && rendered_frames.last() != Some(&player.last_decoded_frame) {
                 rendered_frames.push(player.last_decoded_frame);
             }
         }

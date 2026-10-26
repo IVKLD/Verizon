@@ -182,7 +182,19 @@ impl AudioPlayer {
     ) -> Option<cpal::Stream> {
         let host = cpal::default_host();
         let device = host.default_output_device()?;
-        let config = device.default_output_config().ok()?;
+        let target_rate = AUDIO_RATE;
+        let config = device
+            .supported_output_configs()
+            .ok()
+            .and_then(|mut iter| {
+                iter.find(|c| {
+                    c.channels() == 2
+                        && c.min_sample_rate() <= target_rate
+                        && c.max_sample_rate() >= target_rate
+                })
+                .map(|c| c.with_sample_rate(target_rate))
+            })
+            .or_else(|| device.default_output_config().ok())?;
 
         let sample_format = config.sample_format();
         let err_fn = |err: cpal::Error| {
@@ -305,7 +317,7 @@ impl AudioPlayer {
         let audio_stream = audio_streams
             .get(audio_track_index)
             .or_else(|| audio_streams.first())
-            .unwrap();
+            .ok_or_else(|| "Аудиопотоки не найдены в медиафайле".to_string())?;
 
         let stream_idx = audio_stream.index();
         let context_decoder = ffmpeg_next::codec::context::Context::from_parameters(audio_stream.parameters())

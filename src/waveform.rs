@@ -252,7 +252,7 @@ impl WaveformManager {
         let audio_stream = audio_streams
             .get(audio_track_index)
             .or_else(|| audio_streams.first())
-            .unwrap();
+            .ok_or_else(|| "Аудиопотоки не найдены".to_string())?;
 
         let stream_idx = audio_stream.index();
         let context_decoder = ffmpeg_next::codec::context::Context::from_parameters(audio_stream.parameters())

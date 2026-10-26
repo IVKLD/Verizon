@@ -144,7 +144,7 @@ impl Autopilot {
         if v.is_empty() {
             return 0.0;
         }
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         v[((v.len() as f64 * p) as usize).min(v.len() - 1)]
     }
 

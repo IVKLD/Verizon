@@ -433,9 +433,8 @@ impl ViewerState {
                 .filter(|c| !c.is_audio && c.contains_frame(timeline.playhead_frame))
                 .collect();
 
-            if !active_clips.is_empty() {
+            if let Some(top_clip) = active_clips.last() {
                 let center = rect.center();
-                let top_clip = active_clips.last().unwrap();
 
                 // Применение зума монитора (Fit / 50% / 100% / 200%)
                 let monitor_scale = match self.zoom_mode {
