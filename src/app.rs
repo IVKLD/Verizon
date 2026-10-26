@@ -966,7 +966,7 @@ impl eframe::App for NleApp {
                                 let src_f = clip.source_frame_from_timeline(tl_f, self.timeline.fps);
                                 let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(&self.timeline, tl_f);
                                 uncached_batch.push((src_f, tl_f, sig));
-                                if uncached_batch.len() >= 24 {
+                                if uncached_batch.len() >= 120 {
                                     break;
                                 }
                             }
@@ -989,7 +989,7 @@ impl eframe::App for NleApp {
                                     let src_f = clip.source_frame_from_timeline(tl_f, self.timeline.fps);
                                     let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(&self.timeline, tl_f);
                                     uncached_batch.push((src_f, tl_f, sig));
-                                    if uncached_batch.len() >= 24 {
+                                    if uncached_batch.len() >= 120 {
                                         break;
                                     }
                                 }
@@ -1016,7 +1016,7 @@ impl eframe::App for NleApp {
                             let src_f = clip.source_frame_from_timeline(tl_f, self.timeline.fps);
                             let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(&self.timeline, tl_f);
                             uncached_batch.push((src_f, tl_f, sig));
-                            if uncached_batch.len() >= 24 {
+                            if uncached_batch.len() >= 120 {
                                 break;
                             }
                         }

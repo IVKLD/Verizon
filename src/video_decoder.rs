@@ -96,7 +96,7 @@ fn vaapi_render_nodes() -> Vec<PathBuf> {
 }
 
 /// Максимальное время ожидания первого кадра после старта воспроизведения (мс)
-const PREROLL_TIMEOUT_MS: u128 = 150;
+const PREROLL_TIMEOUT_MS: u128 = 500;
 /// Минимальный интервал между аппаратными запросами кадра при скраббинге (мс)
 const SCRUB_MIN_REQUEST_INTERVAL_MS: u128 = 80;
 /// Через сколько мс без доставки кадра запрос считается потерянным и отправляется заново
@@ -983,6 +983,9 @@ impl VideoPlayer {
         };
 
         if target_frame == self.last_exact_frame && target_frame == self.last_decoded_frame && self.texture.is_some() {
+            if let Some(ref img) = self.last_displayed_image {
+                self.newly_cached_frames.push((target_frame, Arc::clone(img)));
+            }
             return;
         }
 
@@ -993,6 +996,9 @@ impl VideoPlayer {
                 if dist == 0 {
                     self.last_playback_target = target_frame;
                     self.last_exact_frame = target_frame;
+                    if let Some(ref img) = self.last_displayed_image {
+                        self.newly_cached_frames.push((target_frame, Arc::clone(img)));
+                    }
                     return;
                 }
                 // Если dist > 0, мы показали ближайший кадр из скраб-кэша для мгновенного отклика (Zero-Lag),
@@ -1045,12 +1051,19 @@ impl VideoPlayer {
             target_frame.max(0)
         };
         if target_frame == self.last_exact_frame && target_frame == self.last_decoded_frame && self.texture.is_some() {
+            if let Some(ref img) = self.last_displayed_image {
+                self.newly_cached_frames.push((target_frame, Arc::clone(img)));
+            }
             return;
         }
         if self.is_real_video {
             if let Some(dist) = self.try_apply_scrub_cache(target_frame, 0, ctx) {
                 if dist == 0 {
                     self.last_playback_target = target_frame;
+                    self.last_exact_frame = target_frame;
+                    if let Some(ref img) = self.last_displayed_image {
+                        self.newly_cached_frames.push((target_frame, Arc::clone(img)));
+                    }
                     return;
                 }
             }
@@ -1082,7 +1095,6 @@ impl VideoPlayer {
         if self.last_exact_frame == target_frame && self.texture.is_some() {
             return true;
         }
-        eprintln!("[TEST] wait_for_frame timed out! target_frame={}, last_decoded_frame={}", target_frame, self.last_decoded_frame);
         false
     }
 
@@ -1386,10 +1398,10 @@ impl VideoPlayer {
                         target_frame
                     };
 
-                    let can_decode_forward = current_pts >= 0
+                    let can_decode_forward = !waiting_for_keyframe
+                        && current_pts >= 0
                         && target_pts >= current_pts
-                        && (target_pts - current_pts) <= gop_max_pts
-                        && !waiting_for_keyframe;
+                        && (target_pts - current_pts) <= gop_max_pts;
 
                     if !can_decode_forward {
                         unsafe {
@@ -1469,17 +1481,26 @@ impl VideoPlayer {
                                             } else {
                                                 pending_cmd = Some(DecoderCommand::Seek { target_frame, epoch });
                                                 aborted_seek = true;
+                                                waiting_for_keyframe = true;
+                                                current_pts = -1;
+                                                current_decoded_frame = -1;
                                                 break;
                                             }
                                         }
                                         DecoderCommand::Play { start_frame, epoch: newer_epoch } => {
                                             pending_cmd = Some(DecoderCommand::Play { start_frame, epoch: newer_epoch });
                                             aborted_seek = true;
+                                            waiting_for_keyframe = true;
+                                            current_pts = -1;
+                                            current_decoded_frame = -1;
                                             break;
                                         }
                                         DecoderCommand::Pause { epoch: newer_epoch } => {
                                             active_epoch = newer_epoch;
                                             aborted_seek = true;
+                                            waiting_for_keyframe = true;
+                                            current_pts = -1;
+                                            current_decoded_frame = -1;
                                             break;
                                         }
                                         DecoderCommand::UpdatePlayhead { playhead_frame: pf } => {
@@ -1495,8 +1516,13 @@ impl VideoPlayer {
 
                             if st.index() == stream_idx {
                                 waiting_for_keyframe = false;
-                                if video_decoder.send_packet(&packet).is_ok() {
-                                    while video_decoder.receive_frame(&mut decoded_frame).is_ok() {
+                                let send_res = video_decoder.send_packet(&packet);
+                                if send_res.is_ok() {
+                                    loop {
+                                    let recv_res = video_decoder.receive_frame(&mut decoded_frame);
+                                    if recv_res.is_err() {
+                                        break;
+                                    }
                                         let pts = decoded_frame.pts().unwrap_or(current_pts + frame_duration_pts);
                                         current_pts = pts;
                                         let f_num = (pts as f64 * time_base_f * fps).round() as i64;
@@ -1525,28 +1551,11 @@ impl VideoPlayer {
                                                 h,
                                                 &mut rgba_buffer,
                                             ) {
-                                                if frame_tx.send((epoch, -(target_frame + 1), kf_img)).is_err() {
+                                                if frame_tx.send((epoch, -(f_num + 1), kf_img)).is_err() {
                                                     break 'worker_loop;
                                                 }
                                                 egui_ctx.request_repaint();
                                                 keyframe_sent = true;
-                                            }
-                                        } else if f_num >= 0 {
-                                            // Кэшируем промежуточные декодированные кадры прямо в Render Cache!
-                                            // Это превращает обычный переход по таймлайну в мгновенный пререндер красной зоны!
-                                            if let Some(inter_img) = Self::scale_and_copy_frame(
-                                                &mut scaler,
-                                                &decoded_frame,
-                                                &mut sw_frame,
-                                                &mut rgba_frame,
-                                                w,
-                                                h,
-                                                &mut rgba_buffer,
-                                            ) {
-                                                if frame_tx.send((epoch, f_num, inter_img)).is_err() {
-                                                    break 'worker_loop;
-                                                }
-                                                egui_ctx.request_repaint();
                                             }
                                         }
                                     }
@@ -1805,23 +1814,23 @@ impl VideoPlayer {
                                     let f_num = (pts as f64 * time_base_f * fps).round() as i64;
                                     current_decoded_frame = f_num;
 
-                                    // Пропускаем медленный трансфер из VRAM в RAM для кадров до live_target (но отдаем ключевой кадр
-                                    // и промежуточные превью каждые 15 кадров при холодном старте или скачке в середину GOP!),
-                                    // чтобы декодер мгновенно догонял живой playhead_frame и выдавал стабильные 60 FPS!
-                                    let live_target = playhead_frame.max(start_playback_frame);
-                                    if f_num < live_target.saturating_sub(1) {
-                                        if !keyframe_preview_sent || (f_num - last_catchup_preview >= 15) {
+                                    // Кадры до start_playback_frame (разгон от ключевого кадра) передаем на масштабирование
+                                    // с их реальным номером кадра, чтобы они сразу попадали в RenderCache и превращали красную зону в синюю!
+                                    if f_num < start_playback_frame {
+                                        if !keyframe_preview_sent || (f_num - last_catchup_preview >= 2) {
                                             keyframe_preview_sent = true;
                                             last_catchup_preview = f_num;
                                             let mut moved = ffmpeg_next::util::frame::Video::empty();
                                             unsafe {
                                                 ffmpeg_next::ffi::av_frame_move_ref(moved.as_mut_ptr(), decoded_frame.as_mut_ptr());
                                             }
-                                            if !transfer_and_send(active_epoch, -(f_num + 1), moved, &recycle_rx, &scale_tx) {
+                                            if !transfer_and_send(active_epoch, f_num, moved, &recycle_rx, &scale_tx) {
                                                 break 'worker_loop;
                                             }
                                         }
-                                    } else if f_num >= start_playback_frame {
+                                    } else {
+                                        // f_num >= start_playback_frame: ВСЕ кадры обязаны попасть в конвейер и RenderCache,
+                                        // без пропусков и без образования красных «дыр» на таймлайне!
                                         keyframe_preview_sent = true;
                                         let mut moved = ffmpeg_next::util::frame::Video::empty();
                                         unsafe {
@@ -1960,12 +1969,19 @@ impl VideoPlayer {
                 if ffmpeg_next::ffi::av_hwframe_transfer_data(sw_frame.as_mut_ptr(), decoded_frame.as_ptr(), 0) == 0 {
                     &*sw_frame
                 } else {
-                    decoded_frame
+                    return None;
                 }
             } else {
                 decoded_frame
             }
         };
+
+        if frame_to_scale.format() == ffmpeg_next::format::Pixel::None
+            || frame_to_scale.width() == 0
+            || frame_to_scale.height() == 0
+        {
+            return None;
+        }
 
         // Адаптация формата конвертера при необходимости
         if scaler.input().format != frame_to_scale.format()

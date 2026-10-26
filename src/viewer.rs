@@ -174,13 +174,24 @@ impl ViewerState {
                     let target_src = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
                     if let Some(ref img) = video_player.last_displayed_image {
                         let presented_src = video_player.last_exact_frame;
-                        let is_match = presented_src == target_src
-                            || (video_player.total_frames > 0 && target_src >= video_player.total_frames && presented_src >= video_player.total_frames - 1);
+                        let is_match = (presented_src - target_src).abs() <= 1
+                            || (video_player.total_frames > 0 && target_src >= video_player.total_frames - 2 && presented_src >= video_player.total_frames - 2);
                         if is_match && clip.contains_frame(timeline.playhead_frame) {
                             let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, timeline.playhead_frame);
                             if !render_cache.is_cached(timeline.playhead_frame) {
                                 render_cache.insert(timeline.playhead_frame, std::sync::Arc::clone(img), sig);
                                 inserted_any = true;
+                            }
+                            if video_player.total_frames > 0 && target_src >= video_player.total_frames - 2 {
+                                for tl_f in timeline.playhead_frame..clip.end_frame() {
+                                    if clip.contains_frame(tl_f) {
+                                        let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
+                                        if !render_cache.is_cached(tl_f) {
+                                            render_cache.insert(tl_f, std::sync::Arc::clone(img), sig);
+                                            inserted_any = true;
+                                        }
+                                    }
+                                }
                             }
                         }
                         if presented_src >= 0 {
@@ -207,13 +218,32 @@ impl ViewerState {
                         }
                         if clip.source_path.as_ref() == Some(&current_path_buf) {
                             let base_tl = clip.timeline_frame_from_source(src_f, timeline.fps);
-                            let search_range = ((timeline.fps as f64 / clip.source_fps.max(1.0) / clip.speed.abs().max(0.01)).ceil() as i64).max(1);
+                            let search_range = ((timeline.fps as f64 / clip.source_fps.max(1.0) / clip.speed.abs().max(0.01)).ceil() as i64).max(2);
                             for tl_f in (base_tl - search_range)..=(base_tl + search_range) {
-                                if clip.contains_frame(tl_f) && clip.source_frame_from_timeline(tl_f, timeline.fps) == src_f {
-                                    let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
-                                    if !render_cache.is_cached(tl_f) {
-                                        render_cache.insert(tl_f, std::sync::Arc::clone(&img), sig);
-                                        inserted_any = true;
+                                if clip.contains_frame(tl_f) {
+                                    let tl_src = clip.source_frame_from_timeline(tl_f, timeline.fps);
+                                    let is_match = tl_src == src_f
+                                        || (video_player.total_frames > 0 && src_f >= video_player.total_frames - 2 && tl_src >= video_player.total_frames - 2);
+                                    if is_match {
+                                        let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
+                                        if !render_cache.is_cached(tl_f) {
+                                            render_cache.insert(tl_f, std::sync::Arc::clone(&img), sig);
+                                            inserted_any = true;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Если это последний кадр файла (хвост клипа), заполняем ВСЕ оставшиеся кадры клипа до его конца (Hold Frame),
+                            // устраняя перманентные красные сектора из-за разницы длительностей видео и контейнера!
+                            if video_player.total_frames > 0 && src_f >= video_player.total_frames - 2 {
+                                for tl_f in base_tl..clip.end_frame() {
+                                    if clip.contains_frame(tl_f) {
+                                        let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
+                                        if !render_cache.is_cached(tl_f) {
+                                            render_cache.insert(tl_f, std::sync::Arc::clone(&img), sig);
+                                            inserted_any = true;
+                                        }
                                     }
                                 }
                             }
