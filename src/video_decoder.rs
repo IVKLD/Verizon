@@ -1512,6 +1512,23 @@ impl VideoPlayer {
                                                 egui_ctx.request_repaint();
                                                 keyframe_sent = true;
                                             }
+                                        } else if f_num >= 0 {
+                                            // Кэшируем промежуточные декодированные кадры прямо в Render Cache!
+                                            // Это превращает обычный переход по таймлайну в мгновенный пререндер красной зоны!
+                                            if let Some(inter_img) = Self::scale_and_copy_frame(
+                                                &mut scaler,
+                                                &decoded_frame,
+                                                &mut sw_frame,
+                                                &mut rgba_frame,
+                                                w,
+                                                h,
+                                                &mut rgba_buffer,
+                                            ) {
+                                                if frame_tx.send((epoch, f_num, inter_img)).is_err() {
+                                                    break 'worker_loop;
+                                                }
+                                                egui_ctx.request_repaint();
+                                            }
                                         }
                                     }
                                 }

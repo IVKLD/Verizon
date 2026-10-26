@@ -107,7 +107,7 @@ impl Default for UserPreferences {
             render_cache_ram_mb: 2048,
             drop_frames_enabled: true,
             gpu_blending_enabled: true,
-            auto_cache_idle_secs: 2.0,
+            auto_cache_idle_secs: 0.2,
             proxy_resolution: 1, // Half (1/2)
             proxy_codec: 0,      // ProRes 422 Proxy
 
@@ -1174,8 +1174,8 @@ impl PreferencesModalState {
 
                 pref_grid_row(ui, "Задержка рендера:", |ui| {
                     ui.add(
-                        egui::Slider::new(&mut self.draft.auto_cache_idle_secs, 0.5..=10.0)
-                            .step_by(0.5)
+                        egui::Slider::new(&mut self.draft.auto_cache_idle_secs, 0.1..=5.0)
+                            .step_by(0.1)
                             .suffix(" сек при простое"),
                     );
                 });

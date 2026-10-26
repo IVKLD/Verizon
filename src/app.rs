@@ -942,7 +942,7 @@ impl eframe::App for NleApp {
         // Отслеживание активности пользователя для фонового Smart Cache в режиме ожидания (Idle)
         let user_busy = self.timeline.is_playing
             || self.timeline.is_scrubbing
-            || ctx.input(|i| i.pointer.any_down() || i.pointer.any_pressed());
+            || ctx.input(|i| i.pointer.primary_down());
 
         if user_busy {
             self.last_user_activity = std::time::Instant::now();
@@ -1038,6 +1038,10 @@ impl eframe::App for NleApp {
                     ctx.clone(),
                 );
             }
+        }
+
+        if self.bg_cache_engine.is_busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
 
         // 0. Обработка очереди импорта из таймлайна

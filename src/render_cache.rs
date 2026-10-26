@@ -410,6 +410,9 @@ impl BackgroundCacheEngine {
             if decoder.send_packet(&packet).is_ok() {
                 while decoder.receive_frame(&mut decoded_frame).is_ok() {
                     if cancel_flag.load(Ordering::Acquire) {
+                        if cached_count > 0 {
+                            egui_ctx.request_repaint();
+                        }
                         return;
                     }
                     let pts = decoded_frame.pts().unwrap_or(0);
@@ -448,6 +451,9 @@ impl BackgroundCacheEngine {
                             );
                             cache.insert(tl_f, Arc::new(color_img), sig);
                             cached_count += 1;
+                            if cached_count % 2 == 0 || target_map.is_empty() {
+                                egui_ctx.request_repaint();
+                            }
                         }
                     }
 
@@ -464,6 +470,9 @@ impl BackgroundCacheEngine {
             let _ = decoder.send_eof();
             while decoder.receive_frame(&mut decoded_frame).is_ok() {
                 if cancel_flag.load(Ordering::Acquire) {
+                    if cached_count > 0 {
+                        egui_ctx.request_repaint();
+                    }
                     return;
                 }
                 let pts = decoded_frame.pts().unwrap_or(0);

@@ -1859,6 +1859,49 @@ fn test_seek_preview_does_not_poison_render_cache_or_stall_exact_decode() {
     assert_eq!(intervals, vec![(100, 100)]);
 }
 
+#[test]
+fn test_smart_cache_responsive_idle_and_intermediate_frame_precache() {
+    use crate::render_cache::{RenderCacheManager, RenderCacheMode};
+    use crate::preferences::UserPreferences;
+
+    // 1. Проверяем отзывчивое значение задержки автокэша по умолчанию
+    let prefs = UserPreferences::default();
+    assert!(prefs.auto_cache_idle_secs <= 0.5, "Задержка автокэша должна быть отзывчивой (<= 0.5с), получено {}", prefs.auto_cache_idle_secs);
+
+    // 2. Проверяем, что промежуточные кадры, декодированные по пути к целевому, сразу сохраняются в newly_cached_frames
+    let ctx = egui::Context::default();
+    let mut player = VideoPlayer::new();
+    player.current_epoch = 1;
+    let (frame_tx, frame_rx) = std::sync::mpsc::channel();
+    player.frame_rx = Some(frame_rx);
+
+    let cache = RenderCacheManager::new(RenderCacheMode::Smart, 200);
+
+    // Воркер на пути к кадру 100 декодирует кадры 97, 98, 99, 100
+    let img = egui::ColorImage::example();
+    frame_tx.send((1, 97, img.clone())).unwrap();
+    frame_tx.send((1, 98, img.clone())).unwrap();
+    frame_tx.send((1, 99, img.clone())).unwrap();
+    frame_tx.send((1, 100, img)).unwrap();
+
+    player.poll_frames(&ctx);
+    assert_eq!(player.newly_cached_frames.len(), 4, "Все 4 промежуточных кадра должны быть сохранены");
+
+    // Имитация viewer.rs
+    for (src_f, arc_img) in player.newly_cached_frames.drain(..) {
+        cache.insert(src_f, arc_img, 12345);
+    }
+
+    assert!(cache.is_cached(97));
+    assert!(cache.is_cached(98));
+    assert!(cache.is_cached(99));
+    assert!(cache.is_cached(100));
+
+    let intervals = cache.cached_intervals();
+    assert_eq!(intervals, vec![(97, 100)], "Кадры 97..100 должны объединиться в один сплошной синий интервал");
+}
+
+
 
 
 
