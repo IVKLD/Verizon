@@ -578,6 +578,7 @@ impl VideoPlayer {
                 self.last_decoded_frame = target_frame;
                 self.last_exact_frame = target_frame;
                 self.last_playback_target = target_frame;
+                self.poll_frames(ctx);
             } else {
                 self.seek_and_decode(target_frame, ctx);
             }
@@ -622,7 +623,6 @@ impl VideoPlayer {
                 if raw_frame_num < 0 {
                     let preview_f = -raw_frame_num - 1;
                     if epoch <= self.current_epoch && (epoch == self.current_epoch || epoch > self.last_displayed_epoch) {
-                        newly_cached.push((preview_f, Arc::clone(&arc_img)));
                         if let Some((_, _, old_prev)) = fallback_preview.replace((epoch, preview_f, arc_img)) {
                             garbage.extend(Arc::try_unwrap(old_prev).ok());
                         }
@@ -927,24 +927,26 @@ impl VideoPlayer {
                     if self.newly_cached_frames.len() > 64 {
                         self.newly_cached_frames.remove(0);
                     }
+                    self.last_displayed_epoch = self.last_displayed_epoch.max(epoch);
                 }
-                self.last_displayed_epoch = self.last_displayed_epoch.max(epoch);
 
                 // Обновляем монитор только если кадр совпадает с целевым (плейхедом)
                 // или включен режим воспроизведения. Упреждающие кадры Smart Cache не сбивают текущий кадр паузы!
                 if self.is_playing_mode || frame_num == self.last_playback_target {
                     self.rendered_frames_in_sample += 1;
                     self.last_fingerprint = image_fingerprint(&arc_img);
-                    self.last_displayed_image = Some(Arc::clone(&arc_img));
-                    let data = ImageData::Color(arc_img);
+                    let data = ImageData::Color(Arc::clone(&arc_img));
                     if let Some(tex) = &mut self.texture {
                         tex.set(data, TextureOptions::LINEAR);
                     } else {
                         self.texture = Some(ctx.load_texture("video_frame", data, TextureOptions::LINEAR));
                     }
                     self.last_decoded_frame = frame_num;
-                    if !is_preview && epoch == self.current_epoch {
-                        self.last_exact_frame = frame_num;
+                    if !is_preview {
+                        self.last_displayed_image = Some(arc_img);
+                        if epoch == self.current_epoch {
+                            self.last_exact_frame = frame_num;
+                        }
                     }
                 }
             }

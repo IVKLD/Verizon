@@ -1081,10 +1081,11 @@ impl TimelineView {
                     if overlap_start < overlap_end {
                         let x1 = rect.min.x + (overlap_start as f32 * timeline.zoom_factor) - timeline.scroll_x;
                         let x2 = rect.min.x + (overlap_end as f32 * timeline.zoom_factor) - timeline.scroll_x;
-                        if x2 > rect.min.x && x1 < rect.max.x {
+                        let draw_x2 = (x1 + 3.0).max(x2);
+                        if draw_x2 > rect.min.x && x1 < rect.max.x {
                             let r = Rect::from_min_max(
                                 pos2(x1.max(rect.min.x), bar_y_min),
-                                pos2(x2.min(rect.max.x), bar_y_max),
+                                pos2(draw_x2.min(rect.max.x), bar_y_max),
                             );
                             cache_mesh.add_colored_rect(r, blue_cache);
                         }

@@ -1782,6 +1782,84 @@ fn test_waveform_zoom_peak_hold_stability() {
     }
 }
 
+#[test]
+fn test_seek_preview_does_not_poison_render_cache_or_stall_exact_decode() {
+    use crate::video_decoder::DecoderCommand;
+    use crate::render_cache::{RenderCacheManager, RenderCacheMode};
+
+    let ctx = egui::Context::default();
+    let mut player = VideoPlayer::new();
+    player.is_real_video = true;
+    player.fps = 60.0;
+
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    player.command_tx = Some(cmd_tx);
+
+    let (frame_tx, frame_rx) = std::sync::mpsc::channel();
+    player.frame_rx = Some(frame_rx);
+
+    let cache = RenderCacheManager::new(RenderCacheMode::Smart, 100);
+
+    // Пользователь ставит курсор на кадр 100
+    player.seek_and_decode(100, &ctx);
+
+    let cmd = cmd_rx.try_recv().expect("Команда Seek(100) должна быть отправлена");
+    let cmd_epoch = match cmd {
+        DecoderCommand::Seek { target_frame, epoch } => {
+            assert_eq!(target_frame, 100);
+            epoch
+        }
+        _ => panic!("Ожидалась команда Seek"),
+    };
+
+    // 1. Воркер отправляет превью ключевого кадра (-101)
+    let kf_preview = egui::ColorImage::example();
+    frame_tx.send((cmd_epoch, -(100 + 1), kf_preview)).unwrap();
+    player.poll_frames(&ctx);
+
+    // Проверяем, что превью обновляет экран для Zero-Lag Scrubbing, но НЕ выставляется как точный кадр 100
+    assert_eq!(player.last_decoded_frame, 100, "Превью отображается на мониторе для Zero-Lag Scrubbing");
+    assert_ne!(player.last_exact_frame, 100, "Превью не должно помечать last_exact_frame");
+    assert!(player.newly_cached_frames.is_empty(), "Превью не должно попадать в newly_cached_frames");
+    assert!(player.last_displayed_image.is_none(), "last_displayed_image не должно содержать превью");
+
+    // Имитация viewer.rs: кэш НЕ должен сохранять превью
+    let expected_src = 100;
+    if player.last_exact_frame == expected_src {
+        if let Some(ref img) = player.last_displayed_image {
+            cache.insert(100, std::sync::Arc::clone(img), 42);
+        }
+    }
+    assert!(!cache.is_cached(100), "Render Cache не должен быть отравлен превью ключевого кадра!");
+
+    // 2. Повторный клик/вызов на ту же позицию 100 не должен считать, что кадр уже готов
+    player.seek_and_decode(100, &ctx);
+    assert_ne!(player.last_exact_frame, 100);
+
+    // 3. Воркер наконец декодирует точный кадр 100
+    let exact_img = egui::ColorImage::example();
+    frame_tx.send((cmd_epoch, 100, exact_img)).unwrap();
+    player.poll_frames(&ctx);
+
+    assert_eq!(player.last_exact_frame, 100, "Точный кадр должен обновить last_exact_frame");
+    assert_eq!(player.last_decoded_frame, 100, "Точный кадр должен обновить last_decoded_frame");
+    assert_eq!(player.newly_cached_frames.len(), 1, "newly_cached_frames должен содержать точный кадр");
+    assert!(player.last_displayed_image.is_some(), "last_displayed_image должен содержать точный кадр");
+
+    // Теперь viewer.rs успешно сохраняет точный кадр в Render Cache
+    if player.last_exact_frame == expected_src {
+        if let Some(ref img) = player.last_displayed_image {
+            cache.insert(100, std::sync::Arc::clone(img), 42);
+        }
+    }
+    assert!(cache.is_cached(100), "Render Cache должен содержать точный кадр 100!");
+
+    // Проверяем, что интервалы кэша возвращают кадр 100
+    let intervals = cache.cached_intervals();
+    assert_eq!(intervals, vec![(100, 100)]);
+}
+
+
 
 
 

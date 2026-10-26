@@ -169,12 +169,11 @@ impl ViewerState {
                 let is_same_file = clip.source_path.as_deref() == video_player.current_path.as_deref();
                 if is_same_file {
                     let expected_src = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
-                    if cached_img.is_none()
-                        && (video_player.last_decoded_frame == expected_src
-                            || video_player.last_exact_frame == expected_src)
-                    {
+                    let mut inserted_any = false;
+                    if cached_img.is_none() && video_player.last_exact_frame == expected_src {
                         if let Some(ref img) = video_player.last_displayed_image {
                             render_cache.insert(timeline.playhead_frame, std::sync::Arc::clone(img), current_sig);
+                            inserted_any = true;
                         }
                     }
                     for (src_f, img) in video_player.newly_cached_frames.drain(..) {
@@ -182,7 +181,11 @@ impl ViewerState {
                         if clip.contains_frame(tl_f) {
                             let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
                             render_cache.insert(tl_f, img, sig);
+                            inserted_any = true;
                         }
+                    }
+                    if inserted_any {
+                        ctx.request_repaint();
                     }
                 } else {
                     video_player.newly_cached_frames.clear();
