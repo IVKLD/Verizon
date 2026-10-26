@@ -4,9 +4,16 @@ use crate::media_pool::MediaPoolState;
 use crate::theme::ResolveColors;
 use crate::video_decoder::VideoPlayer;
 
+#[derive(Debug, Clone)]
+pub struct StorageEntry {
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub display_name: String,
+}
+
 pub struct MediaPageState {
     pub current_directory: PathBuf,
-    pub storage_files: Vec<PathBuf>,
+    pub storage_files: Vec<StorageEntry>,
     pub selected_storage_file: Option<PathBuf>,
 }
 
@@ -30,17 +37,26 @@ impl MediaPageState {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_dir() || MediaPoolState::is_media_file(&path) {
-                    self.storage_files.push(path);
+                let is_dir = path.is_dir();
+                if is_dir || MediaPoolState::is_media_file(&path) {
+                    let file_name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown");
+                    let icon = if is_dir { "📁" } else { "🎬" };
+                    let display_name = format!("{} {}", icon, file_name);
+                    self.storage_files.push(StorageEntry {
+                        path,
+                        is_dir,
+                        display_name,
+                    });
                 }
             }
         }
         self.storage_files.sort_by(|a, b| {
-            let a_dir = a.is_dir();
-            let b_dir = b.is_dir();
-            if a_dir == b_dir {
-                a.file_name().cmp(&b.file_name())
-            } else if a_dir {
+            if a.is_dir == b.is_dir {
+                a.path.file_name().cmp(&b.path.file_name())
+            } else if a.is_dir {
                 std::cmp::Ordering::Less
             } else {
                 std::cmp::Ordering::Greater
@@ -138,18 +154,11 @@ impl MediaPageState {
                     let mut clicked_dir = None;
 
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        for path in &self.storage_files {
-                            let is_dir = path.is_dir();
-                            let is_sel = self.selected_storage_file.as_ref() == Some(path);
-                            let file_name = path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("unknown");
+                        for entry in &self.storage_files {
+                            let is_dir = entry.is_dir;
+                            let is_sel = self.selected_storage_file.as_ref() == Some(&entry.path);
 
-                            let icon = if is_dir { "📁" } else { "🎬" };
-                            let label_text = format!("{} {}", icon, file_name);
-
-                            let text = egui::RichText::new(label_text).size(11.0).color(if is_sel {
+                            let text = egui::RichText::new(&entry.display_name).size(11.0).color(if is_sel {
                                 ResolveColors::ACCENT_ORANGE
                             } else if is_dir {
                                 Color32::from_rgb(0xe0, 0xb0, 0x50)
@@ -159,11 +168,11 @@ impl MediaPageState {
 
                             if ui.selectable_label(is_sel, text).clicked() {
                                 if is_dir {
-                                    clicked_dir = Some(path.clone());
+                                    clicked_dir = Some(entry.path.clone());
                                 } else {
-                                    self.selected_storage_file = Some(path.clone());
+                                    self.selected_storage_file = Some(entry.path.clone());
                                     // Проигрывать выбранный файл
-                                    let _ = video_player.open_file(path, ctx);
+                                    let _ = video_player.open_file(&entry.path, ctx);
                                 }
                             }
                         }
@@ -310,7 +319,7 @@ impl MediaPageState {
                                         }
                                     }
                                     ui.label(
-                                        egui::RichText::new(format!("{} | {}", asset.resolution, asset.duration))
+                                        egui::RichText::new(&asset.summary)
                                             .size(9.0)
                                             .color(ResolveColors::TEXT_MUTED),
                                     );

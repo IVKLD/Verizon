@@ -13,6 +13,7 @@ pub struct MediaAsset {
     pub fps_num: f64,
     pub duration: String,
     pub duration_secs: f64,
+    pub summary: String,
     pub has_video: bool,
     pub has_audio: bool,
     pub audio_tracks_count: usize,
@@ -147,6 +148,7 @@ impl MediaPoolState {
             }
         }
 
+        let summary = format!("{} | {}", res, dur_str);
         let asset = MediaAsset {
             id: self.next_id,
             filename,
@@ -156,6 +158,7 @@ impl MediaPoolState {
             fps_num,
             duration: dur_str,
             duration_secs,
+            summary,
             has_video,
             has_audio,
             audio_tracks_count,
@@ -345,7 +348,7 @@ impl MediaPoolState {
 
                         let interact_resp = ui.interact(
                             frame_response.response.rect,
-                            ui.id().with(format!("asset_card_{}", asset.id)),
+                            ui.id().with(("asset_card", asset.id)),
                             egui::Sense::click_and_drag(),
                         );
 
