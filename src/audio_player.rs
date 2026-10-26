@@ -213,18 +213,28 @@ impl AudioPlayer {
         let host = cpal::default_host();
         let device = host.default_output_device()?;
         let target_rate = AUDIO_RATE;
-        let config = device
-            .supported_output_configs()
-            .ok()
-            .and_then(|mut iter| {
-                iter.find(|c| {
-                    c.channels() == 2
-                        && c.min_sample_rate() <= target_rate
-                        && c.max_sample_rate() >= target_rate
-                })
-                .map(|c| c.with_sample_rate(target_rate))
-            })
-            .or_else(|| device.default_output_config().ok())?;
+
+        // Приоритетный выбор конфигурации: в первую очередь нативный F32 Stereo 48kHz (PipeWire / ALSA)
+        let all_configs: Vec<_> = device.supported_output_configs().map(|c| c.collect()).unwrap_or_default();
+        let config = all_configs.iter().find(|c| {
+            c.channels() == 2
+                && c.sample_format() == cpal::SampleFormat::F32
+                && c.min_sample_rate() <= target_rate
+                && c.max_sample_rate() >= target_rate
+        })
+        .or_else(|| all_configs.iter().find(|c| {
+            c.channels() == 2
+                && c.sample_format() == cpal::SampleFormat::I16
+                && c.min_sample_rate() <= target_rate
+                && c.max_sample_rate() >= target_rate
+        }))
+        .or_else(|| all_configs.iter().find(|c| {
+            c.sample_format() == cpal::SampleFormat::F32
+                && c.min_sample_rate() <= target_rate
+                && c.max_sample_rate() >= target_rate
+        }))
+        .map(|c| c.with_sample_rate(target_rate))
+        .or_else(|| device.default_output_config().ok())?;
 
         let sample_format = config.sample_format();
         let err_fn = |err: cpal::Error| {
@@ -253,7 +263,6 @@ impl AudioPlayer {
                 let engine_clone = engine.clone();
                 let vu_l_clone = vu_l.clone();
                 let vu_r_clone = vu_r.clone();
-                // Буфер преобразования переиспользуется между вызовами коллбэка (без аллокаций в real-time)
                 let mut temp: Vec<f32> = Vec::new();
                 device.build_output_stream(
                     config.into(),
@@ -264,6 +273,46 @@ impl AudioPlayer {
                         Self::write_audio_data(&mut temp, &engine_clone, &vu_l_clone, &vu_r_clone);
                         for (dst, src) in data.iter_mut().zip(temp.iter()) {
                             *dst = (src * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                        }
+                    },
+                    err_fn,
+                    None,
+                )
+            }
+            cpal::SampleFormat::I32 => {
+                let engine_clone = engine.clone();
+                let vu_l_clone = vu_l.clone();
+                let vu_r_clone = vu_r.clone();
+                let mut temp: Vec<f32> = Vec::new();
+                device.build_output_stream(
+                    config.into(),
+                    move |data: &mut [i32], _| {
+                        if temp.len() != data.len() {
+                            temp.resize(data.len(), 0.0);
+                        }
+                        Self::write_audio_data(&mut temp, &engine_clone, &vu_l_clone, &vu_r_clone);
+                        for (dst, src) in data.iter_mut().zip(temp.iter()) {
+                            *dst = (src * i32::MAX as f32).clamp(i32::MIN as f32, i32::MAX as f32) as i32;
+                        }
+                    },
+                    err_fn,
+                    None,
+                )
+            }
+            cpal::SampleFormat::U8 => {
+                let engine_clone = engine.clone();
+                let vu_l_clone = vu_l.clone();
+                let vu_r_clone = vu_r.clone();
+                let mut temp: Vec<f32> = Vec::new();
+                device.build_output_stream(
+                    config.into(),
+                    move |data: &mut [u8], _| {
+                        if temp.len() != data.len() {
+                            temp.resize(data.len(), 0.0);
+                        }
+                        Self::write_audio_data(&mut temp, &engine_clone, &vu_l_clone, &vu_r_clone);
+                        for (dst, src) in data.iter_mut().zip(temp.iter()) {
+                            *dst = ((src * 127.0) + 128.0).clamp(0.0, 255.0) as u8;
                         }
                     },
                     err_fn,
@@ -908,5 +957,58 @@ mod tests {
         let (samples2, rate2) = res2.unwrap();
         assert_eq!(rate2, 48000);
         assert!(!samples2.is_empty());
+    }
+
+    #[test]
+    fn test_real_hardware_cpal_stream_playback() {
+        let path = Path::new("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
+        if !path.exists() {
+            return;
+        }
+        let mut player = AudioPlayer::new();
+        assert!(player._stream.is_some(), "Hardware CPAL stream must be active!");
+
+        // Загружаем аудио и собираем снимок таймлайна
+        let mut timeline = TimelineState::new_empty();
+        timeline.fps = 60;
+        let arc_buf = player.ensure_audio_stream_cached_sync(path, 0).expect("decode failed");
+        assert!(arc_buf.finished.load(Ordering::Acquire));
+        assert!(arc_buf.decoded_len.load(Ordering::Acquire) > 0);
+
+        let clip = crate::timeline::Clip {
+            id: 1,
+            name: "AudioClip".to_string(),
+            track_index: 2, // A1
+            start_frame: 0,
+            duration_frames: 600,
+            is_audio: true,
+            color: egui::Color32::BLUE,
+            source_path: Some(path.to_path_buf()),
+            source_in_frame: 0,
+            source_in_secs: 5.0, // с 5-й секунды где есть звук
+            source_fps: 60.0,
+            link_group: None,
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            position_x: 0.0,
+            position_y: 0.0,
+            rotation: 0.0,
+            opacity: 100.0,
+            volume_db: 0.0,
+            pan: 0.0,
+            source_audio_stream: 0,
+        };
+        timeline.clips.push(clip);
+        player.rebuild_timeline_audio(&timeline);
+
+        // Включаем воспроизведение на 300 мс в реальном CPAL-коллбэке
+        player.sync_playhead_frame(0, 60, true);
+        assert!(player.engine.is_playing.load(Ordering::Acquire));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let (vu_l, vu_r) = player.get_vu_levels();
+        println!("Real hardware CPAL VU levels after 300ms: L={:.4}, R={:.4}", vu_l, vu_r);
+        assert!(vu_l > 0.001 || vu_r > 0.001, "Real CPAL callback must process audio samples and generate non-zero VU!");
+        player.sync_playhead_frame(0, 60, false);
     }
 }
