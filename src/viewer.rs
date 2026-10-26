@@ -77,6 +77,7 @@ impl ViewerState {
             if let Some(cached_img) = render_cache.get(timeline.playhead_frame, current_sig) {
                 video_player.present_playback_frame(ctx, cached_img);
                 video_player.last_decoded_frame = timeline.playhead_frame;
+                video_player.last_playback_target = timeline.playhead_frame;
                 cache_hit = true;
             }
         }

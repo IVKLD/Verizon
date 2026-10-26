@@ -150,6 +150,11 @@ impl TimelineView {
             let y_top = ruler_rect.max.y + (i as f32 * track_height) - timeline.scroll_y;
             let track_row_rect = Rect::from_min_size(pos2(canvas_rect.min.x, y_top), vec2(canvas_rect.width(), track_height));
 
+            // Отсечение невидимых по вертикали дорожек
+            if track_row_rect.max.y < tracks_canvas_rect.min.y || track_row_rect.min.y > tracks_canvas_rect.max.y {
+                continue;
+            }
+
             // Фон полосы дорожки
             let bg_color = if i % 2 == 0 {
                 Color32::from_rgb(0x19, 0x1a, 0x1d)
@@ -169,6 +174,15 @@ impl TimelineView {
         let mut start_drag_request = None;
         let mut start_trim_request = None;
 
+        // Предварительное вычисление link_group выделенного клипа: O(N) один раз вместо O(N^2) сканирования
+        let selected_link_group = if timeline.linked_selection {
+            timeline.selected_clip_id.and_then(|sel_id| {
+                timeline.clips.iter().find(|c| c.id == sel_id).and_then(|c| c.link_group)
+            })
+        } else {
+            None
+        };
+
         for clip in &timeline.clips {
             if clip.track_index >= timeline.tracks.len() {
                 continue;
@@ -181,23 +195,18 @@ impl TimelineView {
                 vec2(clip_width, track_height - 4.0),
             );
 
-            // Видимость клипа в пределах canvas
-            if clip_rect.max.x < canvas_rect.min.x || clip_rect.min.x > canvas_rect.max.x {
+            // Полное 2D Frustum Culling клипа: горизонтальное и вертикальное отсечение
+            if clip_rect.max.x < canvas_rect.min.x
+                || clip_rect.min.x > canvas_rect.max.x
+                || clip_rect.max.y < tracks_canvas_rect.min.y
+                || clip_rect.min.y > tracks_canvas_rect.max.y
+            {
                 continue;
             }
 
-            // Связанная подсветка клипов при выделении
-            let is_selected = if let Some(sel_id) = timeline.selected_clip_id {
-                if sel_id == clip.id {
-                    true
-                } else if timeline.linked_selection && clip.link_group.is_some() {
-                    timeline.clips.iter().any(|c| c.id == sel_id && c.link_group == clip.link_group)
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
+            // Связанная подсветка клипов при выделении (O(1) проверка)
+            let is_selected = timeline.selected_clip_id == Some(clip.id)
+                || (selected_link_group.is_some() && clip.link_group == selected_link_group);
 
             // Отрисовка с tracks_painter (изоляция от левой панели треков)
             Self::draw_clip(&tracks_painter, clip_rect, canvas_rect, clip, is_selected, timeline, waveform_mgr, ui.ctx());
@@ -801,7 +810,7 @@ impl TimelineView {
         }
 
         // Индикатор Render Cache в стиле DaVinci Resolve (полоса синий/красный внизу линейки)
-        if render_cache.mode != crate::render_cache::RenderCacheMode::None {
+        if let Some(cached_set) = render_cache.read_cached_set() {
             let bar_y_min = rect.max.y - 3.0;
             let bar_y_max = rect.max.y;
             let blue_cache = Color32::from_rgb(0x29, 0x97, 0xff);
@@ -822,9 +831,9 @@ impl TimelineView {
                 }
 
                 let mut seg_start = c_start;
-                let mut cur_cached = render_cache.is_cached(seg_start);
+                let mut cur_cached = cached_set.contains(&seg_start);
                 for f in c_start + 1..=c_end {
-                    let cached = if f < c_end { render_cache.is_cached(f) } else { !cur_cached };
+                    let cached = if f < c_end { cached_set.contains(&f) } else { !cur_cached };
                     if cached != cur_cached || f == c_end {
                         let seg_end = f;
                         let x1 = rect.min.x + (seg_start as f32 * timeline.zoom_factor) - timeline.scroll_x;
@@ -1023,9 +1032,13 @@ impl TimelineView {
                     if let Some(peaks) = waveform_mgr.get_waveform_stream(path, clip.source_audio_stream) {
                         let pts_per_sec = 100.0;
                         let sec_per_px = 1.0 / (timeline.zoom_factor * timeline.fps as f32);
+                        let pts_per_px = pts_per_sec * sec_per_px as f64;
+                        let step_px = 2.0;
+                        let sample_step = step_px as f64 * pts_per_px;
+                        let start_rel_x = (visible_start_x - rect.min.x) as f64;
+                        let mut sample_float = (clip.source_in_secs + start_rel_x * sec_per_px as f64) * pts_per_sec;
 
                         let mut x = visible_start_x;
-                        let step_px = 2.0;
                         let num_steps = (((visible_end_x - visible_start_x) / step_px).ceil() as usize).max(1);
                         let mut mesh = egui::Mesh::default();
                         mesh.reserve_triangles(num_steps * 2);
@@ -1033,13 +1046,18 @@ impl TimelineView {
                         let wave_color = Color32::from_rgb(0x38, 0xd4, 0x8a);
                         let silence_color = Color32::from_rgba_unmultiplied(255, 255, 255, 45);
 
-                        while x < visible_end_x {
-                            let rel_x = x - rect.min.x;
-                            let sec_in_clip = rel_x as f64 * sec_per_px as f64;
-                            let total_source_sec = clip.source_in_secs + sec_in_clip;
-                            let sample_idx = (total_source_sec * pts_per_sec).round() as usize;
+                        let peaks_slice = peaks.as_slice();
+                        let peaks_len = peaks_slice.len();
 
-                            let amp = peaks.get(sample_idx).copied().unwrap_or(0.0);
+                        while x < visible_end_x {
+                            let sample_idx = sample_float as usize;
+                            sample_float += sample_step;
+
+                            let amp = if sample_idx < peaks_len {
+                                peaks_slice[sample_idx]
+                            } else {
+                                0.0
+                            };
 
                             if amp > 0.005 {
                                 let bar_h = (amp * half_h).max(1.0);

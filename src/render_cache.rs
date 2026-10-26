@@ -107,6 +107,15 @@ impl RenderCacheManager {
         }
     }
 
+    /// Захват read guard для пакетных проверок без повторного взятия RwLock на каждый кадр
+    #[inline]
+    pub fn read_cached_set(&self) -> Option<std::sync::RwLockReadGuard<'_, HashSet<i64>>> {
+        if self.mode == RenderCacheMode::None {
+            return None;
+        }
+        self.cached_set.read().ok()
+    }
+
     /// Получить готовый кадр из Render Cache (0 мс доступ к RAM без декодирования)
     pub fn get(&self, frame: i64, expected_sig: u64) -> Option<Arc<ColorImage>> {
         if self.mode == RenderCacheMode::None {

@@ -625,18 +625,13 @@ impl AudioPlayer {
                                 )
                             };
                             dec.buf.append_slice(&mut dec.cursor, data);
-                            for &sample in data {
-                                let abs = sample.abs();
-                                if abs > dec.current_max {
-                                    dec.current_max = abs;
-                                }
-                                dec.count_in_bucket += 1;
-                                if dec.count_in_bucket >= samples_per_bucket {
-                                    dec.peaks.push(dec.current_max.clamp(0.0, 1.0));
-                                    dec.current_max = 0.0;
-                                    dec.count_in_bucket = 0;
-                                }
-                            }
+                            crate::waveform::WaveformManager::accumulate_peaks(
+                                data,
+                                &mut dec.peaks,
+                                &mut dec.current_max,
+                                &mut dec.count_in_bucket,
+                                samples_per_bucket,
+                            );
                         }
                     }
                 }
@@ -658,18 +653,13 @@ impl AudioPlayer {
                             )
                         };
                         dec.buf.append_slice(&mut dec.cursor, data);
-                        for &sample in data {
-                            let abs = sample.abs();
-                            if abs > dec.current_max {
-                                dec.current_max = abs;
-                            }
-                            dec.count_in_bucket += 1;
-                            if dec.count_in_bucket >= samples_per_bucket {
-                                dec.peaks.push(dec.current_max.clamp(0.0, 1.0));
-                                dec.current_max = 0.0;
-                                dec.count_in_bucket = 0;
-                            }
-                        }
+                        crate::waveform::WaveformManager::accumulate_peaks(
+                            data,
+                            &mut dec.peaks,
+                            &mut dec.current_max,
+                            &mut dec.count_in_bucket,
+                            samples_per_bucket,
+                        );
                     }
                 }
             }

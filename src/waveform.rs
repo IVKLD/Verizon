@@ -198,19 +198,28 @@ impl WaveformManager {
                                     samples_count,
                                 )
                             };
-                            for &s in data {
-                                let abs_s = s.abs();
-                                if abs_s > st.current_max {
-                                    st.current_max = abs_s;
-                                }
-                                st.count_in_bucket += 1;
-                                if st.count_in_bucket >= samples_per_point {
-                                    st.peaks.push(st.current_max);
-                                    st.current_max = 0.0;
-                                    st.count_in_bucket = 0;
-                                }
-                            }
+                            Self::accumulate_peaks(data, &mut st.peaks, &mut st.current_max, &mut st.count_in_bucket, samples_per_point);
                         }
+                    }
+                }
+            }
+        }
+
+        for st in &mut states {
+            if st.decoder.send_eof().is_ok() {
+                while st.decoder.receive_frame(&mut st.decoded_frame).is_ok() {
+                    if st.decoded_frame.channel_layout().is_empty() {
+                        st.decoded_frame.set_channel_layout(st.in_channel_layout);
+                    }
+                    if st.resampler.run(&st.decoded_frame, &mut st.resampled_frame).is_ok() {
+                        let samples_count = st.resampled_frame.samples();
+                        let data: &[f32] = unsafe {
+                            std::slice::from_raw_parts(
+                                st.resampled_frame.data(0).as_ptr() as *const f32,
+                                samples_count,
+                            )
+                        };
+                        Self::accumulate_peaks(data, &mut st.peaks, &mut st.current_max, &mut st.count_in_bucket, samples_per_point);
                     }
                 }
             }
@@ -219,11 +228,60 @@ impl WaveformManager {
         let mut out = Vec::with_capacity(states.len());
         for mut st in states {
             if st.count_in_bucket > 0 {
-                st.peaks.push(st.current_max);
+                st.peaks.push(st.current_max.clamp(0.0, 1.0));
             }
             out.push((st.a_idx, st.peaks));
         }
         Ok(out)
+    }
+
+    /// Векторизованная SIMD-аккумуляция волновых пиков без попиксельного ветвления
+    #[inline]
+    pub fn accumulate_peaks(
+        data: &[f32],
+        peaks: &mut Vec<f32>,
+        current_max: &mut f32,
+        count_in_bucket: &mut usize,
+        samples_per_point: usize,
+    ) {
+        let mut offset = 0;
+        if *count_in_bucket > 0 {
+            let needed = samples_per_point - *count_in_bucket;
+            let take = needed.min(data.len());
+            for &s in &data[..take] {
+                let a = s.abs();
+                if a > *current_max {
+                    *current_max = a;
+                }
+            }
+            *count_in_bucket += take;
+            if *count_in_bucket >= samples_per_point {
+                peaks.push((*current_max).clamp(0.0, 1.0));
+                *current_max = 0.0;
+                *count_in_bucket = 0;
+            }
+            offset = take;
+        }
+
+        let rest = &data[offset..];
+        let mut chunk_iter = rest.chunks_exact(samples_per_point);
+        for chunk in chunk_iter.by_ref() {
+            let max = chunk.iter().fold(0.0f32, |acc, &x| acc.max(x.abs()));
+            peaks.push(max.clamp(0.0, 1.0));
+        }
+
+        let rem = chunk_iter.remainder();
+        if !rem.is_empty() {
+            let mut local_max = *current_max;
+            for &s in rem {
+                let a = s.abs();
+                if a > local_max {
+                    local_max = a;
+                }
+            }
+            *current_max = local_max;
+            *count_in_bucket += rem.len();
+        }
     }
 
     /// Быстрая расшифровка амплитуд конкретного аудиопотока (100 замеров в секунду) через FFmpeg
@@ -309,26 +367,33 @@ impl WaveformManager {
                                 )
                             };
 
-                            for &s in data {
-                                let abs_s = s.abs();
-                                if abs_s > current_max {
-                                    current_max = abs_s;
-                                }
-                                count_in_bucket += 1;
-                                if count_in_bucket >= samples_per_point {
-                                    peaks.push(current_max);
-                                    current_max = 0.0;
-                                    count_in_bucket = 0;
-                                }
-                            }
+                            Self::accumulate_peaks(data, &mut peaks, &mut current_max, &mut count_in_bucket, samples_per_point);
                         }
                     }
                 }
             }
         }
 
+        if decoder.send_eof().is_ok() {
+            while decoder.receive_frame(&mut decoded_frame).is_ok() {
+                if decoded_frame.channel_layout().is_empty() {
+                    decoded_frame.set_channel_layout(in_channel_layout);
+                }
+                if resampler.run(&decoded_frame, &mut resampled_frame).is_ok() {
+                    let samples_count = resampled_frame.samples();
+                    let data: &[f32] = unsafe {
+                        std::slice::from_raw_parts(
+                            resampled_frame.data(0).as_ptr() as *const f32,
+                            samples_count,
+                        )
+                    };
+                    Self::accumulate_peaks(data, &mut peaks, &mut current_max, &mut count_in_bucket, samples_per_point);
+                }
+            }
+        }
+
         if count_in_bucket > 0 {
-            peaks.push(current_max);
+            peaks.push(current_max.clamp(0.0, 1.0));
         }
 
         Ok(peaks)
