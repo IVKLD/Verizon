@@ -81,9 +81,23 @@ impl TimelineView {
         // Обычное колесико — горизонтальный скролл таймлайна
         if let Some(m_pos) = mouse_pos {
             if full_rect.contains(m_pos) {
-                // Панорамирование зажатием колесика мыши (MMB Drag)
+                // Панорамирование и зум зажатием колесика мыши (MMB Drag)
                 let mmb_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
-                if mmb_down {
+                let alt_down = ui.input(|i| i.modifiers.alt || i.modifiers.ctrl);
+                if mmb_down && alt_down {
+                    // Alt + MMB Drag: плавный аналоговый зум движением мыши (как в DaVinci Resolve)
+                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ZoomIn);
+                    let delta = ui.input(|i| i.pointer.delta());
+                    if delta.x != 0.0 || delta.y != 0.0 {
+                        let drag_zoom = ((delta.x - delta.y) * 0.012).clamp(-0.3, 0.3).exp();
+                        let old_zoom = timeline.zoom_factor;
+                        let new_zoom = (old_zoom * drag_zoom).clamp(0.0005, 50.0);
+                        let mouse_rel_x = m_pos.x - canvas_rect.min.x;
+                        let target_frame = (mouse_rel_x + timeline.scroll_x) / old_zoom;
+                        timeline.zoom_factor = new_zoom;
+                        timeline.scroll_x = (target_frame * new_zoom - mouse_rel_x).max(0.0);
+                    }
+                } else if mmb_down {
                     ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::AllScroll);
                     let delta = ui.input(|i| i.pointer.delta());
                     if delta.x != 0.0 {
@@ -117,10 +131,11 @@ impl TimelineView {
                     let is_shift = ui.input(|i| i.modifiers.shift);
 
                     if is_zoom {
-                        // Зум центрированный строго под курсором мыши (как в DaVinci Resolve 21)
+                        // Плавный гранулярный зум с центрированием строго под курсором мыши (DaVinci Resolve 21)
                         let old_zoom = timeline.zoom_factor;
-                        let zoom_mult = if scroll_y > 0.0 { 1.15 } else { 0.87 };
-                        let new_zoom = (old_zoom * zoom_mult).clamp(0.0005, 50.0);
+                        let raw_delta = if scroll_y.abs() > 30.0 { scroll_y / 60.0 } else { scroll_y * 0.08 };
+                        let factor = (raw_delta * 0.5).clamp(-0.8, 0.8).exp();
+                        let new_zoom = (old_zoom * factor).clamp(0.0005, 50.0);
 
                         let mouse_rel_x = m_pos.x - canvas_rect.min.x;
                         let target_frame = (mouse_rel_x + timeline.scroll_x) / old_zoom;
@@ -715,17 +730,20 @@ impl TimelineView {
             // Zoom контролы (от 1 кадра до многочасовых проектов)
             ui.label(egui::RichText::new("Zoom:").size(11.0).color(ResolveColors::TEXT_MUTED));
             if ui.button("➖").on_hover_text("Уменьшить масштаб (Zoom Out)").clicked() {
-                timeline.zoom_factor = (timeline.zoom_factor * 0.75).clamp(0.0005, 50.0);
+                timeline.zoom_factor = (timeline.zoom_factor * 0.90).clamp(0.0005, 50.0);
             }
             let mut log_zoom = timeline.zoom_factor;
             let slider = egui::Slider::new(&mut log_zoom, 0.0005..=50.0)
                 .logarithmic(true)
                 .show_value(false);
-            if ui.add(slider).on_hover_text("Плавный логарифмический зум (от 1 кадра до 10 часов)").changed() {
+            if ui.add_sized([120.0, 16.0], slider).on_hover_text("Плавный логарифмический зум (от 1 кадра до 10 часов)").changed() {
+                let center_x = 500.0;
+                let target_frame = (center_x + timeline.scroll_x) / timeline.zoom_factor;
                 timeline.zoom_factor = log_zoom;
+                timeline.scroll_x = (target_frame * log_zoom - center_x).max(0.0);
             }
             if ui.button("➕").on_hover_text("Увеличить масштаб (Zoom In)").clicked() {
-                timeline.zoom_factor = (timeline.zoom_factor * 1.33).clamp(0.0005, 50.0);
+                timeline.zoom_factor = (timeline.zoom_factor * 1.10).clamp(0.0005, 50.0);
             }
             if ui.button("⛶ Fit").on_hover_text("Показать весь проект целиком [Shift+Z]").clicked() {
                 timeline.zoom_to_fit(ui.available_width().max(400.0));
@@ -1040,13 +1058,21 @@ impl TimelineView {
                         let pts_per_sec = 100.0;
                         let sec_per_px = 1.0 / (timeline.zoom_factor * timeline.fps as f32);
                         let pts_per_px = pts_per_sec * sec_per_px as f64;
-                        let step_px = 2.0;
+                        let step_px: f32 = 2.0;
                         let sample_step = step_px as f64 * pts_per_px;
-                        let start_rel_x = (visible_start_x - rect.min.x) as f64;
-                        let mut sample_float = (clip.source_in_secs + start_rel_x * sec_per_px as f64) * pts_per_sec;
 
-                        let mut x = visible_start_x;
-                        let num_steps = (((visible_end_x - visible_start_x) / step_px).ceil() as usize).max(1);
+                        // Привязываем сетку полос жестко к началу клипа rect.min.x,
+                        // чтобы при горизонтальном скролле волна монолитно и плавно двигалась с клипом без дёргания
+                        let first_k = if rect.min.x < canvas_rect.min.x {
+                            (((canvas_rect.min.x - rect.min.x) / step_px).floor() as usize).max(0)
+                        } else {
+                            0
+                        };
+
+                        let mut x = rect.min.x + (first_k as f32 * step_px);
+                        let mut sample_float = (clip.source_in_secs + (first_k as f32 * step_px * sec_per_px) as f64) * pts_per_sec;
+
+                        let num_steps = (((visible_end_x - x).max(0.0) / step_px).ceil() as usize + 2).max(1);
                         let mut mesh = egui::Mesh::default();
                         mesh.reserve_triangles(num_steps * 2);
                         mesh.reserve_vertices(num_steps * 4);

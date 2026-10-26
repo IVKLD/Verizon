@@ -430,18 +430,25 @@ impl ViewerState {
 
         ui.separator();
 
-        let w = ui.available_width().max(80.0);
-        let h = (w * 9.0 / 16.0).max(60.0);
-        let (rect, _response) = ui.allocate_exact_size(vec2(w, h), egui::Sense::hover());
+        let avail_w = ui.available_width().max(80.0);
+        let avail_h = (ui.available_height() - 34.0).max(60.0);
+        let aspect = 16.0 / 9.0;
+        let (video_w, video_h) = if avail_w / avail_h > aspect {
+            (avail_h * aspect, avail_h)
+        } else {
+            (avail_w, avail_w / aspect)
+        };
+        let (rect, _response) = ui.allocate_exact_size(vec2(avail_w, avail_h), egui::Sense::hover());
 
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, CornerRadius::same(2), Color32::from_rgb(0x0a, 0x0b, 0x0d));
         painter.rect_stroke(rect, CornerRadius::same(2), Stroke::new(1.0, ResolveColors::BORDER), StrokeKind::Inside);
 
+        let video_rect = Rect::from_center_size(rect.center(), vec2(video_w, video_h));
         if let Some(tex) = &video_player.texture {
             painter.image(
                 tex.id(),
-                rect,
+                video_rect,
                 Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                 Color32::WHITE,
             );
@@ -480,11 +487,22 @@ impl ViewerState {
         ui.separator();
 
         let vu_width = 28.0;
-        let w = (ui.available_width() - vu_width - 8.0).max(80.0);
-        let h = (w * 9.0 / 16.0).max(60.0);
+        let transport_h = 36.0;
+        let avail_w = (ui.available_width() - vu_width - 8.0).max(80.0);
+        let avail_h = (ui.available_height() - transport_h - 6.0).max(60.0);
+
+        let aspect = 16.0 / 9.0;
+        let (video_w, video_h) = if avail_w / avail_h > aspect {
+            // Контейнер шире, чем 16:9 (например, закрыт Source Viewer): высота = высоте контейнера!
+            (avail_h * aspect, avail_h)
+        } else {
+            // Контейнер уже: ширина = ширине контейнера
+            (avail_w, avail_w / aspect)
+        };
 
         ui.horizontal(|ui| {
-            let (rect, _response) = ui.allocate_exact_size(vec2(w, h), egui::Sense::hover());
+            // Контейнер предпросмотра занимает полную высоту контейнера dock
+            let (rect, _response) = ui.allocate_exact_size(vec2(avail_w, avail_h), egui::Sense::hover());
             let painter = ui.painter_at(rect);
 
             painter.rect_filled(rect, CornerRadius::same(2), Color32::from_rgb(0x0a, 0x0b, 0x0d));
@@ -499,13 +517,13 @@ impl ViewerState {
                 let monitor_scale = match self.zoom_mode {
                     ZoomMode::Fit => 1.0,
                     ZoomMode::Fifty => 0.5,
-                    ZoomMode::Hundred => 1.0 * (1080.0 / rect.height().max(1.0)),
+                    ZoomMode::Hundred => 1.0 * (1080.0 / video_h.max(1.0)),
                     ZoomMode::TwoHundred => 2.0,
                 };
 
                 let video_box_size = vec2(
-                    rect.width() * top_clip.zoom_x * monitor_scale,
-                    rect.height() * top_clip.zoom_y * monitor_scale,
+                    video_w * top_clip.zoom_x * monitor_scale,
+                    video_h * top_clip.zoom_y * monitor_scale,
                 );
                 let video_box_rect = Rect::from_center_size(
                     center + vec2(top_clip.position_x * 0.2, top_clip.position_y * 0.2),
@@ -593,7 +611,7 @@ impl ViewerState {
             }
 
             // Master Audio VU Meter (справа)
-            self.render_vu_meter(ui, h);
+            self.render_vu_meter(ui, avail_h);
         });
 
         ui.add_space(4.0);
