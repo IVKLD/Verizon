@@ -1055,19 +1055,34 @@ impl TimelineView {
             let intervals = render_cache.cached_intervals();
             let mut cache_mesh = egui::Mesh::default();
 
+            // 1) Объединяем интервалы всех активных видеоклипов для фоновой красной сетки
+            let mut video_spans: Vec<(i64, i64)> = Vec::new();
             for clip in &timeline.clips {
-                if clip.is_audio {
+                if clip.is_audio || clip.is_disabled {
                     continue;
                 }
                 let c_start = clip.start_frame.max(visible_start_frame);
                 let c_end = clip.end_frame().min(visible_end_frame);
-                if c_start >= c_end {
-                    continue;
+                if c_start < c_end {
+                    video_spans.push((c_start, c_end));
                 }
+            }
+            video_spans.sort_unstable_by_key(|&(s, _)| s);
+            let mut merged_spans: Vec<(i64, i64)> = Vec::new();
+            for (s, e) in video_spans {
+                if let Some(last) = merged_spans.last_mut() {
+                    if s <= last.1 {
+                        last.1 = last.1.max(e);
+                        continue;
+                    }
+                }
+                merged_spans.push((s, e));
+            }
 
-                // 1) Фоновая полоса клипа — красная (неотрендеренный сегмент)
-                let clip_x1 = rect.min.x + (c_start as f32 * timeline.zoom_factor) - timeline.scroll_x;
-                let clip_x2 = rect.min.x + (c_end as f32 * timeline.zoom_factor) - timeline.scroll_x;
+            // Фоновая красная полоса — рисуется один раз по объединенным видеосегментам
+            for &(s, e) in &merged_spans {
+                let clip_x1 = rect.min.x + (s as f32 * timeline.zoom_factor) - timeline.scroll_x;
+                let clip_x2 = rect.min.x + (e as f32 * timeline.zoom_factor) - timeline.scroll_x;
                 if clip_x2 > rect.min.x && clip_x1 < rect.max.x {
                     let r = Rect::from_min_max(
                         pos2(clip_x1.max(rect.min.x), bar_y_min),
@@ -1075,11 +1090,13 @@ impl TimelineView {
                     );
                     cache_mesh.add_colored_rect(r, red_dirty);
                 }
+            }
 
-                // 2) Поверх наносим синие сегменты готового кэша (O(1) на интервал вместо O(N) на кадр)
-                for &(i_start, i_end) in &intervals {
-                    let overlap_start = i_start.max(c_start);
-                    let overlap_end = (i_end + 1).min(c_end);
+            // 2) Поверх наносим синие сегменты готового кэша (O(1) на интервал), никогда не перетираясь красным
+            for &(i_start, i_end) in &intervals {
+                for &(s, e) in &merged_spans {
+                    let overlap_start = i_start.max(s);
+                    let overlap_end = (i_end + 1).min(e);
                     if overlap_start < overlap_end {
                         let x1 = rect.min.x + (overlap_start as f32 * timeline.zoom_factor) - timeline.scroll_x;
                         let x2 = rect.min.x + (overlap_end as f32 * timeline.zoom_factor) - timeline.scroll_x;

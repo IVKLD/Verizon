@@ -2131,6 +2131,86 @@ fn test_media_asset_and_clip_separate_video_and_audio_duration() {
     assert_eq!(a_clip.duration_frames, 315, "Аудиоклип должен длиться 315 кадров!");
 }
 
+#[test]
+fn test_render_cache_caching_tail_frames_when_playhead_at_end() {
+    let mut timeline = TimelineState::new_empty();
+    timeline.fps = 60;
+    let dummy_path = std::path::PathBuf::from("/tmp/test_tail.mkv");
+
+    let v_clip = Clip {
+        id: 1,
+        name: "test_tail.mkv".to_string(),
+        track_index: 1,
+        start_frame: 0,
+        duration_frames: 300,
+        is_audio: false,
+        source_path: Some(dummy_path.clone()),
+        source_in_secs: 0.0,
+        source_fps: 60.0,
+        ..Default::default()
+    };
+    timeline.clips.push(v_clip);
+
+    let mut render_cache = crate::render_cache::RenderCacheManager::new(crate::render_cache::RenderCacheMode::Smart, 500);
+    let mut viewer = crate::viewer::ViewerState::new();
+    let mut player = VideoPlayer::new();
+    player.current_path = Some(dummy_path);
+
+    // Симулируем ситуацию, когда декодер отдал хвостовые кадры клипа (290..300),
+    // но плейхед таймлайна уже дошел до конца клипа (playhead_frame = 300, за пределами клипа!)
+    timeline.playhead_frame = 300;
+    assert!(timeline.active_video_clip_at(300).is_none(), "Плейхед на 300 кадре находится за пределами клипа 0..300");
+
+    let sample_img = std::sync::Arc::new(egui::ColorImage::new([16, 16], vec![egui::Color32::BLUE; 256]));
+    for f in 290..300 {
+        player.newly_cached_frames.push((f, std::sync::Arc::clone(&sample_img)));
+    }
+
+    let ctx = egui::Context::default();
+    let mut output = ctx.run_ui(Default::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let c = ui.ctx().clone();
+            viewer.render_dual_viewers(ui, &mut timeline, &mut player, &mut render_cache, (0.0, 0.0), &c);
+        });
+    });
+    output.textures_delta.clear();
+
+    // Хвостовые кадры клипа ОБЯЗАНЫ быть закэшированы в RenderCache даже если плейхед за пределами клипа!
+    for f in 290..300 {
+        assert!(
+            render_cache.is_cached(f),
+            "Кадр {} в хвосте клипа обязан быть закэширован, предотвращая 0.5s красный сектор!",
+            f
+        );
+    }
+}
+
+#[test]
+fn test_render_cache_multiple_epoch_intermediate_frames_preserved() {
+    let mut player = VideoPlayer::new();
+    let ctx = egui::Context::default();
+
+    // Создаем канал симуляции воркера декодера
+    let (tx, rx) = std::sync::mpsc::channel();
+    player.frame_rx = Some(rx);
+    player.current_epoch = 5;
+    player.last_displayed_epoch = 3;
+
+    let sample_img = egui::ColorImage::new([16, 16], vec![egui::Color32::RED; 256]);
+
+    // Воркер прислал кадр 40 из эпохи 4 (предыдущая эпоха, но кадр валидный)
+    tx.send((4, 40, sample_img)).unwrap();
+
+    player.poll_frames(&ctx);
+
+    // Кадр 40 ОБЯЗАН поступить в newly_cached_frames для RenderCache, а не быть отброшенным!
+    assert!(
+        player.newly_cached_frames.iter().any(|(f, _)| *f == 40),
+        "Кадр из предшествующей эпохи обязан сохраняться в newly_cached_frames для RenderCache!"
+    );
+}
+
+
 
 
 

@@ -347,7 +347,19 @@ impl BackgroundCacheEngine {
         let Some(video_stream) = ictx.streams().best(ffmpeg_next::media::Type::Video) else { return; };
         let stream_idx = video_stream.index();
         let time_base = video_stream.time_base();
-        let Ok(context_decoder) = ffmpeg_next::codec::context::Context::from_parameters(video_stream.parameters()) else { return; };
+        let Ok(mut context_decoder) = ffmpeg_next::codec::context::Context::from_parameters(video_stream.parameters()) else { return; };
+        unsafe {
+            (*context_decoder.as_mut_ptr()).thread_type =
+                (ffmpeg_next::ffi::FF_THREAD_FRAME | ffmpeg_next::ffi::FF_THREAD_SLICE) as i32;
+        }
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+            .min(16);
+        context_decoder.set_threading(ffmpeg_next::codec::threading::Config {
+            kind: ffmpeg_next::codec::threading::Type::Frame,
+            count: num_threads,
+        });
         let Ok(mut decoder) = context_decoder.decoder().video() else { return; };
 
         let first_src = frames[0].0;

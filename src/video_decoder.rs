@@ -428,7 +428,7 @@ impl VideoPlayer {
         if !q2.is_empty() {
             self.recycle_queue(q2);
         }
-        self.newly_cached_frames.clear();
+        // newly_cached_frames сохраняются для наполнения Render Cache в viewer.rs
     }
 
     /// Полный сброс очередей и префетча при нарезке клипа (Blade), изменении скорости (Retime)
@@ -454,21 +454,20 @@ impl VideoPlayer {
     fn drain_incoming_into_cache(&mut self) {
         if let Some(rx) = &self.frame_rx {
             while let Ok((epoch, raw_frame_num, image)) = rx.try_recv() {
-                if epoch == self.current_epoch && raw_frame_num >= 0 {
+                if raw_frame_num >= 0 {
                     let arc_img = Arc::new(image);
                     self.newly_cached_frames.push((raw_frame_num, Arc::clone(&arc_img)));
-                    if self.newly_cached_frames.len() > 64 {
-                        self.newly_cached_frames.remove(0);
-                    }
-                    if let Some(back) = self.frame_queue.back_mut() {
-                        if back.0 == raw_frame_num {
-                            back.1 = arc_img;
-                            continue;
+                    if epoch == self.current_epoch {
+                        if let Some(back) = self.frame_queue.back_mut() {
+                            if back.0 == raw_frame_num {
+                                back.1 = arc_img;
+                                continue;
+                            }
                         }
-                    }
-                    self.frame_queue.push_back((raw_frame_num, arc_img));
-                    while self.frame_queue.len() > 180 {
-                        self.frame_queue.pop_front();
+                        self.frame_queue.push_back((raw_frame_num, arc_img));
+                        while self.frame_queue.len() > 180 {
+                            self.frame_queue.pop_front();
+                        }
                     }
                 }
             }
@@ -653,15 +652,15 @@ impl VideoPlayer {
                     continue;
                 }
                 let frame_num = raw_frame_num;
+                if frame_num <= cut_limit {
+                    if frame_num % 8 == 0 {
+                        newly_cached.push((frame_num, Arc::clone(&arc_img)));
+                    }
+                    self.newly_cached_frames.push((frame_num, Arc::clone(&arc_img)));
+                }
+
                 if epoch == self.current_epoch {
                     if frame_num <= cut_limit {
-                        if frame_num % 8 == 0 {
-                            newly_cached.push((frame_num, Arc::clone(&arc_img)));
-                        }
-                        self.newly_cached_frames.push((frame_num, Arc::clone(&arc_img)));
-                        if self.newly_cached_frames.len() > 64 {
-                            self.newly_cached_frames.remove(0);
-                        }
                         if let Some(back) = self.frame_queue.back_mut() {
                             if back.0 == frame_num {
                                 let old = std::mem::replace(&mut back.1, arc_img);
@@ -934,21 +933,16 @@ impl VideoPlayer {
                 let is_preview = raw_frame_num < 0;
                 let frame_num = if is_preview { -raw_frame_num - 1 } else { raw_frame_num };
                 let arc_img = Arc::new(image);
-                if epoch != self.current_epoch && epoch <= self.last_displayed_epoch {
-                    if !is_preview {
-                        newly_cached.push((frame_num, arc_img));
-                    } else {
-                        stale.extend(Arc::try_unwrap(arc_img).ok());
-                    }
-                    continue;
-                }
                 if !is_preview {
                     newly_cached.push((frame_num, Arc::clone(&arc_img)));
                     self.newly_cached_frames.push((frame_num, Arc::clone(&arc_img)));
-                    if self.newly_cached_frames.len() > 64 {
-                        self.newly_cached_frames.remove(0);
-                    }
                     self.last_displayed_epoch = self.last_displayed_epoch.max(epoch);
+                }
+                if epoch != self.current_epoch && epoch <= self.last_displayed_epoch {
+                    if is_preview {
+                        stale.extend(Arc::try_unwrap(arc_img).ok());
+                    }
+                    continue;
                 }
 
                 // Обновляем монитор только если кадр совпадает с целевым (плейхедом)

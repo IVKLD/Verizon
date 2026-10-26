@@ -165,13 +165,13 @@ impl ViewerState {
 
         // Автоматически сохраняем декодированные кадры в Render Cache
         if render_cache.mode != crate::render_cache::RenderCacheMode::None {
+            let mut inserted_any = false;
+
+            // 1) Точное кэширование текущего положения плейхеда при кликах и на паузе
             if let Some(clip) = active_clip {
                 let is_same_file = clip.source_path.as_deref() == video_player.current_path.as_deref();
                 if is_same_file {
-                    let mut inserted_any = false;
                     let target_src = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
-
-                    // 1) Точное кэширование текущего положения плейхеда при кликах и на паузе
                     if let Some(ref img) = video_player.last_displayed_image {
                         let presented_src = video_player.last_exact_frame;
                         let is_match = presented_src == target_src
@@ -194,29 +194,38 @@ impl ViewerState {
                             }
                         }
                     }
+                }
+            }
 
-                    // 2) Кэширование всех декодированных кадров из фоновой очереди (включая дублирующиеся таймлайн-кадры при 60fps/Retime)
-                    for (src_f, img) in video_player.newly_cached_frames.drain(..) {
-                        let base_tl = clip.timeline_frame_from_source(src_f, timeline.fps);
-                        let search_range = ((timeline.fps as f64 / clip.source_fps.max(1.0) / clip.speed.abs().max(0.01)).ceil() as i64).max(1);
-                        for tl_f in (base_tl - search_range)..=(base_tl + search_range) {
-                            if clip.contains_frame(tl_f) && clip.source_frame_from_timeline(tl_f, timeline.fps) == src_f {
-                                let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
-                                if !render_cache.is_cached(tl_f) {
-                                    render_cache.insert(tl_f, std::sync::Arc::clone(&img), sig);
-                                    inserted_any = true;
+            // 2) Кэширование всех декодированных кадров из фоновой очереди (включая концы клипов, даже если плейхед за пределами клипа)
+            if let Some(ref current_path) = video_player.current_path {
+                let current_path_buf = current_path.clone();
+                for (src_f, img) in video_player.newly_cached_frames.drain(..) {
+                    for clip in &timeline.clips {
+                        if clip.is_audio || clip.is_disabled {
+                            continue;
+                        }
+                        if clip.source_path.as_ref() == Some(&current_path_buf) {
+                            let base_tl = clip.timeline_frame_from_source(src_f, timeline.fps);
+                            let search_range = ((timeline.fps as f64 / clip.source_fps.max(1.0) / clip.speed.abs().max(0.01)).ceil() as i64).max(1);
+                            for tl_f in (base_tl - search_range)..=(base_tl + search_range) {
+                                if clip.contains_frame(tl_f) && clip.source_frame_from_timeline(tl_f, timeline.fps) == src_f {
+                                    let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
+                                    if !render_cache.is_cached(tl_f) {
+                                        render_cache.insert(tl_f, std::sync::Arc::clone(&img), sig);
+                                        inserted_any = true;
+                                    }
                                 }
                             }
                         }
                     }
-                    if inserted_any {
-                        ctx.request_repaint();
-                    }
-                } else {
-                    video_player.newly_cached_frames.clear();
                 }
             } else {
                 video_player.newly_cached_frames.clear();
+            }
+
+            if inserted_any {
+                ctx.request_repaint();
             }
         } else {
             video_player.newly_cached_frames.clear();
