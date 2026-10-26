@@ -194,16 +194,17 @@ impl PreferencesModalState {
         let mut apply_result = None;
         let mut should_close = false;
 
-        let win_width = 860.0;
-        let win_height = 580.0;
-        let sidebar_width = 196.0;
-        let content_width = win_width - sidebar_width - 32.0;
-        let content_height = 460.0;
-
+        let win_width = 920.0;
+        let win_height = 620.0;
+        let header_height = 44.0;
+        let footer_height = 48.0;
+        let body_height = win_height - header_height - footer_height;
+        let sidebar_width = 180.0;
         let (accent, _) = get_accent_colors(self.draft.theme_accent_idx);
 
-        egui::Window::new("⚙ Preferences")
+        egui::Window::new("preferences_modal_window")
             .open(open)
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
             .fixed_size([win_width, win_height])
@@ -211,150 +212,211 @@ impl PreferencesModalState {
             .frame(
                 egui::Frame::new()
                     .fill(Color32::from_rgb(0x13, 0x14, 0x17))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(0x2a, 0x2d, 0x36)))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(0x2d, 0x30, 0x3a)))
                     .corner_radius(CornerRadius::same(6))
-                    .inner_margin(egui::Margin::symmetric(14, 10)),
+                    .inner_margin(egui::Margin::ZERO),
             )
             .show(ctx, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                ui.set_width(win_width);
+                ui.set_height(win_height);
+
                 ui.vertical(|ui| {
-                    // 1. Верхний переключатель вкладок: SYSTEM | USER (В точности как в DaVinci Resolve Studio)
-                    ui.horizontal(|ui| {
-                        ui.add_space(sidebar_width * 0.45);
+                    // 1. Верхний единый заголовок окна модалки: 100% ширина, заголовок + табы System/User + крестик закрытия
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(0x18, 0x1a, 0x20))
+                        .stroke(Stroke::NONE)
+                        .inner_margin(egui::Margin::symmetric(16, 8))
+                        .show(ui, |ui| {
+                            ui.set_width(win_width - 32.0);
+                            ui.set_height(header_height - 16.0);
+                            ui.horizontal_centered(|ui| {
+                                // Заголовок слева
+                                ui.horizontal(|ui| {
+                                    ui.set_width(200.0);
+                                    ui.label(
+                                        egui::RichText::new("⚙ Preferences")
+                                            .size(13.0)
+                                            .strong()
+                                            .color(Color32::WHITE),
+                                    );
+                                });
 
-                        egui::Frame::new()
-                            .fill(Color32::from_rgb(0x1b, 0x1c, 0x22))
-                            .stroke(Stroke::new(1.0, Color32::from_rgb(0x28, 0x2a, 0x32)))
-                            .corner_radius(CornerRadius::same(4))
-                            .inner_margin(egui::Margin::symmetric(4, 2))
-                            .show(ui, |ui| {
-                                let sys_active = self.current_tab == PrefTab::System;
-                                let user_active = self.current_tab == PrefTab::User;
-
-                                let sys_btn = egui::Button::new(
-                                    egui::RichText::new("  System  ")
-                                        .size(12.0)
-                                        .strong()
-                                        .color(if sys_active { Color32::WHITE } else { Color32::from_rgb(0x92, 0x97, 0xa5) }),
-                                )
-                                .fill(if sys_active { accent.gamma_multiply(0.28) } else { Color32::TRANSPARENT })
-                                .stroke(if sys_active { Stroke::new(1.0, accent) } else { Stroke::NONE })
-                                .corner_radius(CornerRadius::same(3));
-
-                                if ui.add(sys_btn).clicked() {
-                                    self.current_tab = PrefTab::System;
-                                    self.current_section = PrefSection::SystemMemoryGpu;
+                                // Центр: переключатель вкладок System | User
+                                let center_width = 180.0;
+                                let left_pad = ((win_width - 32.0) - 200.0 - 50.0 - center_width) * 0.5;
+                                if left_pad > 0.0 {
+                                    ui.add_space(left_pad);
                                 }
 
-                                let user_btn = egui::Button::new(
-                                    egui::RichText::new("  User  ")
-                                        .size(12.0)
-                                        .strong()
-                                        .color(if user_active { Color32::WHITE } else { Color32::from_rgb(0x92, 0x97, 0xa5) }),
-                                )
-                                .fill(if user_active { accent.gamma_multiply(0.28) } else { Color32::TRANSPARENT })
-                                .stroke(if user_active { Stroke::new(1.0, accent) } else { Stroke::NONE })
-                                .corner_radius(CornerRadius::same(3));
+                                egui::Frame::new()
+                                    .fill(Color32::from_rgb(0x12, 0x13, 0x17))
+                                    .stroke(Stroke::new(1.0, Color32::from_rgb(0x28, 0x2b, 0x34)))
+                                    .corner_radius(CornerRadius::same(4))
+                                    .inner_margin(egui::Margin::symmetric(3, 2))
+                                    .show(ui, |ui| {
+                                        let sys_active = self.current_tab == PrefTab::System;
+                                        let user_active = self.current_tab == PrefTab::User;
 
-                                if ui.add(user_btn).clicked() {
-                                    self.current_tab = PrefTab::User;
-                                    self.current_section = PrefSection::UserAppearance;
-                                }
-                            });
-                    });
+                                        let sys_btn = egui::Button::new(
+                                            egui::RichText::new("  System  ")
+                                                .size(11.5)
+                                                .strong()
+                                                .color(if sys_active { Color32::WHITE } else { Color32::from_rgb(0x92, 0x97, 0xa5) }),
+                                        )
+                                        .fill(if sys_active { accent.gamma_multiply(0.35) } else { Color32::TRANSPARENT })
+                                        .stroke(if sys_active { Stroke::new(1.0, accent) } else { Stroke::NONE })
+                                        .corner_radius(CornerRadius::same(3));
 
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(6.0);
+                                        if ui.add(sys_btn).clicked() {
+                                            self.current_tab = PrefTab::System;
+                                            self.current_section = PrefSection::SystemMemoryGpu;
+                                        }
 
-                    // 2. Основная рабочая область: Слева меню категорий (Sidebar), Справа карточки параметров
-                    ui.horizontal(|ui| {
-                        // Левый сайдбар со списком категорий
-                        egui::Frame::new()
-                            .fill(Color32::from_rgb(0x17, 0x18, 0x1c))
-                            .stroke(Stroke::new(1.0, Color32::from_rgb(0x23, 0x25, 0x2b)))
-                            .corner_radius(CornerRadius::same(4))
-                            .inner_margin(egui::Margin::symmetric(6, 6))
-                            .show(ui, |ui| {
-                                ui.set_min_width(sidebar_width);
-                                ui.set_max_width(sidebar_width);
-                                ui.set_min_height(content_height);
-                                ui.vertical(|ui| {
-                                    self.render_sidebar(ui);
+                                        let user_btn = egui::Button::new(
+                                            egui::RichText::new("  User  ")
+                                                .size(11.5)
+                                                .strong()
+                                                .color(if user_active { Color32::WHITE } else { Color32::from_rgb(0x92, 0x97, 0xa5) }),
+                                        )
+                                        .fill(if user_active { accent.gamma_multiply(0.35) } else { Color32::TRANSPARENT })
+                                        .stroke(if user_active { Stroke::new(1.0, accent) } else { Stroke::NONE })
+                                        .corner_radius(CornerRadius::same(3));
+
+                                        if ui.add(user_btn).clicked() {
+                                            self.current_tab = PrefTab::User;
+                                            self.current_section = PrefSection::UserAppearance;
+                                        }
+                                    });
+
+                                // Кнопка закрытия ✕ справа
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let close_btn = egui::Button::new(
+                                        egui::RichText::new("✕")
+                                            .size(13.0)
+                                            .color(Color32::from_rgb(0xa2, 0xa8, 0xb8)),
+                                    )
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(Stroke::NONE);
+
+                                    if ui.add(close_btn).on_hover_text("Закрыть [Esc]").clicked() {
+                                        should_close = true;
+                                    }
                                 });
                             });
+                        });
 
-                        ui.add_space(8.0);
+                    // Тонкая разделительная черта под заголовком
+                    ui.separator();
 
-                        // Правая область с карточками настроек
-                        egui::Frame::new()
-                            .fill(Color32::from_rgb(0x13, 0x14, 0x17))
-                            .stroke(Stroke::new(1.0, Color32::from_rgb(0x23, 0x25, 0x2b)))
-                            .corner_radius(CornerRadius::same(4))
-                            .inner_margin(egui::Margin::symmetric(8, 8))
-                            .show(ui, |ui| {
-                                ui.set_min_width(content_width);
-                                ui.set_max_width(content_width);
-                                ui.set_min_height(content_height);
-                                egui::ScrollArea::vertical()
-                                    .auto_shrink([false, false])
-                                    .max_height(content_height)
+                    // 2. Основная рабочая область: Сайдбар слева, Настройки справа
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(0x13, 0x14, 0x17))
+                        .inner_margin(egui::Margin::symmetric(14, 10))
+                        .show(ui, |ui| {
+                            let avail_w = (win_width - 28.0).max(400.0);
+                            let avail_h = (body_height - 20.0).max(200.0);
+                            ui.set_width(avail_w);
+                            ui.set_height(avail_h);
+
+                            ui.horizontal(|ui| {
+                                // Сайдбар со списком категорий
+                                egui::Frame::new()
+                                    .fill(Color32::from_rgb(0x16, 0x17, 0x1c))
+                                    .stroke(Stroke::new(1.0, Color32::from_rgb(0x23, 0x25, 0x2c)))
+                                    .corner_radius(CornerRadius::same(4))
+                                    .inner_margin(egui::Margin::symmetric(6, 6))
                                     .show(ui, |ui| {
-                                        ui.set_width(content_width - 16.0);
+                                        ui.set_width(sidebar_width);
+                                        ui.set_height(avail_h - 12.0);
                                         ui.vertical(|ui| {
-                                            self.render_content(ui);
+                                            self.render_sidebar(ui);
                                         });
                                     });
+
+                                ui.add_space(8.0);
+
+                                // Правая область с карточками настроек
+                                let content_w = (avail_w - sidebar_width - 24.0).max(200.0);
+                                egui::Frame::new()
+                                    .fill(Color32::from_rgb(0x13, 0x14, 0x17))
+                                    .inner_margin(egui::Margin::ZERO)
+                                    .show(ui, |ui| {
+                                        ui.set_width(content_w);
+                                        ui.set_height(avail_h - 12.0);
+                                        egui::ScrollArea::vertical()
+                                            .auto_shrink([false, false])
+                                            .max_height(avail_h - 12.0)
+                                            .show(ui, |ui| {
+                                                ui.set_width(content_w - 14.0);
+                                                ui.vertical(|ui| {
+                                                    self.render_content(ui);
+                                                });
+                                            });
+                                    });
                             });
-                    });
+                        });
+
+                    // Тонкая разделительная черта перед нижним баром
+                    ui.separator();
 
                     // 3. Нижний бар действий: Сброс | Отмена | Сохранить
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(6.0);
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(0x17, 0x18, 0x1e))
+                        .stroke(Stroke::NONE)
+                        .inner_margin(egui::Margin::symmetric(16, 10))
+                        .show(ui, |ui| {
+                            ui.set_width(win_width - 32.0);
+                            ui.set_height(footer_height - 20.0);
+                            ui.horizontal_centered(|ui| {
+                                let reset_btn = egui::Button::new(
+                                    egui::RichText::new("⟲  Reset to Defaults")
+                                        .size(11.0)
+                                        .color(Color32::from_rgb(0xa2, 0xa8, 0xb6)),
+                                )
+                                .fill(Color32::from_rgb(0x1e, 0x20, 0x26))
+                                .stroke(Stroke::new(1.0, Color32::from_rgb(0x2d, 0x30, 0x39)))
+                                .corner_radius(CornerRadius::same(3));
 
-                    ui.horizontal(|ui| {
-                        let reset_btn = egui::Button::new(
-                            egui::RichText::new("⟲  Reset to Defaults")
-                                .size(11.0)
-                                .color(Color32::from_rgb(0xa2, 0xa8, 0xb6)),
-                        )
-                        .fill(Color32::from_rgb(0x1e, 0x20, 0x25))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(0x2b, 0x2e, 0x36)));
+                                if ui.add(reset_btn).clicked() {
+                                    self.draft = UserPreferences::default();
+                                }
 
-                        if ui.add(reset_btn).clicked() {
-                            self.draft = UserPreferences::default();
-                        }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let save_btn = egui::Button::new(
+                                        egui::RichText::new("  Save  ")
+                                            .size(12.0)
+                                            .color(Color32::WHITE)
+                                            .strong(),
+                                    )
+                                    .fill(accent)
+                                    .stroke(Stroke::new(1.0, accent))
+                                    .corner_radius(CornerRadius::same(3))
+                                    .min_size(Vec2::new(82.0, 26.0));
 
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let save_btn = egui::Button::new(
-                                egui::RichText::new("  Save  ")
-                                    .size(12.0)
-                                    .color(Color32::WHITE)
-                                    .strong(),
-                            )
-                            .fill(accent)
-                            .stroke(Stroke::new(1.0, accent))
-                            .min_size(Vec2::new(80.0, 26.0));
+                                    if ui.add(save_btn).clicked() {
+                                        apply_result = Some(self.draft.clone());
+                                        should_close = true;
+                                    }
 
-                            if ui.add(save_btn).clicked() {
-                                apply_result = Some(self.draft.clone());
-                                should_close = true;
-                            }
+                                    ui.add_space(8.0);
 
-                            let cancel_btn = egui::Button::new(
-                                egui::RichText::new("  Cancel  ")
-                                    .size(11.5)
-                                    .color(Color32::from_rgb(0xd5, 0xda, 0xe5)),
-                            )
-                            .fill(Color32::from_rgb(0x22, 0x24, 0x2a))
-                            .stroke(Stroke::new(1.0, Color32::from_rgb(0x2f, 0x32, 0x3b)))
-                            .min_size(Vec2::new(70.0, 26.0));
+                                    let cancel_btn = egui::Button::new(
+                                        egui::RichText::new("  Cancel  ")
+                                            .size(11.5)
+                                            .color(Color32::from_rgb(0xd5, 0xda, 0xe5)),
+                                    )
+                                    .fill(Color32::from_rgb(0x23, 0x25, 0x2c))
+                                    .stroke(Stroke::new(1.0, Color32::from_rgb(0x30, 0x33, 0x3d)))
+                                    .corner_radius(CornerRadius::same(3))
+                                    .min_size(Vec2::new(72.0, 26.0));
 
-                            if ui.add(cancel_btn).clicked() {
-                                should_close = true;
-                            }
+                                    if ui.add(cancel_btn).clicked() {
+                                        should_close = true;
+                                    }
+                                });
+                            });
                         });
-                    });
 
                     if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         should_close = true;
@@ -379,19 +441,27 @@ fn pref_card<R>(ui: &mut Ui, title: &str, subtitle: Option<&str>, add_contents: 
         .inner_margin(egui::Margin::symmetric(14, 10));
 
     frame.show(ui, |ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        ui.set_width(ui.available_width());
         ui.vertical(|ui| {
-            ui.label(
-                egui::RichText::new(title)
-                    .size(11.5)
-                    .strong()
-                    .color(Color32::from_rgb(0xec, 0xf0, 0xf8)),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(title)
+                        .size(11.5)
+                        .strong()
+                        .color(Color32::from_rgb(0xec, 0xf0, 0xf8)),
+                )
+                .wrap(),
             );
             if let Some(sub) = subtitle {
                 ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new(sub)
-                        .size(10.0)
-                        .color(Color32::from_rgb(0x84, 0x8a, 0x99)),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(sub)
+                            .size(10.0)
+                            .color(Color32::from_rgb(0x84, 0x8a, 0x99)),
+                    )
+                    .wrap(),
                 );
             }
             ui.add_space(6.0);
@@ -402,26 +472,50 @@ fn pref_card<R>(ui: &mut Ui, title: &str, subtitle: Option<&str>, add_contents: 
     }).inner
 }
 
-/// Структурированная 2-колоночная сетка DaVinci Resolve (Метка 210px, Элемент управления 340+px)
+/// Структурированная 2-колоночная сетка DaVinci Resolve
 fn pref_grid<R>(ui: &mut Ui, id_salt: &str, add_rows: impl FnOnce(&mut Ui) -> R) -> R {
     egui::Grid::new(id_salt)
         .num_columns(2)
-        .spacing([18.0, 10.0])
-        .min_col_width(200.0)
+        .spacing([14.0, 10.0])
+        .min_col_width(170.0)
+        .max_col_width(210.0)
         .show(ui, add_rows)
         .inner
 }
 
-/// Строка сетки: левая колонка - название параметра, правая колонка - управляющий виджет
+/// Строка сетки: левая колонка - название параметра с автопереносом, правая - виджет
 fn pref_grid_row<R>(ui: &mut Ui, label: &str, add_widget: impl FnOnce(&mut Ui) -> R) -> R {
-    ui.label(
-        egui::RichText::new(label)
-            .size(11.5)
-            .color(Color32::from_rgb(0x9d, 0xa3, 0xb4)),
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(label)
+                .size(11.5)
+                .color(Color32::from_rgb(0x9d, 0xa3, 0xb4)),
+        )
+        .wrap(),
     );
     let res = add_widget(ui);
     ui.end_row();
     res
+}
+
+/// Чекбокс с гарантированным переносом строк и кликабельным текстом
+fn pref_checkbox(ui: &mut Ui, value: &mut bool, text: &str) -> egui::Response {
+    ui.horizontal(|ui| {
+        let mut cb_resp = ui.checkbox(value, "");
+        let lbl_resp = ui.add(
+            egui::Label::new(
+                egui::RichText::new(text)
+                    .size(11.5)
+                    .color(Color32::from_rgb(0xcc, 0xd0, 0xdc)),
+            )
+            .wrap(),
+        );
+        if lbl_resp.clicked() {
+            *value = !*value;
+            cb_resp.mark_changed();
+        }
+        cb_resp | lbl_resp
+    }).inner
 }
 
 /// Сегментированные кнопки-пилюли DaVinci Resolve
@@ -482,7 +576,7 @@ impl PreferencesModalState {
             .fill(if is_selected { Color32::from_rgb(0x23, 0x25, 0x2c) } else { Color32::TRANSPARENT })
             .stroke(if is_selected { Stroke::new(1.0, accent.gamma_multiply(0.6)) } else { Stroke::NONE })
             .corner_radius(CornerRadius::same(3))
-            .min_size(Vec2::new(180.0, 32.0));
+            .min_size(Vec2::new(ui.available_width(), 32.0));
 
             if ui.add(btn).clicked() {
                 self.current_section = sec;
@@ -509,7 +603,7 @@ impl PreferencesModalState {
 
         pref_card(ui, "SYSTEM MEMORY CONFIGURATION", Some("Выделение оперативной памяти для фонового рендера и воспроизведения"), |ui| {
             pref_grid(ui, "grid_sys_mem", |ui| {
-                pref_grid_row(ui, "Общий объем памяти системы:", |ui| {
+                pref_grid_row(ui, "Общий объем памяти:", |ui| {
                     ui.label(egui::RichText::new("32 768 MB (32.0 GB DDR5)").strong().color(Color32::WHITE));
                 });
 
@@ -524,7 +618,7 @@ impl PreferencesModalState {
 
             ui.add_space(8.0);
 
-            // Визуальный градусник памяти в стиле DaVinci Resolve
+            // Градусник памяти в стиле DaVinci Resolve
             let total_ram_mb = 32768.0;
             let nle_ram_mb = self.draft.render_cache_ram_mb as f32;
             let ratio = (nle_ram_mb / total_ram_mb).clamp(0.02, 0.95);
@@ -534,15 +628,12 @@ impl PreferencesModalState {
             let (bar_rect, _) = ui.allocate_exact_size(Vec2::new(bar_width, bar_height), egui::Sense::hover());
             let painter = ui.painter();
 
-            // Фон всей шкалы
             painter.rect_filled(bar_rect, CornerRadius::same(3), Color32::from_rgb(0x23, 0x25, 0x2d));
 
-            // Сегмент Verizon NLE
             let filled_w = bar_rect.width() * ratio;
             let nle_rect = Rect::from_min_size(bar_rect.min, Vec2::new(filled_w, bar_height));
             painter.rect_filled(nle_rect, CornerRadius::same(3), accent.gamma_multiply(0.85));
 
-            // Текстовые метки на градуснике
             let text_nle = format!("Verizon NLE: {} MB ({:.1}%)", self.draft.render_cache_ram_mb, ratio * 100.0);
             painter.text(
                 nle_rect.center(),
@@ -564,11 +655,14 @@ impl PreferencesModalState {
                 );
             }
 
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("💡 Выделение 2048-4096 МБ обеспечивает стабильный реалтайм 60 FPS предпросмотр без задержек.")
-                    .size(10.0)
-                    .color(Color32::from_rgb(0x82, 0x88, 0x96)),
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("💡 Выделение 2048-4096 МБ обеспечивает стабильный реалтайм 60 FPS предпросмотр без задержек.")
+                        .size(10.0)
+                        .color(Color32::from_rgb(0x82, 0x88, 0x96)),
+                )
+                .wrap(),
             );
         });
 
@@ -578,14 +672,14 @@ impl PreferencesModalState {
             pref_grid(ui, "grid_gpu_proc", |ui| {
                 pref_grid_row(ui, "Режим работы GPU:", |ui| {
                     pref_segmented_pills(ui, &mut self.draft.gpu_mode, &[
-                        (0, "Auto (Высокая производительность)"),
+                        (0, "Auto"),
                         (1, "VAAPI Hardware"),
-                        (2, "CPU Software Fallback"),
+                        (2, "CPU Software"),
                     ], accent);
                 });
 
                 pref_grid_row(ui, "Аппаратный блендинг:", |ui| {
-                    ui.checkbox(&mut self.draft.gpu_blending_enabled, "Аппаратное GPU-смешивание и альфа-композитинг (GPU Blending)");
+                    pref_checkbox(ui, &mut self.draft.gpu_blending_enabled, "GPU Blending (Аппаратное альфа-смешивание)");
                 });
             });
 
@@ -593,89 +687,72 @@ impl PreferencesModalState {
             ui.label(egui::RichText::new("Обнаруженные видеоустройства в системе:").size(11.0).strong().color(Color32::from_rgb(0xec, 0xf0, 0xf8)));
             ui.add_space(4.0);
 
-            // Таблица обнаруженных GPU
+            // Таблица обнаруженных GPU в структурированном Grid
             egui::Frame::new()
                 .fill(Color32::from_rgb(0x14, 0x15, 0x1a))
                 .stroke(Stroke::new(1.0, Color32::from_rgb(0x27, 0x2a, 0x34)))
                 .corner_radius(CornerRadius::same(3))
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.set_min_width(50.0);
+                    egui::Grid::new("sys_gpu_grid")
+                        .num_columns(5)
+                        .spacing([12.0, 6.0])
+                        .show(ui, |ui| {
                             ui.label(egui::RichText::new("ID").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                            ui.add_space(10.0);
-                            ui.set_min_width(220.0);
                             ui.label(egui::RichText::new("Модель устройства").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                            ui.set_min_width(70.0);
                             ui.label(egui::RichText::new("VRAM").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                            ui.set_min_width(90.0);
                             ui.label(egui::RichText::new("Шина / DRM").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
                             ui.label(egui::RichText::new("Статус").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                        });
-                        ui.separator();
+                            ui.end_row();
 
-                        // GPU 0
-                        ui.horizontal(|ui| {
-                            ui.set_min_width(50.0);
+                            // GPU 0
                             ui.label("GPU 0");
-                            ui.add_space(10.0);
-                            ui.set_min_width(220.0);
-                            ui.label("AMD Radeon RX 9070 XT (Navi 48)");
-                            ui.set_min_width(70.0);
+                            ui.label("AMD Radeon RX 9070 XT");
                             ui.label("16 GB");
-                            ui.set_min_width(90.0);
                             ui.monospace("renderD129");
                             ui.label(egui::RichText::new("● Active (Primary)").color(Color32::from_rgb(0x40, 0xd0, 0x70)));
-                        });
+                            ui.end_row();
 
-                        // GPU 1
-                        ui.horizontal(|ui| {
-                            ui.set_min_width(50.0);
+                            // GPU 1
                             ui.label("GPU 1");
-                            ui.add_space(10.0);
-                            ui.set_min_width(220.0);
                             ui.label("AMD Radeon 780M Graphics");
-                            ui.set_min_width(70.0);
                             ui.label("2 GB");
-                            ui.set_min_width(90.0);
                             ui.monospace("renderD128");
                             ui.label(egui::RichText::new("○ Available (iGPU)").color(Color32::from_rgb(0x82, 0x88, 0x96)));
+                            ui.end_row();
                         });
-                    });
                 });
         });
     }
 
     fn render_system_media_storage(&mut self, ui: &mut Ui) {
         pref_card(ui, "MOUNTED MEDIA STORAGE & SCRATCH DISKS", Some("Дисковые накопители для кэширования, прокси и исходников"), |ui| {
-            // Таблица смонтированных хранилищ
             egui::Frame::new()
                 .fill(Color32::from_rgb(0x14, 0x15, 0x1a))
                 .stroke(Stroke::new(1.0, Color32::from_rgb(0x27, 0x2a, 0x34)))
                 .corner_radius(CornerRadius::same(3))
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.set_min_width(240.0);
+                    egui::Grid::new("sys_storage_grid")
+                        .num_columns(4)
+                        .spacing([12.0, 6.0])
+                        .show(ui, |ui| {
                             ui.label(egui::RichText::new("Точка монтирования / Путь").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                            ui.set_min_width(120.0);
                             ui.label(egui::RichText::new("Роль тома").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                            ui.set_min_width(110.0);
                             ui.label(egui::RichText::new("Свободно").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
                             ui.label(egui::RichText::new("Действия").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                        });
-                        ui.separator();
+                            ui.end_row();
 
-                        // Строка 1: Кэш таймлайна
-                        ui.horizontal(|ui| {
-                            ui.set_min_width(240.0);
+                            // Строка 1: Кэш таймлайна
                             let path_display = self.draft.cache_directory.to_string_lossy().to_string();
-                            ui.label(egui::RichText::new(path_display).monospace().size(11.0));
-                            ui.set_min_width(120.0);
+                            let short_path = if path_display.len() > 30 {
+                                format!("...{}", &path_display[path_display.len() - 27..])
+                            } else {
+                                path_display.clone()
+                            };
+                            ui.add(egui::Label::new(egui::RichText::new(short_path).monospace().size(11.0)))
+                                .on_hover_text(&path_display);
                             ui.label(egui::RichText::new("Scratch & Cache").color(Color32::from_rgb(0x56, 0xad, 0xee)));
-                            ui.set_min_width(110.0);
                             ui.label("428.5 GB");
 
                             if ui.button("🗑 Purge").clicked() {
@@ -685,19 +762,15 @@ impl PreferencesModalState {
                                     }
                                 }
                             }
-                        });
+                            ui.end_row();
 
-                        // Строка 2: Проектные диски
-                        ui.horizontal(|ui| {
-                            ui.set_min_width(240.0);
+                            // Строка 2: Проектные диски
                             ui.label(egui::RichText::new("/mnt/projects-and-games").monospace().size(11.0));
-                            ui.set_min_width(120.0);
                             ui.label("Media Storage");
-                            ui.set_min_width(110.0);
                             ui.label("1.8 TB");
                             ui.label(egui::RichText::new("● Mounted").color(Color32::from_rgb(0x40, 0xd0, 0x70)));
+                            ui.end_row();
                         });
-                    });
                 });
 
             ui.add_space(10.0);
@@ -706,7 +779,8 @@ impl PreferencesModalState {
             pref_grid(ui, "grid_cache_disk", |ui| {
                 pref_grid_row(ui, "Каталог кэша рендера:", |ui| {
                     ui.horizontal(|ui| {
-                        if ui.add(egui::TextEdit::singleline(&mut path_str).desired_width(260.0)).changed() {
+                        let text_w = (ui.available_width() - 80.0).max(180.0);
+                        if ui.add(egui::TextEdit::singleline(&mut path_str).desired_width(text_w)).changed() {
                             self.draft.cache_directory = PathBuf::from(path_str);
                         }
                         if ui.button("⟲ Сброс").clicked() {
@@ -718,7 +792,7 @@ impl PreferencesModalState {
                 });
 
                 pref_grid_row(ui, "Автоматическая очистка:", |ui| {
-                    ui.checkbox(&mut self.draft.auto_cleanup_proxies, "Очищать временные прокси и дисковый кэш при закрытии проекта");
+                    pref_checkbox(ui, &mut self.draft.auto_cleanup_proxies, "Очищать временные прокси и дисковый кэш при закрытии");
                 });
             });
         });
@@ -728,11 +802,11 @@ impl PreferencesModalState {
         pref_card(ui, "AUDIO ENGINE & I/O CONFIGURATION", Some("Низколатентный аудиодрайвер PipeWire / ALSA и частота дискретизации"), |ui| {
             pref_grid(ui, "grid_audio_io", |ui| {
                 pref_grid_row(ui, "Аудиоподсистема:", |ui| {
-                    ui.label(egui::RichText::new("PipeWire Audio Server (Native Low-Latency)").strong().color(Color32::WHITE));
+                    ui.label(egui::RichText::new("PipeWire Audio Server (Native)").strong().color(Color32::WHITE));
                 });
 
                 pref_grid_row(ui, "Устройство вывода:", |ui| {
-                    ui.label(egui::RichText::new("● PipeWire ALSA / Komplete Audio 1 Pro (Cinema Reference)").color(Color32::from_rgb(0x40, 0xd0, 0x70)));
+                    ui.label(egui::RichText::new("● PipeWire ALSA / Studio Monitor").color(Color32::from_rgb(0x40, 0xd0, 0x70)));
                 });
 
                 pref_grid_row(ui, "Частота дискретизации:", |ui| {
@@ -740,11 +814,11 @@ impl PreferencesModalState {
                         .selected_text(match self.draft.audio_sample_rate {
                             44100 => "44.1 kHz (CD Audio)",
                             96000 => "96.0 kHz (Hi-Res Studio)",
-                            _ => "48.0 kHz (Cinema Broadcast Standard)",
+                            _ => "48.0 kHz (Cinema Standard)",
                         })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.draft.audio_sample_rate, 44100, "44.1 kHz (CD Audio)");
-                            ui.selectable_value(&mut self.draft.audio_sample_rate, 48000, "48.0 kHz (Cinema Broadcast Standard)");
+                            ui.selectable_value(&mut self.draft.audio_sample_rate, 48000, "48.0 kHz (Cinema Standard)");
                             ui.selectable_value(&mut self.draft.audio_sample_rate, 96000, "96.0 kHz (Hi-Res Studio)");
                         });
                 });
@@ -752,16 +826,16 @@ impl PreferencesModalState {
                 pref_grid_row(ui, "Размер буфера (Latency):", |ui| {
                     egui::ComboBox::from_id_salt("audio_buf_combo")
                         .selected_text(match self.draft.audio_buffer_size {
-                            128 => "128 семплов (2.7 мс - Low Latency)",
-                            256 => "256 семплов (5.3 мс)",
-                            1024 => "1024 семпла (21.3 мс - Safe)",
-                            _ => "512 семплов (10.7 мс - Рекомендуется)",
+                            128 => "128 (2.7 ms - Low Latency)",
+                            256 => "256 (5.3 ms)",
+                            1024 => "1024 (21.3 ms - Safe)",
+                            _ => "512 (10.7 ms - Рекомендуется)",
                         })
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.draft.audio_buffer_size, 128, "128 семплов (2.7 мс - Low Latency)");
-                            ui.selectable_value(&mut self.draft.audio_buffer_size, 256, "256 семплов (5.3 мс)");
-                            ui.selectable_value(&mut self.draft.audio_buffer_size, 512, "512 семплов (10.7 мс - Рекомендуется)");
-                            ui.selectable_value(&mut self.draft.audio_buffer_size, 1024, "1024 семпла (21.3 мс - Safe)");
+                            ui.selectable_value(&mut self.draft.audio_buffer_size, 128, "128 (2.7 ms - Low Latency)");
+                            ui.selectable_value(&mut self.draft.audio_buffer_size, 256, "256 (5.3 ms)");
+                            ui.selectable_value(&mut self.draft.audio_buffer_size, 512, "512 (10.7 ms - Рекомендуется)");
+                            ui.selectable_value(&mut self.draft.audio_buffer_size, 1024, "1024 (21.3 ms - Safe)");
                         });
                 });
             });
@@ -770,45 +844,34 @@ impl PreferencesModalState {
         ui.add_space(10.0);
 
         pref_card(ui, "SPEAKER SETUP & CHANNEL ROUTING", Some("Назначение каналов мониторинга Fairlight"), |ui| {
-            // Таблица маршрутизации стерео выходов
             egui::Frame::new()
                 .fill(Color32::from_rgb(0x14, 0x15, 0x1a))
                 .stroke(Stroke::new(1.0, Color32::from_rgb(0x27, 0x2a, 0x34)))
                 .corner_radius(CornerRadius::same(3))
                 .inner_margin(egui::Margin::symmetric(8, 6))
                 .show(ui, |ui| {
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.set_min_width(120.0);
+                    egui::Grid::new("audio_spk_grid")
+                        .num_columns(4)
+                        .spacing([14.0, 6.0])
+                        .show(ui, |ui| {
                             ui.label(egui::RichText::new("Канал микшера").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                            ui.set_min_width(130.0);
                             ui.label(egui::RichText::new("Динамик монитора").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                            ui.set_min_width(160.0);
                             ui.label(egui::RichText::new("Порт PipeWire").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
                             ui.label(egui::RichText::new("Статус").strong().color(Color32::from_rgb(0x8a, 0x90, 0xa0)));
-                        });
-                        ui.separator();
+                            ui.end_row();
 
-                        ui.horizontal(|ui| {
-                            ui.set_min_width(120.0);
                             ui.label("Channel 1 (Left)");
-                            ui.set_min_width(130.0);
                             ui.label("Left Front");
-                            ui.set_min_width(160.0);
                             ui.monospace("playback_FL");
                             ui.label(egui::RichText::new("● Connected").color(Color32::from_rgb(0x40, 0xd0, 0x70)));
-                        });
+                            ui.end_row();
 
-                        ui.horizontal(|ui| {
-                            ui.set_min_width(120.0);
                             ui.label("Channel 2 (Right)");
-                            ui.set_min_width(130.0);
                             ui.label("Right Front");
-                            ui.set_min_width(160.0);
                             ui.monospace("playback_FR");
                             ui.label(egui::RichText::new("● Connected").color(Color32::from_rgb(0x40, 0xd0, 0x70)));
+                            ui.end_row();
                         });
-                    });
                 });
 
             ui.add_space(8.0);
@@ -831,7 +894,7 @@ impl PreferencesModalState {
                 });
 
                 pref_grid_row(ui, "Скраббинг аудио:", |ui| {
-                    ui.checkbox(&mut self.draft.mute_on_scrub, "Mute audio while scrubbing (Заглушать звук при скраббинге)");
+                    pref_checkbox(ui, &mut self.draft.mute_on_scrub, "Mute on scrub (Заглушать звук при скраббинге)");
                 });
             });
         });
@@ -841,11 +904,11 @@ impl PreferencesModalState {
         pref_card(ui, "HARDWARE ACCELERATION & ZERO-COPY DECODE", Some("Аппаратное декодирование через VAAPI и нативные протоколы Wayland"), |ui| {
             pref_grid(ui, "grid_hw_decode", |ui| {
                 pref_grid_row(ui, "Аппаратное декодирование:", |ui| {
-                    ui.checkbox(&mut self.draft.hardware_decoding_enabled, "AMD / Intel VAAPI аппаратное декодирование H.264, HEVC, AV1");
+                    pref_checkbox(ui, &mut self.draft.hardware_decoding_enabled, "AMD / Intel VAAPI аппаратное декодирование H.264, HEVC, AV1");
                 });
 
                 pref_grid_row(ui, "Zero-copy Wayland:", |ui| {
-                    ui.checkbox(&mut self.draft.gpu_blending_enabled, "Zero-copy трансфер текстур в Wayland через DMABUF");
+                    pref_checkbox(ui, &mut self.draft.gpu_blending_enabled, "Zero-copy трансфер текстур в Wayland через DMABUF");
                 });
             });
         });
@@ -854,16 +917,19 @@ impl PreferencesModalState {
 
         pref_card(ui, "PLAYBACK TIMING & SYNC", Some("Синхронизация звука и видео в режиме реального времени 1.0x"), |ui| {
             pref_grid(ui, "grid_timing_sync", |ui| {
-                pref_grid_row(ui, "Пропуск кадров (Drop frames):", |ui| {
-                    ui.checkbox(&mut self.draft.drop_frames_enabled, "Drop frames during playback (Пропускать кадры при нехватке скорости)");
+                pref_grid_row(ui, "Пропуск кадров:", |ui| {
+                    pref_checkbox(ui, &mut self.draft.drop_frames_enabled, "Drop frames during playback (Пропускать кадры при нехватке скорости)");
                 });
             });
 
             ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("💡 При включении таймлайн сохраняет реальную скорость 1x даже на тяжелых 4K/8K файлах, не давая звуку рассинхронизироваться.")
-                    .size(10.0)
-                    .color(Color32::from_rgb(0x82, 0x88, 0x96)),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("💡 При включении таймлайн сохраняет реальную скорость 1x даже на тяжелых файлах, предотвращая рассинхрон звука.")
+                        .size(10.0)
+                        .color(Color32::from_rgb(0x82, 0x88, 0x96)),
+                )
+                .wrap(),
             );
         });
     }
@@ -876,12 +942,12 @@ impl PreferencesModalState {
                 pref_grid_row(ui, "Пресеты разрешения:", |ui| {
                     ui.horizontal_wrapped(|ui| {
                         let presets = [
-                            (1.0, "100% (1080p)"),
-                            (1.25, "125% (2K)"),
-                            (1.5, "150% (QHD)"),
-                            (1.75, "175% (3K)"),
-                            (2.0, "200% (4K UHD)"),
-                            (2.5, "250% (4K Large)"),
+                            (1.0, "100%"),
+                            (1.25, "125%"),
+                            (1.5, "150%"),
+                            (1.75, "175%"),
+                            (2.0, "200%"),
+                            (2.5, "250%"),
                         ];
 
                         for (scale, label) in presets {
@@ -900,7 +966,7 @@ impl PreferencesModalState {
                     });
                 });
 
-                pref_grid_row(ui, "Точный масштаб интерфейса:", |ui| {
+                pref_grid_row(ui, "Точный масштаб:", |ui| {
                     ui.add(
                         egui::Slider::new(&mut self.draft.ui_scale, 0.75..=3.5)
                             .step_by(0.05)
@@ -910,10 +976,13 @@ impl PreferencesModalState {
             });
 
             ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("💡 Быстрые хоткеи масштабирования: Ctrl + Plus / Ctrl + Minus / Ctrl + 0")
-                    .size(10.0)
-                    .color(Color32::from_rgb(0x82, 0x88, 0x96)),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("💡 Быстрые хоткеи масштабирования: Ctrl + Plus / Ctrl + Minus / Ctrl + 0")
+                        .size(10.0)
+                        .color(Color32::from_rgb(0x82, 0x88, 0x96)),
+                )
+                .wrap(),
             );
         });
 
@@ -924,9 +993,9 @@ impl PreferencesModalState {
                 pref_grid_row(ui, "Цветовой акцент:", |ui| {
                     ui.horizontal(|ui| {
                         let themes = [
-                            (0, "🟠 DaVinci Orange"),
-                            (1, "🔵 Resolve Blue"),
-                            (2, "🟡 Studio Gold"),
+                            (0, "🟠 Orange"),
+                            (1, "🔵 Blue"),
+                            (2, "🟡 Gold"),
                         ];
                         for (idx, name) in themes {
                             let is_active = self.draft.theme_accent_idx == idx;
@@ -952,8 +1021,8 @@ impl PreferencesModalState {
             pref_grid(ui, "grid_tc_format", |ui| {
                 pref_grid_row(ui, "Режим отображения:", |ui| {
                     ui.vertical(|ui| {
-                        ui.radio_value(&mut self.draft.timecode_display_frames, false, "SMPTE Timecode (ЧЧ:ММ:СС:КК / 01:21:30:03)");
-                        ui.radio_value(&mut self.draft.timecode_display_frames, true, "Кадры таймлайна (Frames: 0, 1, 2 .. N)");
+                        ui.radio_value(&mut self.draft.timecode_display_frames, false, "SMPTE Timecode (01:21:30:03)");
+                        ui.radio_value(&mut self.draft.timecode_display_frames, true, "Кадры таймлайна (Frames: 0, 1, 2 ..)");
                     });
                 });
             });
@@ -964,10 +1033,10 @@ impl PreferencesModalState {
         pref_card(ui, "SNAPPING & MAGNETIC TIMELINE", Some("Поведение магнитного прилипания курсора и границ клипов"), |ui| {
             pref_grid(ui, "grid_snapping", |ui| {
                 pref_grid_row(ui, "Магнитное прилипание:", |ui| {
-                    ui.checkbox(&mut self.draft.snapping_enabled, "Включить магнитное прилипание клипов [N]");
+                    pref_checkbox(ui, &mut self.draft.snapping_enabled, "Включить магнитное прилипание клипов [N]");
                 });
 
-                pref_grid_row(ui, "Чувствительность прилипания:", |ui| {
+                pref_grid_row(ui, "Чувствительность:", |ui| {
                     ui.add(
                         egui::Slider::new(&mut self.draft.snapping_threshold_px, 2.0..=30.0)
                             .suffix(" px"),
@@ -981,15 +1050,15 @@ impl PreferencesModalState {
         pref_card(ui, "CLIP LINKING & PLAYBACK", Some("Связность аудио/видео клипов и навигация"), |ui| {
             pref_grid(ui, "grid_clip_linking", |ui| {
                 pref_grid_row(ui, "Связанное выделение:", |ui| {
-                    ui.checkbox(&mut self.draft.linked_selection, "Связанное выделение видео и аудиодорожек (Linked Selection [Ctrl+Shift+L])");
+                    pref_checkbox(ui, &mut self.draft.linked_selection, "Связанное выделение видео и аудио [Ctrl+Shift+L]");
                 });
 
                 pref_grid_row(ui, "Конец таймлайна:", |ui| {
-                    ui.checkbox(&mut self.draft.stop_at_timeline_end, "Останавливать воспроизведение в конце таймлайна");
+                    pref_checkbox(ui, &mut self.draft.stop_at_timeline_end, "Останавливать воспроизведение в конце таймлайна");
                 });
 
                 pref_grid_row(ui, "Зацикливание:", |ui| {
-                    ui.checkbox(&mut self.draft.loop_enabled, "Зацикливать воспроизведение (Loop Playback [Ctrl+/])");
+                    pref_checkbox(ui, &mut self.draft.loop_enabled, "Зацикливать воспроизведение (Loop Playback [Ctrl+/])");
                 });
             });
         });
@@ -1002,7 +1071,7 @@ impl PreferencesModalState {
                     egui::ComboBox::from_id_salt("pref_fps_combo")
                         .selected_text(format!("{} fps", self.draft.default_fps))
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.draft.default_fps, 24, "24.00 fps (Cinema Standard)");
+                            ui.selectable_value(&mut self.draft.default_fps, 24, "24.00 fps (Cinema)");
                             ui.selectable_value(&mut self.draft.default_fps, 25, "25.00 fps (PAL)");
                             ui.selectable_value(&mut self.draft.default_fps, 30, "30.00 fps (NTSC / Web)");
                             ui.selectable_value(&mut self.draft.default_fps, 50, "50.00 fps (PAL Broadcast)");
@@ -1027,7 +1096,7 @@ impl PreferencesModalState {
                                 self.draft.default_width = 3840;
                                 self.draft.default_height = 2160;
                             }
-                            if ui.selectable_label(self.draft.default_width == 1080 && self.draft.default_height == 1920, "1080 x 1920 (Vertical 9:16 Shorts/Reels)").clicked() {
+                            if ui.selectable_label(self.draft.default_width == 1080 && self.draft.default_height == 1920, "1080 x 1920 (Vertical 9:16 Shorts)").clicked() {
                                 self.draft.default_width = 1080;
                                 self.draft.default_height = 1920;
                             }
@@ -1045,17 +1114,20 @@ impl PreferencesModalState {
                 pref_grid_row(ui, "Режим кэша рендера:", |ui| {
                     pref_segmented_pills(ui, &mut self.draft.render_cache_mode, &[
                         (0, "None"),
-                        (1, "Smart Cache (Автоматически)"),
+                        (1, "Smart Cache"),
                         (2, "User Cache"),
                     ], accent);
                 });
             });
 
             ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("💡 В режиме Smart Cache система сама анализирует тяжелые эффекты и переходы и кэширует их в фоне.")
-                    .size(10.0)
-                    .color(Color32::from_rgb(0x82, 0x88, 0x96)),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("💡 В режиме Smart Cache система сама анализирует тяжелые эффекты и переходы и кэширует их в фоне.")
+                        .size(10.0)
+                        .color(Color32::from_rgb(0x82, 0x88, 0x96)),
+                )
+                .wrap(),
             );
         });
 
@@ -1074,13 +1146,13 @@ impl PreferencesModalState {
 
                 pref_grid_row(ui, "Кодек прокси-файлов:", |ui| {
                     pref_segmented_pills(ui, &mut self.draft.proxy_codec, &[
-                        (0, "ProRes 422 Proxy"),
+                        (0, "ProRes 422"),
                         (1, "DNxHR LB"),
-                        (2, "H.264 Intra"),
+                        (2, "H.264"),
                     ], accent);
                 });
 
-                pref_grid_row(ui, "Задержка фонового рендера:", |ui| {
+                pref_grid_row(ui, "Задержка рендера:", |ui| {
                     ui.add(
                         egui::Slider::new(&mut self.draft.auto_cache_idle_secs, 0.5..=10.0)
                             .step_by(0.5)
@@ -1098,13 +1170,13 @@ impl PreferencesModalState {
                     egui::ComboBox::from_id_salt("cs_science_combo")
                         .selected_text(match self.draft.color_science {
                             1 => "DaVinci YRGB Color Managed (RCM)",
-                            2 => "ACEScc (Academy Color Encoding System)",
+                            2 => "ACEScc (Academy Color Encoding)",
                             _ => "DaVinci YRGB (Standard)",
                         })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.draft.color_science, 0, "DaVinci YRGB (Standard)");
                             ui.selectable_value(&mut self.draft.color_science, 1, "DaVinci YRGB Color Managed (RCM)");
-                            ui.selectable_value(&mut self.draft.color_science, 2, "ACEScc (Academy Color Encoding System)");
+                            ui.selectable_value(&mut self.draft.color_science, 2, "ACEScc (Academy Color Encoding)");
                         });
                 });
 
@@ -1113,14 +1185,14 @@ impl PreferencesModalState {
                         .selected_text(match self.draft.timeline_color_space {
                             1 => "Rec.709 (Scene)",
                             2 => "Rec.2020 (HDR/UHD)",
-                            3 => "DCI-P3 (DCI Cinema)",
-                            _ => "Rec.709 Gamma 2.4 (HDTV Standard)",
+                            3 => "DCI-P3 (Cinema)",
+                            _ => "Rec.709 Gamma 2.4 (HDTV)",
                         })
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.draft.timeline_color_space, 0, "Rec.709 Gamma 2.4 (HDTV Standard)");
+                            ui.selectable_value(&mut self.draft.timeline_color_space, 0, "Rec.709 Gamma 2.4 (HDTV)");
                             ui.selectable_value(&mut self.draft.timeline_color_space, 1, "Rec.709 (Scene)");
                             ui.selectable_value(&mut self.draft.timeline_color_space, 2, "Rec.2020 (HDR/UHD)");
-                            ui.selectable_value(&mut self.draft.timeline_color_space, 3, "DCI-P3 (DCI Cinema)");
+                            ui.selectable_value(&mut self.draft.timeline_color_space, 3, "DCI-P3 (Cinema)");
                         });
                 });
             });
@@ -1131,7 +1203,7 @@ impl PreferencesModalState {
         pref_card(ui, "VIDEO MONITORS & SCOPES", Some("Параметры графиков Waveform, Vectorscope и Histogram"), |ui| {
             pref_grid(ui, "grid_scopes", |ui| {
                 pref_grid_row(ui, "Точность скоупов:", |ui| {
-                    ui.checkbox(&mut self.draft.scopes_quality_high, "Высокая точность скоупов 10-bit (High Precision Scopes)");
+                    pref_checkbox(ui, &mut self.draft.scopes_quality_high, "Высокая точность скоупов 10-bit (High Precision)");
                 });
 
                 pref_grid_row(ui, "Яркость трассировки:", |ui| {

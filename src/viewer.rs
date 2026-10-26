@@ -166,19 +166,24 @@ impl ViewerState {
         // Автоматически сохраняем ТОЛЬКО реально декодированные кадры в Render Cache
         if render_cache.mode != crate::render_cache::RenderCacheMode::None && cached_img.is_none() {
             if let Some(clip) = active_clip {
-                let expected_src = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
-                // Сохраняем last_displayed_image только если номер кадра строго совпадает с ожидаемым (без дублирования и мерцания)
-                if video_player.last_decoded_frame == expected_src {
-                    if let Some(ref img) = video_player.last_displayed_image {
-                        render_cache.insert(timeline.playhead_frame, std::sync::Arc::clone(img), current_sig);
+                let is_same_file = clip.source_path.as_deref() == video_player.current_path.as_deref();
+                if is_same_file {
+                    let expected_src = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
+                    // Сохраняем last_displayed_image только если номер кадра строго совпадает с ожидаемым (без дублирования и мерцания)
+                    if video_player.last_decoded_frame == expected_src {
+                        if let Some(ref img) = video_player.last_displayed_image {
+                            render_cache.insert(timeline.playhead_frame, std::sync::Arc::clone(img), current_sig);
+                        }
                     }
-                }
-                for (src_f, img) in video_player.newly_cached_frames.drain(..) {
-                    let tl_f = clip.timeline_frame_from_source(src_f, timeline.fps);
-                    if clip.contains_frame(tl_f) {
-                        let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
-                        render_cache.insert(tl_f, img, sig);
+                    for (src_f, img) in video_player.newly_cached_frames.drain(..) {
+                        let tl_f = clip.timeline_frame_from_source(src_f, timeline.fps);
+                        if clip.contains_frame(tl_f) && clip.source_frame_from_timeline(tl_f, timeline.fps) == src_f {
+                            let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
+                            render_cache.insert(tl_f, img, sig);
+                        }
                     }
+                } else {
+                    video_player.newly_cached_frames.clear();
                 }
             } else {
                 video_player.newly_cached_frames.clear();

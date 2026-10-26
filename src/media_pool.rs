@@ -340,8 +340,8 @@ impl MediaPoolState {
                                     let icon = if asset.has_video { "🎬" } else { "🎵" };
                                     ui.label(egui::RichText::new(icon).size(14.0));
                                     ui.vertical(|ui| {
-                                        ui.label(egui::RichText::new(&asset.filename).color(ResolveColors::TEXT_PRIMARY).size(11.0).strong());
-                                        ui.horizontal(|ui| {
+                                        ui.add(egui::Label::new(egui::RichText::new(&asset.filename).color(ResolveColors::TEXT_PRIMARY).size(11.0).strong()).truncate());
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.label(egui::RichText::new(&asset.duration).color(ResolveColors::TEXT_MUTED).size(9.0));
                                             ui.label(egui::RichText::new("•").color(ResolveColors::TEXT_MUTED).size(9.0));
                                             ui.label(egui::RichText::new(&asset.fps).color(ResolveColors::TEXT_MUTED).size(9.0));

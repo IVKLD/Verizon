@@ -1561,4 +1561,44 @@ fn test_render_cache_playback_sustains_fps_and_no_zero_fps() {
     assert!(!player.is_dropping_frames, "При кэше индикатор дроп-кадров не должен загораться красным");
 }
 
+#[test]
+fn test_uncached_playback_no_backwards_flash_or_scrub_glitch() {
+    let ctx = egui::Context::default();
+    let mut player = VideoPlayer::new();
+    player.is_real_video = true;
+    player.fps = 60.0;
+    player.is_playing_mode = true;
+    player.last_decoded_frame = 50;
+    player.last_playback_target = 50;
+
+    let dummy_img = std::sync::Arc::new(egui::ColorImage::example());
+
+    // Заполняем scrub_cache старыми приближенными кадрами
+    player.scrub_cache.push_back((40, std::sync::Arc::clone(&dummy_img)));
+    player.scrub_cache.push_back((45, std::sync::Arc::clone(&dummy_img)));
+
+    // 1. Кадр 51 не закэширован (cached_image = None), а в очереди декодера пока пусто (задержка потока)
+    // Плеер должен удержать текущий кадр 50 (Smooth Hold), а НЕ прыгать назад на кадр 45 из scrub_cache!
+    player.update_playback_with_cut(51, true, None, None, &ctx);
+    assert_eq!(
+        player.last_decoded_frame, 50,
+        "При отсутствии нового кадра плеер должен удерживать последний отображенный кадр (50), а не мигать старым кадром (45)!"
+    );
+
+    // 2. В очереди декодера появился запоздалый старый кадр 48 (меньше last_decoded_frame)
+    // Он должен быть отброшен, а не выведен на экран (никаких мельканий назад во времени!)
+    player.frame_queue.push_back((48, std::sync::Arc::clone(&dummy_img)));
+    player.update_playback_with_cut(51, true, None, None, &ctx);
+    assert_eq!(
+        player.last_decoded_frame, 50,
+        "Старый кадр 48 из очереди должен быть отброшен, нельзя мелькать назад во времени!"
+    );
+    assert!(player.frame_queue.is_empty(), "Старый кадр 48 должен быть извлечен и отброшен");
+
+    // 3. В очереди появился актуальный кадр 51 — теперь плеер плавно переходит на него
+    player.frame_queue.push_back((51, std::sync::Arc::clone(&dummy_img)));
+    player.update_playback_with_cut(51, true, None, None, &ctx);
+    assert_eq!(player.last_decoded_frame, 51, "Актуальный кадр 51 должен быть успешно отображен");
+}
+
 

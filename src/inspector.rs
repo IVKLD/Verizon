@@ -40,11 +40,14 @@ impl InspectorState {
                 ui.horizontal(|ui| {
                     let icon = if clip.is_audio { "🎵" } else { "🎬" };
                     ui.label(egui::RichText::new(icon).size(13.0));
-                    ui.label(
-                        egui::RichText::new(&clip.name)
-                            .size(12.0)
-                            .strong()
-                            .color(ResolveColors::ACCENT_ORANGE),
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&clip.name)
+                                .size(12.0)
+                                .strong()
+                                .color(ResolveColors::ACCENT_ORANGE),
+                        )
+                        .truncate(),
                     );
                 });
 

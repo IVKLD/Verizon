@@ -480,7 +480,6 @@ impl VideoPlayer {
                     self.recycle_queue(old_q);
                     self.prefetch_target = None;
                 } else {
-                    self.try_apply_scrub_cache(target_frame, 30, ctx);
                     self.current_epoch = self.current_epoch.max(self.prefetch_epoch).wrapping_add(1);
                     self.clear_queues_async();
                     self.prefetch_target = None;
@@ -511,7 +510,6 @@ impl VideoPlayer {
                             let _ = tx.send(DecoderCommand::UpdatePlayhead { playhead_frame: target_frame });
                         }
                     } else {
-                        let _ = self.try_apply_scrub_cache(target_frame, 45, ctx);
                         let now = std::time::Instant::now();
                         let elapsed = now.duration_since(self.last_request_time).as_millis();
                         let prev_delivered = self.last_displayed_epoch >= self.current_epoch;
@@ -714,6 +712,13 @@ impl VideoPlayer {
         while let Some(&(f_num, _)) = self.frame_queue.front() {
             if f_num <= target_frame {
                 let Some((f, img)) = self.frame_queue.pop_front() else { break; };
+                // При непрерывном воспроизведении кадры, которые меньше или равны уже отображенному last_decoded_frame,
+                // являются устаревшими (из прошлого) и ДОЛЖНЫ быть отброшены, чтобы видео не дёргалось назад!
+                if is_continuous_playback && f <= self.last_decoded_frame {
+                    garbage.extend(Arc::try_unwrap(img).ok());
+                    dropped += 1;
+                    continue;
+                }
                 // Кадр реально отстал от живого воспроизведения минимум на 2 кадра
                 let really_late = target_frame - f >= 2;
                 if self.drop_frames_enabled
@@ -760,18 +765,21 @@ impl VideoPlayer {
             self.last_decoded_frame = best_frame;
             self.last_exact_frame = best_frame;
         } else if let Some((ep, prev_f, prev_img)) = fallback_preview {
-            self.rendered_frames_in_sample += 1;
-            self.last_displayed_epoch = ep;
-            self.last_fingerprint = image_fingerprint(&prev_img);
-            let data = ImageData::Color(prev_img);
-            if let Some(tex) = &mut self.texture {
-                tex.set(data, TextureOptions::LINEAR);
+            // Превью ключевого кадра при холодном старте допустимо ТОЛЬКО если
+            // на экране ещё ничего не было показано (self.last_decoded_frame < 0)!
+            // Во время живого воспроизведения мы никогда не заменяем текущий кадр старым ключевым кадром!
+            if self.last_decoded_frame < 0 {
+                self.rendered_frames_in_sample += 1;
+                self.last_displayed_epoch = ep;
+                self.last_fingerprint = image_fingerprint(&prev_img);
+                self.present_playback_frame(ctx, prev_img);
+                self.last_decoded_frame = prev_f;
             } else {
-                self.texture = Some(ctx.load_texture("video_frame", data, TextureOptions::LINEAR));
+                garbage.extend(Arc::try_unwrap(prev_img).ok());
             }
-            self.last_decoded_frame = prev_f;
         } else {
-            let _ = self.try_apply_scrub_cache(target_frame, 18, ctx);
+            // Если нового кадра ещё нет в очереди (декодер готовит следующий GOP),
+            // мы удерживаем текущий кадр на экране (Smooth Hold), исключая мерцание скраб-кэшем!
         }
 
         self.recycle_images(garbage);
