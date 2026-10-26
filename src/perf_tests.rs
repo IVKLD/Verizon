@@ -466,6 +466,7 @@ fn test_real_perf_cut_boundary_transition() {
         volume_db: 0.0,
         pan: 0.0,
         source_audio_stream: 0,
+        ..Default::default()
     };
 
     let clip2 = Clip {
@@ -490,6 +491,7 @@ fn test_real_perf_cut_boundary_transition() {
         volume_db: 0.0,
         pan: 0.0,
         source_audio_stream: 0,
+        ..Default::default()
     };
 
     timeline.clips.push(clip1);
@@ -573,6 +575,7 @@ fn test_real_perf_multitrack_audio_mixer() {
         volume_db: 0.0,
         pan: 0.0,
         source_audio_stream: 0, // Первый аудиопоток файла
+        ..Default::default()
     };
 
     // Создаем аудиоклип 2 (Stream 1, Track 2) на A2: длительность 120 кадров (2 секунды)
@@ -598,6 +601,7 @@ fn test_real_perf_multitrack_audio_mixer() {
         volume_db: 0.0,
         pan: 0.0,
         source_audio_stream: 1, // Второй аудиопоток файла!
+        ..Default::default()
     };
 
     timeline.clips.push(clip_a1);
@@ -721,6 +725,7 @@ fn build_real_timeline(path: &PathBuf, audio_player: &AudioPlayer) -> TimelineSt
         volume_db: 0.0,
         pan: 0.0,
         source_audio_stream: stream,
+        ..Default::default()
     };
     timeline.clips.push(mk(1, 1, false, 0));
     timeline.clips.push(mk(2, 2, true, 0));
@@ -1237,6 +1242,7 @@ fn test_render_cache_signature_invalidation_and_lru() {
         volume_db: 0.0,
         pan: 0.0,
         source_audio_stream: 0,
+        ..Default::default()
     };
     timeline.clips.push(clip);
 
@@ -1374,6 +1380,7 @@ fn test_active_video_clip_priority() {
         volume_db: 0.0,
         pan: 0.0,
         source_audio_stream: 0,
+        ..Default::default()
     };
     // Добавляем клип на дорожку V2 (индекс 0 - более высокий приоритет композитинга)
     let clip_v2 = Clip {
@@ -1398,6 +1405,7 @@ fn test_active_video_clip_priority() {
         volume_db: 0.0,
         pan: 0.0,
         source_audio_stream: 0,
+        ..Default::default()
     };
     tl.clips.push(clip_v1);
     tl.clips.push(clip_v2);
@@ -1475,6 +1483,7 @@ fn test_timeline_zoom_multi_hour_project_support() {
         volume_db: 0.0,
         pan: 0.0,
         source_audio_stream: 0,
+        ..Default::default()
     };
     timeline.clips.push(clip);
 

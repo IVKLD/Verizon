@@ -54,6 +54,42 @@ pub struct Clip {
     pub volume_db: f32,
     pub pan: f32,
     pub source_audio_stream: usize,
+
+    // Управление скоростью и Retime Control в стиле DaVinci Resolve
+    pub speed: f64,                 // 1.0 = 100%, 0.5 = 50%, 2.0 = 200%, -1.0 = Reverse
+    pub retime_controls_open: bool, // Отображение панели Retime Controls на клипе (Ctrl+R)
+    pub is_disabled: bool,          // Отключение / mute клипа ('D' в DaVinci Resolve)
+}
+
+impl Default for Clip {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            name: String::new(),
+            track_index: 0,
+            start_frame: 0,
+            duration_frames: 0,
+            is_audio: false,
+            color: Color32::from_rgb(0x2a, 0x64, 0x96),
+            source_path: None,
+            source_in_frame: 0,
+            source_in_secs: 0.0,
+            source_fps: 24.0,
+            link_group: None,
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            position_x: 0.0,
+            position_y: 0.0,
+            rotation: 0.0,
+            opacity: 100.0,
+            volume_db: 0.0,
+            pan: 0.0,
+            source_audio_stream: 0,
+            speed: 1.0,
+            retime_controls_open: false,
+            is_disabled: false,
+        }
+    }
 }
 
 impl Clip {
@@ -65,10 +101,15 @@ impl Clip {
         frame >= self.start_frame && frame < self.end_frame()
     }
 
-    /// Перевод глобального кадра таймлайна в локальный номер кадра исходного медиафайла
+    /// Перевод глобального кадра таймлайна в локальный номер кадра исходного медиафайла с учетом скорости (Retime)
     pub fn source_frame_from_timeline(&self, timeline_frame: i64, timeline_fps: u32) -> i64 {
         let offset = timeline_frame - self.start_frame;
-        let time_secs = offset as f64 / timeline_fps.max(1) as f64;
+        let time_secs = if self.speed < 0.0 {
+            let rev_offset = (self.duration_frames - 1 - offset).max(0);
+            (rev_offset as f64 / timeline_fps.max(1) as f64) * self.speed.abs()
+        } else {
+            (offset as f64 / timeline_fps.max(1) as f64) * self.speed
+        };
         let total_source_secs = self.source_in_secs + time_secs;
         let fps = if self.source_fps > 0.0 { self.source_fps } else { timeline_fps as f64 };
         (total_source_secs * fps).round() as i64
@@ -79,7 +120,13 @@ impl Clip {
         let fps = if self.source_fps > 0.0 { self.source_fps } else { timeline_fps as f64 };
         let total_source_secs = source_frame as f64 / fps.max(1.0);
         let time_secs = total_source_secs - self.source_in_secs;
-        self.start_frame + (time_secs * timeline_fps as f64).round() as i64
+        if self.speed < 0.0 {
+            let rev_offset = (time_secs / self.speed.abs() * timeline_fps as f64).round() as i64;
+            self.start_frame + (self.duration_frames - 1 - rev_offset).max(0)
+        } else {
+            let eff_speed = if self.speed.abs() > 0.001 { self.speed } else { 1.0 };
+            self.start_frame + ((time_secs / eff_speed) * timeline_fps as f64).round() as i64
+        }
     }
 }
 
@@ -90,6 +137,7 @@ pub struct Track {
     pub is_muted: bool,
     pub is_locked: bool,
     pub is_solo: bool,
+    pub height: f32, // Высота дорожки в пикселях
 }
 
 #[derive(Debug, Clone)]
@@ -153,19 +201,59 @@ pub struct TimelineState {
 
     // Флаг необходимости пересчета аудиомикса
     pub audio_dirty: bool,
+    // Флаг изменения структуры таймлайна (разрез, удаление, перемещение, подрезка, скорость)
+    pub structure_dirty: bool,
+
+    // Высота дорожек и параметры отображения таймлайна (Timeline View Options)
+    pub track_height: f32, // Глобальная высота дорожки по умолчанию (52.0 px)
+    pub resizing_track: Option<(usize, f32, f32)>, // (индекс дорожки, стартовый Y курсора, начальная высота)
+    pub retime_session: Option<(u64, f32, i64, f64)>, // (clip_id, mouse_start_x, initial_duration, initial_speed)
+    pub show_view_options: bool, // Меню View Options на тулбаре
 }
 
 impl TimelineState {
-    /// Получить активный видеоклип под кадром с учетом приоритета дорожек V2 > V1 и выделения (O(N) за один проход)
+    /// Получить активный видеоклип под кадром с учетом приоритета дорожек V2 > V1, отключения и выделения
     #[inline]
     pub fn active_video_clip_at(&self, frame: i64) -> Option<&Clip> {
         self.clips
             .iter()
-            .filter(|c| !c.is_audio && c.contains_frame(frame))
+            .filter(|c| !c.is_audio && !c.is_disabled && c.contains_frame(frame))
             .min_by_key(|c| (if self.selected_clip_id == Some(c.id) { 0usize } else { 1usize }, c.track_index))
     }
 
+    pub fn track_height(&self, track_idx: usize) -> f32 {
+        self.tracks.get(track_idx).map(|t| t.height).unwrap_or(self.track_height)
+    }
+
+    pub fn track_top_y(&self, track_idx: usize) -> f32 {
+        let mut y = 0.0;
+        for i in 0..track_idx.min(self.tracks.len()) {
+            y += self.track_height(i);
+        }
+        y
+    }
+
+    pub fn total_tracks_height(&self) -> f32 {
+        let mut y = 0.0;
+        for i in 0..self.tracks.len() {
+            y += self.track_height(i);
+        }
+        y
+    }
+
+    pub fn track_at_y(&self, rel_y: f32) -> usize {
+        let mut accumulated = 0.0;
+        for (i, t) in self.tracks.iter().enumerate() {
+            accumulated += t.height;
+            if rel_y < accumulated {
+                return i;
+            }
+        }
+        self.tracks.len().saturating_sub(1)
+    }
+
     pub fn new_empty() -> Self {
+        let default_h = 52.0;
         let tracks = vec![
             Track {
                 name: "V2".to_string(),
@@ -173,6 +261,7 @@ impl TimelineState {
                 is_muted: false,
                 is_locked: false,
                 is_solo: false,
+                height: default_h,
             },
             Track {
                 name: "V1".to_string(),
@@ -180,6 +269,7 @@ impl TimelineState {
                 is_muted: false,
                 is_locked: false,
                 is_solo: false,
+                height: default_h,
             },
             Track {
                 name: "A1".to_string(),
@@ -187,6 +277,7 @@ impl TimelineState {
                 is_muted: false,
                 is_locked: false,
                 is_solo: false,
+                height: default_h,
             },
             Track {
                 name: "A2".to_string(),
@@ -194,6 +285,7 @@ impl TimelineState {
                 is_muted: false,
                 is_locked: false,
                 is_solo: false,
+                height: default_h,
             },
         ];
 
@@ -227,6 +319,11 @@ impl TimelineState {
             history: Vec::new(),
             redo_stack: Vec::new(),
             audio_dirty: true,
+            structure_dirty: false,
+            track_height: default_h,
+            resizing_track: None,
+            retime_session: None,
+            show_view_options: false,
         }
     }
 
@@ -240,6 +337,7 @@ impl TimelineState {
                 is_muted: false,
                 is_locked: false,
                 is_solo: false,
+                height: self.track_height,
             });
         }
     }
@@ -253,6 +351,7 @@ impl TimelineState {
             is_muted: false,
             is_locked: false,
             is_solo: false,
+            height: self.track_height,
         };
         let first_audio = self.tracks.iter().position(|t| !t.is_video).unwrap_or(self.tracks.len());
         self.tracks.insert(first_audio, new_track);
@@ -273,6 +372,7 @@ impl TimelineState {
             is_muted: false,
             is_locked: false,
             is_solo: false,
+            height: self.track_height,
         });
         self.audio_dirty = true;
     }
@@ -374,6 +474,7 @@ impl TimelineState {
             }
         }
         self.audio_dirty = true;
+        self.structure_dirty = true;
         true
     }
 
@@ -392,6 +493,7 @@ impl TimelineState {
                 self.blade_cut_at(id, playhead);
             }
             self.audio_dirty = true;
+            self.structure_dirty = true;
         }
     }
 
@@ -407,6 +509,7 @@ impl TimelineState {
             }
             self.selected_clip_id = None;
             self.audio_dirty = true;
+            self.structure_dirty = true;
         }
     }
 
@@ -456,6 +559,7 @@ impl TimelineState {
 
             self.selected_clip_id = None;
             self.audio_dirty = true;
+            self.structure_dirty = true;
         }
     }
 
@@ -527,6 +631,7 @@ impl TimelineState {
             }
         }
         self.audio_dirty = true;
+        self.structure_dirty = true;
     }
 
     /// Подрезка начала клипа (Trim In) с привязкой к начальному состоянию сессии
@@ -562,6 +667,7 @@ impl TimelineState {
         }
 
         self.audio_dirty = true;
+        self.structure_dirty = true;
     }
 
     /// Подрезка конца клипа (Trim Out) с привязкой к начальному состоянию сессии
@@ -587,6 +693,7 @@ impl TimelineState {
         }
 
         self.audio_dirty = true;
+        self.structure_dirty = true;
     }
 
     /// Шаг плейхеда при воспроизведении с точной остановкой в конце таймлайна
@@ -726,6 +833,7 @@ mod tests {
             volume_db: 0.0,
             pan: 0.0,
             source_audio_stream: 0,
+            ..Default::default()
         });
 
         tl.clips.push(Clip {
@@ -750,6 +858,7 @@ mod tests {
             volume_db: 0.0,
             pan: 0.0,
             source_audio_stream: 0,
+            ..Default::default()
         });
 
         // Режем на кадре 96 (ровно 4.0 секунды)
@@ -803,6 +912,7 @@ mod tests {
             volume_db: 0.0,
             pan: 0.0,
             source_audio_stream: 0,
+            ..Default::default()
         });
 
         tl.is_playing = true;
@@ -847,6 +957,7 @@ mod tests {
             volume_db: 0.0,
             pan: 0.0,
             source_audio_stream: 0,
+            ..Default::default()
         });
 
         tl.clips.push(Clip {
@@ -871,6 +982,7 @@ mod tests {
             volume_db: 0.0,
             pan: 0.0,
             source_audio_stream: 0,
+            ..Default::default()
         });
 
         // Перемещаем только видеоклип на 30 кадр
@@ -909,6 +1021,7 @@ mod tests {
             volume_db: 0.0,
             pan: 0.0,
             source_audio_stream: 0,
+            ..Default::default()
         });
 
         // Режем на кадре 25
@@ -947,6 +1060,7 @@ mod tests {
             volume_db: 0.0,
             pan: 0.0,
             source_audio_stream: 0,
+            ..Default::default()
         });
 
         // Clip 2: [50..100) (Будет удален через Ripple Delete)
@@ -972,6 +1086,7 @@ mod tests {
             volume_db: 0.0,
             pan: 0.0,
             source_audio_stream: 0,
+            ..Default::default()
         });
 
         // Clip 3: [100..180)
@@ -997,6 +1112,7 @@ mod tests {
             volume_db: 0.0,
             pan: 0.0,
             source_audio_stream: 0,
+            ..Default::default()
         });
 
         // Выделяем Clip 2 и делаем Ripple Delete
@@ -1048,6 +1164,7 @@ mod tests {
             volume_db: 0.0,
             pan: 0.0,
             source_audio_stream: 0,
+            ..Default::default()
         });
 
         tl.clips.push(Clip {
@@ -1072,6 +1189,7 @@ mod tests {
             volume_db: 0.0,
             pan: 0.0,
             source_audio_stream: 0,
+            ..Default::default()
         });
 
         let session = TrimSession {
@@ -1127,6 +1245,7 @@ mod tests {
             volume_db: 0.0,
             pan: 0.0,
             source_audio_stream: 0,
+            ..Default::default()
         };
 
         let tl_fps = 60;
@@ -1138,5 +1257,108 @@ mod tests {
         // Обратный перевод: исходный кадр 180 -> таймлайн 160
         let back_tl_f = clip.timeline_frame_from_source(src_f, tl_fps);
         assert_eq!(back_tl_f, 160);
+    }
+
+    #[test]
+    fn test_retime_controls_speed_and_reverse_conversion() {
+        let mut clip = Clip {
+            id: 1,
+            name: "RetimeClip".to_string(),
+            track_index: 0,
+            start_frame: 100,
+            duration_frames: 200,
+            is_audio: false,
+            color: Color32::BLUE,
+            source_path: None,
+            source_in_frame: 0,
+            source_in_secs: 0.0,
+            source_fps: 60.0,
+            speed: 1.0,
+            ..Default::default()
+        };
+
+        let tl_fps = 60;
+        // 1. Нормальная скорость (100%): кадр 150 (+50 кадров) -> source 50
+        assert_eq!(clip.source_frame_from_timeline(150, tl_fps), 50);
+
+        // 2. Ускорение 2x (200%): кадр 150 (+50 кадров на таймлайне) -> source 100
+        clip.speed = 2.0;
+        assert_eq!(clip.source_frame_from_timeline(150, tl_fps), 100);
+
+        // 3. Замедление 0.5x (50%): кадр 150 (+50 кадров на таймлайне) -> source 25
+        clip.speed = 0.5;
+        assert_eq!(clip.source_frame_from_timeline(150, tl_fps), 25);
+
+        // 4. Реверс -1.0x (Reverse Speed): в начале клипа (кадр 100, смещение 0) -> последний кадр источника (кадр 199)
+        clip.speed = -1.0;
+        assert_eq!(clip.source_frame_from_timeline(100, tl_fps), 199);
+        // В конце клипа (кадр 299, смещение 199) -> первый кадр источника (кадр 0)
+        assert_eq!(clip.source_frame_from_timeline(299, tl_fps), 0);
+    }
+
+    #[test]
+    fn test_variable_track_heights_and_y_lookup() {
+        let mut tl = TimelineState::new_empty();
+        tl.tracks.clear();
+        tl.tracks.push(Track { name: "V1".to_string(), is_video: true, is_muted: false, is_locked: false, is_solo: false, height: 40.0 });
+        tl.tracks.push(Track { name: "V2".to_string(), is_video: true, is_muted: false, is_locked: false, is_solo: false, height: 80.0 });
+        tl.tracks.push(Track { name: "A1".to_string(), is_video: false, is_muted: false, is_locked: false, is_solo: false, height: 50.0 });
+
+        assert_eq!(tl.track_height(0), 40.0);
+        assert_eq!(tl.track_height(1), 80.0);
+        assert_eq!(tl.track_height(2), 50.0);
+        assert_eq!(tl.total_tracks_height(), 170.0);
+
+        assert_eq!(tl.track_top_y(0), 0.0);
+        assert_eq!(tl.track_top_y(1), 40.0);
+        assert_eq!(tl.track_top_y(2), 120.0);
+
+        // Поиск трека по Y координате
+        assert_eq!(tl.track_at_y(10.0), 0);
+        assert_eq!(tl.track_at_y(39.0), 0);
+        assert_eq!(tl.track_at_y(40.0), 1);
+        assert_eq!(tl.track_at_y(119.0), 1);
+        assert_eq!(tl.track_at_y(120.0), 2);
+        assert_eq!(tl.track_at_y(300.0), 2); // clamped to last track
+    }
+
+    #[test]
+    fn test_disabled_clip_not_selected_for_video_playback() {
+        let mut tl = TimelineState::new_empty();
+        tl.tracks.push(Track { name: "V1".to_string(), is_video: true, is_muted: false, is_locked: false, is_solo: false, height: 52.0 });
+        tl.tracks.push(Track { name: "V2".to_string(), is_video: true, is_muted: false, is_locked: false, is_solo: false, height: 52.0 });
+
+        // Верхний клип на V2 (индекс 1)
+        let clip_top = Clip {
+            id: 10,
+            name: "TopDisabled".to_string(),
+            track_index: 0,
+            start_frame: 0,
+            duration_frames: 100,
+            is_audio: false,
+            color: Color32::RED,
+            is_disabled: true, // ВЫКЛЮЧЕН (клавиша 'D')
+            ..Default::default()
+        };
+
+        // Нижний клип на V1 (индекс 0)
+        let clip_bottom = Clip {
+            id: 20,
+            name: "BottomActive".to_string(),
+            track_index: 1,
+            start_frame: 0,
+            duration_frames: 100,
+            is_audio: false,
+            color: Color32::BLUE,
+            is_disabled: false,
+            ..Default::default()
+        };
+
+        tl.clips.push(clip_top);
+        tl.clips.push(clip_bottom);
+
+        // Так как верхний клип отключен, активным видеоклипом должен стать нижний (id 20)
+        let active = tl.active_video_clip_at(50).expect("should find active bottom clip");
+        assert_eq!(active.id, 20);
     }
 }

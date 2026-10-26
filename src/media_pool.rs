@@ -214,6 +214,9 @@ impl MediaPoolState {
                         volume_db: 0.0,
                         pan: 0.0,
                         source_audio_stream: 0,
+                        speed: 1.0,
+                        retime_controls_open: false,
+                        is_disabled: false,
                     };
                     timeline.next_clip_id += 1;
                     timeline.selected_clip_id = Some(v_clip.id);
@@ -254,6 +257,9 @@ impl MediaPoolState {
                             volume_db: 0.0,
                             pan: 0.0,
                             source_audio_stream: a_idx,
+                            speed: 1.0,
+                            retime_controls_open: false,
+                            is_disabled: false,
                         };
                         timeline.next_clip_id += 1;
                         if !asset.has_video && a_idx == 0 {

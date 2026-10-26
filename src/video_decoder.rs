@@ -410,6 +410,17 @@ impl VideoPlayer {
         self.newly_cached_frames.clear();
     }
 
+    /// Полный сброс очередей и префетча при нарезке клипа (Blade), изменении скорости (Retime)
+    /// или переходе, предотвращающий мелькания старых кадров
+    pub fn flush_queues_on_cut(&mut self) {
+        self.frame_queue.clear();
+        self.prefetch_queue.clear();
+        self.newly_cached_frames.clear();
+        self.prefetch_target = None;
+        self.last_playback_target = -9999;
+        self.current_epoch = self.current_epoch.wrapping_add(1);
+    }
+
     /// Главный метод обновления кадра:
     /// Автоматически разделяет непрерывное воспроизведение (Jitter Buffer Prefetch)
     /// и точечный скраббинг/перемотку (Frame-Accurate Seek)

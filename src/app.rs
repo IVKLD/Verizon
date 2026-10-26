@@ -529,6 +529,7 @@ impl NleApp {
             // Undo: Ctrl + Z
             if i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::Z) {
                 self.timeline.undo();
+                self.timeline.structure_dirty = true;
             }
 
             // Redo: Ctrl + Shift + Z или Ctrl + Y
@@ -536,6 +537,62 @@ impl NleApp {
                 || (i.modifiers.ctrl && i.key_pressed(egui::Key::Y))
             {
                 self.timeline.redo();
+                self.timeline.structure_dirty = true;
+            }
+
+            // Ctrl + R: Retime Controls (DaVinci Resolve Управление скоростью клипа)
+            if (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::R) {
+                if let Some(sel_id) = self.timeline.selected_clip_id {
+                    if let Some(c) = self.timeline.clips.iter_mut().find(|c| c.id == sel_id) {
+                        c.retime_controls_open = !c.retime_controls_open;
+                    }
+                }
+            }
+
+            // D: Отключить / Включить клип (DaVinci Resolve Disable/Enable Clip)
+            if !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.command && i.key_pressed(egui::Key::D) {
+                if let Some(sel_id) = self.timeline.selected_clip_id {
+                    if let Some(c) = self.timeline.clips.iter_mut().find(|c| c.id == sel_id) {
+                        c.is_disabled = !c.is_disabled;
+                        self.timeline.structure_dirty = true;
+                        self.timeline.audio_dirty = true;
+                    }
+                }
+            }
+
+            // Shift + V: Выделить клип под плейхедом
+            if i.modifiers.shift && !i.modifiers.ctrl && i.key_pressed(egui::Key::V) {
+                let playhead = self.timeline.playhead_frame;
+                if let Some(c) = self.timeline.active_video_clip_at(playhead) {
+                    self.timeline.selected_clip_id = Some(c.id);
+                }
+            }
+
+            // Shift + Plus / Shift + =: Увеличить высоту дорожек клипов (как в DaVinci Resolve)
+            if i.modifiers.shift && !i.modifiers.ctrl {
+                if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
+                    let new_h = (self.timeline.track_height + 8.0).clamp(24.0, 160.0);
+                    self.timeline.track_height = new_h;
+                    for t in &mut self.timeline.tracks {
+                        t.height = new_h;
+                    }
+                } else if i.key_pressed(egui::Key::Minus) {
+                    let new_h = (self.timeline.track_height - 8.0).clamp(24.0, 160.0);
+                    self.timeline.track_height = new_h;
+                    for t in &mut self.timeline.tracks {
+                        t.height = new_h;
+                    }
+                }
+            }
+
+            // Ctrl + /: Зациклить воспроизведение (Loop Playback)
+            if (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::Slash) {
+                self.timeline.loop_enabled = !self.timeline.loop_enabled;
+            }
+
+            // Ctrl + \: Разрезать все дорожки под плейхедом (Blade All)
+            if (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::Backslash) {
+                self.timeline.blade_all_at_playhead();
             }
         });
 
@@ -802,6 +859,13 @@ impl eframe::App for NleApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        // Проверка изменения структуры таймлайна (разрезы, перемещения, удаление, Retime)
+        if self.timeline.structure_dirty {
+            self.render_cache.invalidate_all();
+            self.video_player.flush_queues_on_cut();
+            self.timeline.structure_dirty = false;
+        }
+
         // 0. Обработка очереди импорта из таймлайна
         let pending = std::mem::take(&mut self.timeline.pending_imports);
         for f in pending {
@@ -912,6 +976,11 @@ impl eframe::App for NleApp {
         if !is_autopilot {
             self.handle_drag_and_drop(&ctx);
             self.handle_keyboard_shortcuts(&ctx);
+            if self.timeline.structure_dirty {
+                self.render_cache.invalidate_all();
+                self.video_player.flush_queues_on_cut();
+                self.timeline.structure_dirty = false;
+            }
         }
 
         // 9. Модальное окно настроек (Масштабирование UI для 4K)

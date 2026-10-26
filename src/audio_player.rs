@@ -829,7 +829,7 @@ impl AudioPlayer {
         let mut total_len = 0usize;
 
         for c in &timeline.clips {
-            if !c.is_audio {
+            if !c.is_audio || c.is_disabled {
                 continue;
             }
 
@@ -1008,6 +1008,9 @@ mod tests {
             volume_db: 0.0,
             pan: 0.0,
             source_audio_stream: 0,
+            speed: 1.0,
+            retime_controls_open: false,
+            is_disabled: false,
         };
         timeline.clips.push(clip);
         player.rebuild_timeline_audio(&timeline);

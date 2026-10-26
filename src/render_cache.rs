@@ -88,6 +88,8 @@ impl RenderCacheManager {
                 c.position_y.to_bits().hash(&mut hasher);
                 c.rotation.to_bits().hash(&mut hasher);
                 c.opacity.to_bits().hash(&mut hasher);
+                c.speed.to_bits().hash(&mut hasher);
+                c.is_disabled.hash(&mut hasher);
                 if let Some(ref path) = c.source_path {
                     path.hash(&mut hasher);
                 }
