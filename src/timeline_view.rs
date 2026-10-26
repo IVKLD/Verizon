@@ -120,7 +120,7 @@ impl TimelineView {
                         // Зум центрированный строго под курсором мыши (как в DaVinci Resolve 21)
                         let old_zoom = timeline.zoom_factor;
                         let zoom_mult = if scroll_y > 0.0 { 1.15 } else { 0.87 };
-                        let new_zoom = (old_zoom * zoom_mult).clamp(0.05, 50.0);
+                        let new_zoom = (old_zoom * zoom_mult).clamp(0.0005, 50.0);
 
                         let mouse_rel_x = m_pos.x - canvas_rect.min.x;
                         let target_frame = (mouse_rel_x + timeline.scroll_x) / old_zoom;
@@ -137,7 +137,10 @@ impl TimelineView {
             }
         }
 
-        // Ограничение вертикального скролла дорожек
+        // Ограничение горизонтального и вертикального скролла дорожек
+        let max_scroll_x = (timeline.timeline_end_frame() as f32 * timeline.zoom_factor + canvas_rect.width() * 0.75).max(0.0);
+        timeline.scroll_x = timeline.scroll_x.clamp(0.0, max_scroll_x);
+
         let total_tracks_h = total_tracks as f32 * track_height;
         let max_scroll_y = (total_tracks_h - (tracks_canvas_rect.height() - 20.0)).max(0.0);
         timeline.scroll_y = timeline.scroll_y.clamp(0.0, max_scroll_y);
@@ -709,14 +712,23 @@ impl TimelineView {
 
             ui.separator();
 
-            // Zoom контролы
+            // Zoom контролы (от 1 кадра до многочасовых проектов)
             ui.label(egui::RichText::new("Zoom:").size(11.0).color(ResolveColors::TEXT_MUTED));
-            if ui.button("➖").clicked() {
-                timeline.zoom_factor = (timeline.zoom_factor * 0.75).clamp(0.2, 20.0);
+            if ui.button("➖").on_hover_text("Уменьшить масштаб (Zoom Out)").clicked() {
+                timeline.zoom_factor = (timeline.zoom_factor * 0.75).clamp(0.0005, 50.0);
             }
-            ui.add(egui::Slider::new(&mut timeline.zoom_factor, 0.2..=10.0).show_value(false));
-            if ui.button("➕").clicked() {
-                timeline.zoom_factor = (timeline.zoom_factor * 1.33).clamp(0.2, 20.0);
+            let mut log_zoom = timeline.zoom_factor;
+            let slider = egui::Slider::new(&mut log_zoom, 0.0005..=50.0)
+                .logarithmic(true)
+                .show_value(false);
+            if ui.add(slider).on_hover_text("Плавный логарифмический зум (от 1 кадра до 10 часов)").changed() {
+                timeline.zoom_factor = log_zoom;
+            }
+            if ui.button("➕").on_hover_text("Увеличить масштаб (Zoom In)").clicked() {
+                timeline.zoom_factor = (timeline.zoom_factor * 1.33).clamp(0.0005, 50.0);
+            }
+            if ui.button("⛶ Fit").on_hover_text("Показать весь проект целиком [Shift+Z]").clicked() {
+                timeline.zoom_to_fit(ui.available_width().max(400.0));
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -745,25 +757,15 @@ impl TimelineView {
         let frames_per_sec = timeline.fps as f32;
         let sec_width = frames_per_sec * timeline.zoom_factor;
 
-        // Адаптивный шаг меток: расстояние между таймкодами всегда >= 80px, никакого наложения и мыла
+        // Адаптивный шаг меток: расстояние между таймкодами всегда >= 80px (от секунд до многочасовых проектов)
         let min_spacing = 80.0;
-        let step_seconds = if sec_width >= min_spacing {
-            1
-        } else if sec_width * 2.0 >= min_spacing {
-            2
-        } else if sec_width * 5.0 >= min_spacing {
-            5
-        } else if sec_width * 10.0 >= min_spacing {
-            10
-        } else if sec_width * 30.0 >= min_spacing {
-            30
-        } else if sec_width * 60.0 >= min_spacing {
-            60
-        } else if sec_width * 300.0 >= min_spacing {
-            300
-        } else {
-            600
-        };
+        let steps = [
+            1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400, 28800, 86400,
+        ];
+        let step_seconds = steps
+            .into_iter()
+            .find(|&s| s as f32 * sec_width >= min_spacing)
+            .unwrap_or(86400);
 
         let start_sec = ((timeline.scroll_x / sec_width).floor() as i64 / step_seconds).max(0) * step_seconds;
         let end_sec = (((timeline.scroll_x + rect.width()) / sec_width).ceil() as i64 / step_seconds + 1) * step_seconds;

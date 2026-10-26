@@ -100,7 +100,7 @@ fn vaapi_render_nodes() -> Vec<PathBuf> {
 }
 
 /// Максимальное время ожидания первого кадра после старта воспроизведения (мс)
-const PREROLL_TIMEOUT_MS: u128 = 1000;
+const PREROLL_TIMEOUT_MS: u128 = 150;
 /// Минимальный интервал между аппаратными запросами кадра при скраббинге (мс)
 const SCRUB_MIN_REQUEST_INTERVAL_MS: u128 = 80;
 /// Через сколько мс без доставки кадра запрос считается потерянным и отправляется заново
@@ -489,7 +489,7 @@ impl VideoPlayer {
                             self.current_epoch = self.current_epoch.max(self.prefetch_epoch).wrapping_add(1);
                             self.clear_queues_async();
                             self.prefetch_target = None;
-                            self.begin_preroll();
+                            // Во время активного воспроизведения пре-ролл НЕ включается повторно — декодер догоняет звук через Drop Frame
                             if let Some(tx) = &self.command_tx {
                                 let _ = tx.send(DecoderCommand::Play {
                                     start_frame: target_frame,
@@ -512,17 +512,7 @@ impl VideoPlayer {
 
             self.poll_playback_frames_with_cut(target_frame, upcoming_cut, ctx);
         } else {
-            if self.is_playing_mode {
-                self.is_playing_mode = false;
-                self.current_epoch = self.current_epoch.max(self.prefetch_epoch).wrapping_add(1);
-                self.clear_queues_async();
-                self.prefetch_target = None;
-                self.is_dropping_frames = false;
-                if let Some(tx) = &self.command_tx {
-                    let _ = tx.send(DecoderCommand::Pause { epoch: self.current_epoch });
-                }
-            }
-
+            self.pause();
             self.seek_and_decode(target_frame, ctx);
         }
     }
@@ -742,6 +732,26 @@ impl VideoPlayer {
             && self.play_requested_at.elapsed().as_millis() < PREROLL_TIMEOUT_MS
     }
 
+    /// Пометить готовность кадра воспроизведения (снимает пре-ролл при Render Cache hit)
+    #[inline]
+    pub fn mark_playback_ready(&mut self) {
+        self.playback_ready = true;
+    }
+
+    /// Принудительно перевести декодер в режим паузы с очисткой очередей
+    pub fn pause(&mut self) {
+        if self.is_playing_mode {
+            self.is_playing_mode = false;
+            self.current_epoch = self.current_epoch.max(self.prefetch_epoch).wrapping_add(1);
+            self.clear_queues_async();
+            self.prefetch_target = None;
+            self.is_dropping_frames = false;
+            if let Some(tx) = &self.command_tx {
+                let _ = tx.send(DecoderCommand::Pause { epoch: self.current_epoch });
+            }
+        }
+    }
+
     /// Выводит кадр воспроизведения через ping-pong двух текстур: предыдущий кадр остаётся на GPU для блендинга
     pub fn present_playback_frame(&mut self, ctx: &Context, img: Arc<ColorImage>) {
         self.last_displayed_image = Some(Arc::clone(&img));
@@ -768,8 +778,15 @@ impl VideoPlayer {
         (self.is_playing_mode && self.back_frame >= 0 && self.last_decoded_frame - self.back_frame == 1).then_some(back)
     }
 
+    /// Сбросить историю предыдущего кадра для GPU-блендинга (устраняет мерцание при переходах и скраббинге)
+    #[inline]
+    pub fn reset_blend(&mut self) {
+        self.back_frame = -1;
+    }
+
     /// Отобразить чистый нейтральный экран Resolve (а при воспроизведении паузы — заранее подготовить декодер к следующему клипу!)
     pub fn show_blank_frame_with_prefetch(&mut self, prefetch_frame: Option<i64>, ctx: &Context) {
+        self.playback_ready = true;
         if let Some(next_src) = prefetch_frame {
             if self.prefetch_target.map(|pf| (next_src - pf).abs() <= 2).unwrap_or(false) {
                 self.is_playing_mode = true;
@@ -792,15 +809,7 @@ impl VideoPlayer {
                 }
             }
         } else {
-            if self.is_playing_mode {
-                self.is_playing_mode = false;
-                self.current_epoch = self.current_epoch.max(self.prefetch_epoch).wrapping_add(1);
-                self.clear_queues_async();
-                self.prefetch_target = None;
-                if let Some(tx) = &self.command_tx {
-                    let _ = tx.send(DecoderCommand::Pause { epoch: self.current_epoch });
-                }
-            }
+            self.pause();
             if let Some(rx) = &self.frame_rx {
                 let mut stale = Vec::new();
                 while let Ok((_, _, img)) = rx.try_recv() {

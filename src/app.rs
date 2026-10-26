@@ -358,6 +358,8 @@ impl NleApp {
                 if self.timeline.is_playing {
                     self.timeline.frame_accumulator = 0.0;
                     self.last_frame_time = std::time::Instant::now();
+                } else {
+                    self.video_player.pause();
                 }
             }
 
@@ -383,9 +385,9 @@ impl NleApp {
             } else if (i.modifiers.ctrl || i.modifiers.command) && !i.modifiers.shift {
                 // Ctrl + / Ctrl - в DaVinci Resolve: Зум таймлайна по плейхеду
                 if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
-                    self.timeline.zoom_factor = (self.timeline.zoom_factor * 1.25).clamp(0.05, 50.0);
+                    self.timeline.zoom_factor = (self.timeline.zoom_factor * 1.25).clamp(0.0005, 50.0);
                 } else if i.key_pressed(egui::Key::Minus) {
-                    self.timeline.zoom_factor = (self.timeline.zoom_factor * 0.80).clamp(0.05, 50.0);
+                    self.timeline.zoom_factor = (self.timeline.zoom_factor * 0.80).clamp(0.0005, 50.0);
                 }
             }
 
@@ -443,6 +445,7 @@ impl NleApp {
             if i.key_pressed(egui::Key::K) {
                 self.timeline.is_playing = false;
                 self.timeline.playback_speed = 1.0;
+                self.video_player.pause();
             }
             if i.key_pressed(egui::Key::L) {
                 if !self.timeline.is_playing {
@@ -598,6 +601,8 @@ impl NleApp {
                             if self.timeline.is_playing {
                                 self.timeline.frame_accumulator = 0.0;
                                 self.last_frame_time = std::time::Instant::now();
+                            } else {
+                                self.video_player.pause();
                             }
                             ui.close();
                         }
@@ -919,7 +924,7 @@ impl eframe::App for NleApp {
         self.audio_player.sync_playhead_frame(
             self.timeline.playhead_frame,
             self.timeline.fps,
-            self.timeline.is_playing && !self.video_player.is_prerolling(),
+            self.timeline.is_playing && !self.timeline.is_scrubbing,
         );
 
         // 8. Автопилот самопроверки ПОСЛЕ рендера Viewers (чтобы замерять актуальный декодированный кадр текущего тика)
@@ -935,7 +940,7 @@ impl eframe::App for NleApp {
             self.audio_player.sync_playhead_frame(
                 self.timeline.playhead_frame,
                 self.timeline.fps,
-                self.timeline.is_playing && !self.video_player.is_prerolling(),
+                self.timeline.is_playing && !self.timeline.is_scrubbing,
             );
         }
 

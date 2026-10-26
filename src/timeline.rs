@@ -682,7 +682,7 @@ impl TimelineState {
     /// Показать весь таймлайн целиком (Shift + Z в Resolve)
     pub fn zoom_to_fit(&mut self, available_width: f32) {
         let total_frames = self.timeline_end_frame().max(self.fps as i64 * 10);
-        let optimal_zoom = (available_width / total_frames as f32).clamp(0.05, 50.0);
+        let optimal_zoom = (available_width / total_frames as f32).clamp(0.0005, 50.0);
         self.zoom_factor = optimal_zoom;
         self.scroll_x = 0.0;
     }

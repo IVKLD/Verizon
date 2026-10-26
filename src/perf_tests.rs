@@ -1413,3 +1413,116 @@ fn test_active_video_clip_priority() {
     assert_eq!(tl.active_video_clip_at(60).unwrap().id, 10);
 }
 
+#[test]
+fn test_audio_playback_continuous_during_preroll_cache_and_cuts() {
+    let Some(path) = get_test_file() else { return; };
+    let mut audio_player = AudioPlayer::new();
+    let mut timeline = build_real_timeline(&path, &audio_player);
+    audio_player.rebuild_timeline_audio(&timeline);
+
+    // 1. Проверяем, что sync_playhead_frame переводит движок в режим воспроизведения
+    audio_player.sync_playhead_frame(0, timeline.fps, true);
+    assert!(audio_player.engine.is_playing.load(std::sync::atomic::Ordering::Acquire));
+
+    // 2. Симулируем прогон воспроизведения на протяжении 120 кадров:
+    // Аудио НЕ должно выключаться, даже если видеодекодер переключает склейки или попадает в кэш
+    for frame in 0..120 {
+        timeline.playhead_frame = frame;
+        audio_player.sync_playhead_frame(frame, timeline.fps, true);
+        assert!(
+            audio_player.engine.is_playing.load(std::sync::atomic::Ordering::Acquire),
+            "Аудио-движок обязан продолжать воспроизведение на кадре {}",
+            frame
+        );
+
+        // Рендерим окно аудио и проверяем, что звук не превращается в тишину посреди клипа
+        let sample_pos = (frame as f64 / timeline.fps as f64 * crate::audio_player::AUDIO_RATE as f64).round() as usize * 2;
+        let block = audio_player.render_mix_window(sample_pos, 480 * 2);
+        let energy: f32 = block.iter().map(|s| s.abs()).sum();
+        assert!(energy > 0.0, "На кадре {} должен звучать PCM-сигнал, а не тишина", frame);
+    }
+
+    // 3. Проверяем остановку воспроизведения
+    audio_player.sync_playhead_frame(120, timeline.fps, false);
+    assert!(!audio_player.engine.is_playing.load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[test]
+fn test_timeline_zoom_multi_hour_project_support() {
+    let mut timeline = TimelineState::new_empty();
+    timeline.fps = 60;
+    // 2-часовой проект = 7200 секунд = 432 000 кадров
+    let two_hours_frames = 2 * 3600 * 60;
+    let clip = Clip {
+        id: 1,
+        name: "TwoHourMovie.mp4".to_string(),
+        track_index: 1,
+        start_frame: 0,
+        duration_frames: two_hours_frames,
+        is_audio: false,
+        color: egui::Color32::BLUE,
+        source_path: None,
+        source_in_frame: 0,
+        source_in_secs: 0.0,
+        source_fps: 60.0,
+        link_group: None,
+        zoom_x: 1.0,
+        zoom_y: 1.0,
+        position_x: 0.0,
+        position_y: 0.0,
+        rotation: 0.0,
+        opacity: 100.0,
+        volume_db: 0.0,
+        pan: 0.0,
+        source_audio_stream: 0,
+    };
+    timeline.clips.push(clip);
+
+    // Zoom to Fit на экране шириной 1920 пикселей
+    timeline.zoom_to_fit(1920.0);
+    // Проверяем, что масштаб меньше 0.05 и проект целиком помещается в доступную ширину
+    assert!(
+        timeline.zoom_factor < 0.01,
+        "Масштаб для 2-часового фильма должен быть < 0.01, получено {}",
+        timeline.zoom_factor
+    );
+    let total_width = timeline.timeline_end_frame() as f32 * timeline.zoom_factor;
+    assert!(
+        total_width <= 1920.0 + 1.0,
+        "Весь 2-часовой фильм обязан полностью помещаться в ширину холста"
+    );
+
+    // Проверяем адаптивный шаг меток времени для многочасового проекта
+    let frames_per_sec = timeline.fps as f32;
+    let sec_width = frames_per_sec * timeline.zoom_factor;
+    let min_spacing = 80.0;
+    let steps = [
+        1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400, 28800, 86400,
+    ];
+    let step_seconds = steps
+        .into_iter()
+        .find(|&s| s as f32 * sec_width >= min_spacing)
+        .unwrap_or(86400);
+
+    // При 2 часах метки должны адаптироваться к минутам/часам (например 300 с / 5 мин или 600 с / 10 мин), а не лепиться каждую секунду
+    assert!(
+        step_seconds >= 300,
+        "Для 2-часового проекта шаг таймкода должен быть >= 5 минут, получено {}",
+        step_seconds
+    );
+}
+
+#[test]
+fn test_render_cache_stale_frame_duplication_prevented() {
+    let cache = crate::render_cache::RenderCacheManager::new(crate::render_cache::RenderCacheMode::Smart, 128);
+    let img1 = std::sync::Arc::new(egui::ColorImage::example());
+    let sig1 = 12345u64;
+
+    // Кадр 0 закэширован
+    cache.insert(0, std::sync::Arc::clone(&img1), sig1);
+    assert!(cache.get(0, sig1).is_some());
+
+    // Кадр 1 НЕ должен автоматически получать копию кадра 0
+    assert!(cache.get(1, sig1).is_none(), "Кадр 1 не должен дублировать кадр 0 при отсутствии в кэше");
+}
+

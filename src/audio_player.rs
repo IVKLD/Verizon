@@ -693,8 +693,19 @@ impl AudioPlayer {
                 .streams()
                 .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Audio)
                 .count();
-            let d = (ictx.duration() as f64 / f64::from(ffmpeg_next::ffi::AV_TIME_BASE)).max(1.0);
-            (n, d)
+            let raw_dur = ictx.duration();
+            let d = if raw_dur > 0 {
+                raw_dur as f64 / f64::from(ffmpeg_next::ffi::AV_TIME_BASE)
+            } else {
+                ictx.streams()
+                    .map(|s| {
+                        let tb = f64::from(s.time_base());
+                        s.duration() as f64 * tb
+                    })
+                    .filter(|&d| d > 0.0)
+                    .fold(0.0_f64, f64::max)
+            };
+            (n, if d > 0.0 { d } else { 7200.0 })
         } else {
             return None;
         };
@@ -703,8 +714,8 @@ impl AudioPlayer {
             return None;
         }
 
-        // Выделяем прогрессивные буферы сразу для всех аудиодорожек файла (с запасом +2 сек)
-        let cap_samples = ((duration_secs + 2.0) * AUDIO_RATE as f64).ceil() as usize * 2;
+        // Выделяем прогрессивные буферы сразу для всех аудиодорожек файла (с запасом +10 сек)
+        let cap_samples = ((duration_secs + 10.0) * AUDIO_RATE as f64).ceil() as usize * 2;
         let mut to_decode: Vec<(usize, Arc<AudioStreamBuffer>)> = Vec::new();
         let mut result_buf: Option<Arc<AudioStreamBuffer>> = None;
 
@@ -834,7 +845,7 @@ impl AudioPlayer {
                 } else {
                     let cur = engine.pos.load(Ordering::Acquire);
                     let diff = (cur as isize - target_sample as isize).abs();
-                    let threshold = (rate * 0.10 * 2.0) as isize;
+                    let threshold = (rate * 0.25 * 2.0) as isize;
                     if diff > threshold {
                         engine.pos.store(target_sample, Ordering::Release);
                     }

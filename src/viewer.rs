@@ -76,8 +76,17 @@ impl ViewerState {
         if render_cache.mode != crate::render_cache::RenderCacheMode::None {
             if let Some(cached_img) = render_cache.get(timeline.playhead_frame, current_sig) {
                 video_player.present_playback_frame(ctx, cached_img);
-                video_player.last_decoded_frame = timeline.playhead_frame;
-                video_player.last_playback_target = timeline.playhead_frame;
+                video_player.mark_playback_ready();
+                if let Some(clip) = timeline.active_video_clip_at(timeline.playhead_frame) {
+                    let src_f = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
+                    video_player.last_decoded_frame = src_f;
+                    video_player.last_playback_target = src_f;
+                }
+                if timeline.is_playing && !timeline.is_scrubbing {
+                    video_player.is_playing_mode = true;
+                } else {
+                    video_player.reset_blend();
+                }
                 cache_hit = true;
             }
         }
@@ -168,12 +177,16 @@ impl ViewerState {
                 video_player.show_blank_frame_with_prefetch(prefetch_src, ctx);
             }
 
-            // Автоматически сохраняем успешно декодированные кадры в Render Cache для мгновенного повторного воспроизведения
+            // Автоматически сохраняем ТОЛЬКО реально декодированные кадры в Render Cache
             if render_cache.mode != crate::render_cache::RenderCacheMode::None {
-                if let Some(ref img) = video_player.last_displayed_image {
-                    render_cache.insert(timeline.playhead_frame, std::sync::Arc::clone(img), current_sig);
-                }
                 if let Some(clip) = active_clip {
+                    let expected_src = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
+                    // Сохраняем last_displayed_image только если номер кадра строго совпадает с ожидаемым (без дублирования и мерцания)
+                    if video_player.last_decoded_frame == expected_src {
+                        if let Some(ref img) = video_player.last_displayed_image {
+                            render_cache.insert(timeline.playhead_frame, std::sync::Arc::clone(img), current_sig);
+                        }
+                    }
                     for (src_f, img) in video_player.newly_cached_frames.drain(..) {
                         let tl_f = clip.timeline_frame_from_source(src_f, timeline.fps);
                         if clip.contains_frame(tl_f) {
@@ -181,6 +194,8 @@ impl ViewerState {
                             render_cache.insert(tl_f, img, sig);
                         }
                     }
+                } else {
+                    video_player.newly_cached_frames.clear();
                 }
             } else {
                 video_player.newly_cached_frames.clear();
