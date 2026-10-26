@@ -5,6 +5,7 @@ mod inspector;
 mod media_page;
 mod media_pool;
 mod preferences;
+pub mod render_cache;
 mod theme;
 mod timecode;
 mod timeline;

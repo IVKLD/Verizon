@@ -41,6 +41,7 @@ struct ResolveTabViewer<'a> {
     video_player: &'a mut VideoPlayer,
     audio_player: &'a mut AudioPlayer,
     waveform_mgr: &'a WaveformManager,
+    render_cache: &'a mut crate::render_cache::RenderCacheManager,
 }
 
 impl<'a> TabViewer for ResolveTabViewer<'a> {
@@ -72,13 +73,13 @@ impl<'a> TabViewer for ResolveTabViewer<'a> {
             }
             Tab::Viewers => {
                 let vu = self.audio_player.get_vu_levels();
-                self.viewer.render_dual_viewers(ui, self.timeline, self.video_player, vu, &ctx);
+                self.viewer.render_dual_viewers(ui, self.timeline, self.video_player, self.render_cache, vu, &ctx);
             }
             Tab::Inspector => {
                 self.inspector.render(ui, self.timeline);
             }
             Tab::Timeline => {
-                TimelineView::render(ui, self.timeline, self.waveform_mgr);
+                TimelineView::render(ui, self.timeline, self.waveform_mgr, self.render_cache);
             }
         }
     }
@@ -95,6 +96,7 @@ pub struct NleApp {
     pub video_player: VideoPlayer,
     pub audio_player: AudioPlayer,
     pub waveform_mgr: WaveformManager,
+    pub render_cache: crate::render_cache::RenderCacheManager,
     pub preferences: UserPreferences,
     pub show_preferences_window: bool,
     pub last_frame_time: std::time::Instant,
@@ -121,6 +123,7 @@ impl NleApp {
             video_player: VideoPlayer::new(),
             audio_player: AudioPlayer::new(),
             waveform_mgr: WaveformManager::new(),
+            render_cache: crate::render_cache::RenderCacheManager::default(),
             preferences: prefs.clone(),
             show_preferences_window: false,
             last_frame_time: std::time::Instant::now(),
@@ -890,6 +893,7 @@ impl eframe::App for NleApp {
                     video_player: &mut self.video_player,
                     audio_player: &mut self.audio_player,
                     waveform_mgr: &self.waveform_mgr,
+                    render_cache: &mut self.render_cache,
                 };
 
                 DockArea::new(&mut self.dock_state)
@@ -909,6 +913,7 @@ impl eframe::App for NleApp {
         }
         if self.timeline.audio_dirty {
             self.audio_player.rebuild_timeline_audio(&self.timeline);
+            self.render_cache.invalidate_all();
             self.timeline.audio_dirty = false;
         }
         self.audio_player.sync_playhead_frame(
@@ -924,6 +929,7 @@ impl eframe::App for NleApp {
             self.autopilot = Some(ap);
             if self.timeline.audio_dirty {
                 self.audio_player.rebuild_timeline_audio(&self.timeline);
+                self.render_cache.invalidate_all();
                 self.timeline.audio_dirty = false;
             }
             self.audio_player.sync_playhead_frame(

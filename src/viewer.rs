@@ -66,99 +66,120 @@ impl ViewerState {
         ui: &mut Ui,
         timeline: &mut TimelineState,
         video_player: &mut VideoPlayer,
+        render_cache: &mut crate::render_cache::RenderCacheManager,
         vu_levels: (f32, f32),
         ctx: &egui::Context,
     ) {
-        // Декодирование текущего кадра активного клипа на таймлайне (приоритет: самая верхняя видеодорожка и последний перемещенный клип)
-        let active_clip = timeline
-            .clips
-            .iter()
-            .filter(|c| !c.is_audio && c.contains_frame(timeline.playhead_frame))
-            .min_by_key(|c| (c.track_index, if timeline.selected_clip_id == Some(c.id) { 0usize } else { 1usize }));
+        // 1. Проверяем Render Cache: если кадр уже отрендерен — мгновенный 0 мс доступ без вызова FFmpeg/DRM
+        let current_sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, timeline.playhead_frame);
+        let mut cache_hit = false;
+        if render_cache.mode != crate::render_cache::RenderCacheMode::None {
+            if let Some(cached_img) = render_cache.get(timeline.playhead_frame, current_sig) {
+                video_player.present_playback_frame(ctx, cached_img);
+                video_player.last_decoded_frame = timeline.playhead_frame;
+                cache_hit = true;
+            }
+        }
 
-        if let Some(clip) = active_clip {
-            if let Some(path) = &clip.source_path {
-                if video_player.current_path.as_deref() != Some(path.as_path()) {
-                    let _ = video_player.open_file(path, ctx);
-                }
-                let offset = timeline.playhead_frame - clip.start_frame;
-                let time_secs = offset as f64 / timeline.fps as f64;
-                let total_source_secs = clip.source_in_secs + time_secs;
-                let source_frame = (total_source_secs * clip.source_fps).round() as i64;
-                if timeline.is_playing && !timeline.is_scrubbing {
-                    // Вычисляем ближайшую монтажную склейку (конец текущего клипа или начало клипа на более приоритетной дорожке V2 > V1)
-                    let clip_prio = (clip.track_index, if timeline.selected_clip_id == Some(clip.id) { 0usize } else { 1usize });
-                    let clip_end = clip.start_frame + clip.duration_frames;
-                    let cut_frame = timeline
-                        .clips
-                        .iter()
-                        .filter(|c| {
-                            !c.is_audio
-                                && c.id != clip.id
-                                && c.start_frame > timeline.playhead_frame
-                                && c.start_frame < clip_end
-                                && (c.track_index, if timeline.selected_clip_id == Some(c.id) { 0usize } else { 1usize }) < clip_prio
-                        })
-                        .map(|c| c.start_frame)
-                        .min()
-                        .unwrap_or(clip_end);
+        if !cache_hit {
+            // Декодирование текущего кадра активного клипа на таймлайне (приоритет: самая верхняя видеодорожка и последний перемещенный клип)
+            let active_clip = timeline
+                .clips
+                .iter()
+                .filter(|c| !c.is_audio && c.contains_frame(timeline.playhead_frame))
+                .min_by_key(|c| (c.track_index, if timeline.selected_clip_id == Some(c.id) { 0usize } else { 1usize }));
 
-                    let last_tl_frame = (cut_frame - 1).max(clip.start_frame);
-                    let last_src = ((clip.source_in_secs + (last_tl_frame - clip.start_frame) as f64 / timeline.fps.max(1) as f64) * clip.source_fps).round() as i64;
+            if let Some(clip) = active_clip {
+                if let Some(path) = &clip.source_path {
+                    if video_player.current_path.as_deref() != Some(path.as_path()) {
+                        let _ = video_player.open_file(path, ctx);
+                    }
+                    let offset = timeline.playhead_frame - clip.start_frame;
+                    let time_secs = offset as f64 / timeline.fps as f64;
+                    let total_source_secs = clip.source_in_secs + time_secs;
+                    let source_frame = (total_source_secs * clip.source_fps).round() as i64;
+                    if timeline.is_playing && !timeline.is_scrubbing {
+                        // Вычисляем ближайшую монтажную склейку (конец текущего клипа или начало клипа на более приоритетной дорожке V2 > V1)
+                        let clip_prio = (clip.track_index, if timeline.selected_clip_id == Some(clip.id) { 0usize } else { 1usize });
+                        let clip_end = clip.start_frame + clip.duration_frames;
+                        let cut_frame = timeline
+                            .clips
+                            .iter()
+                            .filter(|c| {
+                                !c.is_audio
+                                    && c.id != clip.id
+                                    && c.start_frame > timeline.playhead_frame
+                                    && c.start_frame < clip_end
+                                    && (c.track_index, if timeline.selected_clip_id == Some(c.id) { 0usize } else { 1usize }) < clip_prio
+                            })
+                            .map(|c| c.start_frame)
+                            .min()
+                            .unwrap_or(clip_end);
 
-                    let next_clip = timeline
-                        .clips
-                        .iter()
-                        .filter(|c| !c.is_audio && c.contains_frame(cut_frame))
-                        .min_by_key(|c| (c.track_index, if timeline.selected_clip_id == Some(c.id) { 0usize } else { 1usize }))
-                        .or_else(|| {
-                            timeline
-                                .clips
-                                .iter()
-                                .filter(|c| !c.is_audio && c.start_frame >= cut_frame)
-                                .min_by_key(|c| (c.start_frame, c.track_index))
+                        let last_tl_frame = (cut_frame - 1).max(clip.start_frame);
+                        let last_src = ((clip.source_in_secs + (last_tl_frame - clip.start_frame) as f64 / timeline.fps.max(1) as f64) * clip.source_fps).round() as i64;
+
+                        let next_clip = timeline
+                            .clips
+                            .iter()
+                            .filter(|c| !c.is_audio && c.contains_frame(cut_frame))
+                            .min_by_key(|c| (c.track_index, if timeline.selected_clip_id == Some(c.id) { 0usize } else { 1usize }))
+                            .or_else(|| {
+                                timeline
+                                    .clips
+                                    .iter()
+                                    .filter(|c| !c.is_audio && c.start_frame >= cut_frame)
+                                    .min_by_key(|c| (c.start_frame, c.track_index))
+                            });
+
+                        let upcoming_cut = next_clip.and_then(|nc| {
+                            if nc.id != clip.id && nc.source_path.as_deref() == Some(path.as_path()) {
+                                let nc_tl_frame = cut_frame.max(nc.start_frame);
+                                let next_src = ((nc.source_in_secs + (nc_tl_frame - nc.start_frame) as f64 / timeline.fps.max(1) as f64) * nc.source_fps).round() as i64;
+                                Some((last_src, next_src))
+                            } else {
+                                None
+                            }
                         });
 
-                    let upcoming_cut = next_clip.and_then(|nc| {
-                        if nc.id != clip.id && nc.source_path.as_deref() == Some(path.as_path()) {
-                            let nc_tl_frame = cut_frame.max(nc.start_frame);
-                            let next_src = ((nc.source_in_secs + (nc_tl_frame - nc.start_frame) as f64 / timeline.fps.max(1) as f64) * nc.source_fps).round() as i64;
-                            Some((last_src, next_src))
-                        } else {
-                            None
-                        }
-                    });
-
-                    video_player.update_playback_with_cut(source_frame, true, upcoming_cut, ctx);
+                        video_player.update_playback_with_cut(source_frame, true, upcoming_cut, ctx);
+                    } else {
+                        video_player.update_playback(source_frame, false, ctx);
+                    }
                 } else {
-                    video_player.update_playback(source_frame, false, ctx);
+                    if timeline.is_playing && !timeline.is_scrubbing {
+                        video_player.update_playback(timeline.playhead_frame, true, ctx);
+                    } else {
+                        video_player.update_playback(timeline.playhead_frame, false, ctx);
+                    }
                 }
             } else {
-                if timeline.is_playing && !timeline.is_scrubbing {
-                    video_player.update_playback(timeline.playhead_frame, true, ctx);
+                // Если под плейхедом пауза — отображаем чистый кадр и при воспроизведении заранее готовим декодер к следующему клипу
+                let prefetch_src = if timeline.is_playing {
+                    timeline
+                        .clips
+                        .iter()
+                        .filter(|c| !c.is_audio && c.start_frame > timeline.playhead_frame)
+                        .min_by_key(|c| (c.start_frame, c.track_index))
+                        .and_then(|c| {
+                            if c.source_path.as_deref() == video_player.current_path.as_deref() {
+                                Some((c.source_in_secs * c.source_fps).round() as i64)
+                            } else {
+                                None
+                            }
+                        })
                 } else {
-                    video_player.update_playback(timeline.playhead_frame, false, ctx);
+                    None
+                };
+                video_player.show_blank_frame_with_prefetch(prefetch_src, ctx);
+            }
+
+            // Автоматически сохраняем успешно декодированный кадр в Render Cache для мгновенного повторного воспроизведения
+            if render_cache.mode != crate::render_cache::RenderCacheMode::None {
+                if let Some(ref img) = video_player.last_displayed_image {
+                    render_cache.insert(timeline.playhead_frame, std::sync::Arc::clone(img), current_sig);
                 }
             }
-        } else {
-            // Если под плейхедом пауза — отображаем чистый кадр и при воспроизведении заранее готовим декодер к следующему клипу
-            let prefetch_src = if timeline.is_playing {
-                timeline
-                    .clips
-                    .iter()
-                    .filter(|c| !c.is_audio && c.start_frame > timeline.playhead_frame)
-                    .min_by_key(|c| (c.start_frame, c.track_index))
-                    .and_then(|c| {
-                        if c.source_path.as_deref() == video_player.current_path.as_deref() {
-                            Some((c.source_in_secs * c.source_fps).round() as i64)
-                        } else {
-                            None
-                        }
-                    })
-            } else {
-                None
-            };
-            video_player.show_blank_frame_with_prefetch(prefetch_src, ctx);
         }
 
         // Обновление реальных уровней громкости VU-метра
@@ -171,7 +192,7 @@ impl ViewerState {
         }
 
         // ВЕРХНИЙ ТУЛБАР МОНИТОРА RESOLVE (Display Modes)
-        self.render_viewer_toolbar(ui, video_player);
+        self.render_viewer_toolbar(ui, video_player, render_cache);
         ui.separator();
 
         // ОБЛАСТЬ МОНИТОРОВ: Одиночный или Двойной режим
@@ -191,7 +212,7 @@ impl ViewerState {
         }
     }
 
-    fn render_viewer_toolbar(&mut self, ui: &mut Ui, video_player: &mut VideoPlayer) {
+    fn render_viewer_toolbar(&mut self, ui: &mut Ui, video_player: &mut VideoPlayer, render_cache: &mut crate::render_cache::RenderCacheManager) {
         ui.horizontal(|ui| {
             // Кнопка Скрыть / Раскрыть Source
             if self.single_viewer_mode {
@@ -285,6 +306,31 @@ impl ViewerState {
             .fill(if self.show_transform_overlay { ResolveColors::ACCENT_ORANGE } else { ResolveColors::BG_HEADER });
             if ui.add(tf_btn).on_hover_text("Интерактивная рамка трансформации клипа на мониторе").clicked() {
                 self.show_transform_overlay = !self.show_transform_overlay;
+            }
+
+            ui.separator();
+
+            // 6. Селектор режима Render Cache (DaVinci Resolve Smart Cache)
+            let stats = render_cache.stats();
+            let cache_label = match stats.mode {
+                crate::render_cache::RenderCacheMode::None => "⚡ Cache: Off",
+                crate::render_cache::RenderCacheMode::Smart => "⚡ Cache: Smart",
+                crate::render_cache::RenderCacheMode::User => "⚡ Cache: User",
+            };
+            egui::ComboBox::from_id_salt("viewer_render_cache_combo")
+                .selected_text(cache_label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut render_cache.mode, crate::render_cache::RenderCacheMode::None, "Off (Без кэша)");
+                    ui.selectable_value(&mut render_cache.mode, crate::render_cache::RenderCacheMode::Smart, "Smart Cache (DaVinci Auto)");
+                    ui.selectable_value(&mut render_cache.mode, crate::render_cache::RenderCacheMode::User, "User Cache (По запросу)");
+                });
+            if stats.mode != crate::render_cache::RenderCacheMode::None && stats.cached_frames > 0 {
+                ui.label(
+                    egui::RichText::new(format!("({} k / {:.1} MB)", stats.cached_frames, stats.memory_mb))
+                        .size(10.0)
+                        .color(ResolveColors::ACCENT_ORANGE),
+                )
+                .on_hover_text("Объем кэшированных кадров в оперативной памяти (0 мс воспроизведение)");
             }
 
             // 6. Статус аппаратного ускорения GPU и индикатор Drop Frame (DaVinci Resolve)

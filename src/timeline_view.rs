@@ -10,6 +10,7 @@ impl TimelineView {
         ui: &mut Ui,
         timeline: &mut TimelineState,
         waveform_mgr: &crate::waveform::WaveformManager,
+        render_cache: &crate::render_cache::RenderCacheManager,
     ) {
         // 1. Верхний тулбар таймлайна
         Self::render_toolbar(ui, timeline);
@@ -142,7 +143,7 @@ impl TimelineView {
         timeline.scroll_y = timeline.scroll_y.clamp(0.0, max_scroll_y);
 
         // 3. Отрисовка Ruler (Линейки времени) строго с изоляцией ruler_painter
-        Self::draw_ruler(&ruler_painter, ruler_rect, timeline);
+        Self::draw_ruler(&ruler_painter, ruler_rect, timeline, render_cache);
 
         // 4. Отрисовка полос дорожек таймлайна с учетом вертикального скролла scroll_y
         for (i, _track) in timeline.tracks.iter().enumerate() {
@@ -720,7 +721,12 @@ impl TimelineView {
         });
     }
 
-    fn draw_ruler(painter: &egui::Painter, rect: Rect, timeline: &TimelineState) {
+    fn draw_ruler(
+        painter: &egui::Painter,
+        rect: Rect,
+        timeline: &TimelineState,
+        render_cache: &crate::render_cache::RenderCacheManager,
+    ) {
         painter.rect_filled(rect, CornerRadius::ZERO, Color32::from_rgb(0x1a, 0x1b, 0x1e));
         painter.line_segment(
             [pos2(rect.min.x, rect.max.y), pos2(rect.max.x, rect.max.y)],
@@ -792,6 +798,52 @@ impl TimelineView {
             }
 
             s += step_seconds;
+        }
+
+        // Индикатор Render Cache в стиле DaVinci Resolve (полоса синий/красный внизу линейки)
+        if render_cache.mode != crate::render_cache::RenderCacheMode::None {
+            let bar_y_min = rect.max.y - 3.0;
+            let bar_y_max = rect.max.y;
+            let blue_cache = Color32::from_rgb(0x29, 0x97, 0xff);
+            let red_dirty = Color32::from_rgb(0xe0, 0x31, 0x31);
+
+            let visible_start_frame = ((timeline.scroll_x / timeline.zoom_factor).floor() as i64).max(0);
+            let visible_end_frame = (((timeline.scroll_x + rect.width()) / timeline.zoom_factor).ceil() as i64).max(0);
+
+            let mut cache_mesh = egui::Mesh::default();
+            for clip in &timeline.clips {
+                if clip.is_audio {
+                    continue;
+                }
+                let c_start = clip.start_frame.max(visible_start_frame);
+                let c_end = clip.end_frame().min(visible_end_frame);
+                if c_start >= c_end {
+                    continue;
+                }
+
+                let mut seg_start = c_start;
+                let mut cur_cached = render_cache.is_cached(seg_start);
+                for f in c_start + 1..=c_end {
+                    let cached = if f < c_end { render_cache.is_cached(f) } else { !cur_cached };
+                    if cached != cur_cached || f == c_end {
+                        let seg_end = f;
+                        let x1 = rect.min.x + (seg_start as f32 * timeline.zoom_factor) - timeline.scroll_x;
+                        let x2 = rect.min.x + (seg_end as f32 * timeline.zoom_factor) - timeline.scroll_x;
+                        if x2 > rect.min.x && x1 < rect.max.x {
+                            let r = Rect::from_min_max(
+                                pos2(x1.max(rect.min.x), bar_y_min),
+                                pos2(x2.min(rect.max.x), bar_y_max),
+                            );
+                            cache_mesh.add_colored_rect(r, if cur_cached { blue_cache } else { red_dirty });
+                        }
+                        seg_start = f;
+                        cur_cached = cached;
+                    }
+                }
+            }
+            if !cache_mesh.is_empty() {
+                painter.add(egui::Shape::mesh(cache_mesh));
+            }
         }
     }
 

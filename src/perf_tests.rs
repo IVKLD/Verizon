@@ -812,8 +812,9 @@ fn bench_timeline_ui_frames(timeline: &mut TimelineState, wf: &crate::waveform::
             ..Default::default()
         };
         let t = Instant::now();
+        let render_cache = crate::render_cache::RenderCacheManager::default();
         let mut out = ctx.run_ui(raw, |ui| {
-            crate::timeline_view::TimelineView::render(ui, timeline, wf);
+            crate::timeline_view::TimelineView::render(ui, timeline, wf, &render_cache);
         });
         out.textures_delta.clear();
         let shape_count = out.shapes.len();
@@ -1172,3 +1173,102 @@ fn test_real_playback_smoothness_user_file() {
     println!("[USER FILE] ticks={} shown={} / {} slots, repeats≈{}, skipped_frames={}, backward={}, avg_lag={:.2}, max_lag={}, max_update_tick={:?}, dropped_counter={}",
         ticks, n, total_slots, repeats, skips, back, lag_sum as f64 / n.max(1) as f64, max_lag, max_tick, player.dropped_frames_count);
 }
+
+/// 10. Тест производительности Render Cache: мгновенный sub-microsecond доступ к кадрам
+#[test]
+fn test_render_cache_instant_hit_latency() {
+    use crate::render_cache::{RenderCacheManager, RenderCacheMode};
+    use std::sync::Arc;
+
+    let cache = RenderCacheManager::new(RenderCacheMode::Smart, 100);
+    let img = Arc::new(egui::ColorImage::new([1280, 720], vec![egui::Color32::BLACK; 1280 * 720]));
+    let sig = 123456789u64;
+
+    cache.insert(42, Arc::clone(&img), sig);
+    assert!(cache.is_cached(42));
+    assert!(!cache.is_cached(43));
+
+    // Замер задержки извлечения кадра из кэша
+    let iterations = 10_000;
+    let t0 = Instant::now();
+    for _ in 0..iterations {
+        let hit = cache.get(42, sig);
+        assert!(hit.is_some());
+    }
+    let total_elapsed = t0.elapsed();
+    let avg_latency = total_elapsed / iterations;
+
+    println!("\n========================================================");
+    println!(" [PERF BENCHMARK] 10. RENDER CACHE INSTANT HIT LATENCY");
+    println!(" Iterations: {}", iterations);
+    println!(" Total elapsed: {:?}", total_elapsed);
+    println!(" Average Hit Latency: {:?}", avg_latency);
+    println!("========================================================");
+
+    assert!(avg_latency < Duration::from_micros(10), "Render Cache Hit latency must be < 10µs, got: {:?}", avg_latency);
+}
+
+/// 11. Тест автоматической инвалидации Render Cache при модификации клипов
+#[test]
+fn test_render_cache_signature_invalidation_and_lru() {
+    use crate::render_cache::{RenderCacheManager, RenderCacheMode};
+    use std::sync::Arc;
+
+    let mut timeline = TimelineState::new_empty();
+    let clip = Clip {
+        id: 1,
+        name: "TestClip".to_string(),
+        track_index: 0,
+        start_frame: 0,
+        duration_frames: 100,
+        is_audio: false,
+        color: egui::Color32::BLUE,
+        source_path: None,
+        source_in_frame: 0,
+        source_in_secs: 0.0,
+        source_fps: 60.0,
+        link_group: None,
+        zoom_x: 1.0,
+        zoom_y: 1.0,
+        position_x: 0.0,
+        position_y: 0.0,
+        rotation: 0.0,
+        opacity: 100.0,
+        volume_db: 0.0,
+        pan: 0.0,
+        source_audio_stream: 0,
+    };
+    timeline.clips.push(clip);
+
+    let cache = RenderCacheManager::new(RenderCacheMode::Smart, 3);
+    let img = Arc::new(egui::ColorImage::new([16, 16], vec![egui::Color32::WHITE; 256]));
+
+    let sig_f10 = RenderCacheManager::compute_frame_signature(&timeline, 10);
+    cache.insert(10, Arc::clone(&img), sig_f10);
+    assert!(cache.get(10, sig_f10).is_some());
+
+    // 1. Изменение трансформации клипа (пользователь сдвинул клип в Inspector)
+    timeline.clips[0].position_x = 45.0;
+    let new_sig_f10 = RenderCacheManager::compute_frame_signature(&timeline, 10);
+    assert_ne!(sig_f10, new_sig_f10, "Сигнатура должна измениться после редактирования");
+
+    // Запрос с новой актуальной сигнатурой должен вернуть None и вычистить устаревший кэш
+    assert!(cache.get(10, new_sig_f10).is_none());
+    assert!(!cache.is_cached(10), "Устаревший кадр должен быть инвалидирован");
+
+    // 2. Тест LRU-вытеснения (емкость 3)
+    let sig = 1u64;
+    cache.insert(1, Arc::clone(&img), sig);
+    cache.insert(2, Arc::clone(&img), sig);
+    cache.insert(3, Arc::clone(&img), sig);
+    assert_eq!(cache.stats().cached_frames, 3);
+
+    // Добавляем 4-й кадр — самый старый (1) должен вытесниться
+    cache.insert(4, Arc::clone(&img), sig);
+    assert_eq!(cache.stats().cached_frames, 3);
+    assert!(!cache.is_cached(1), "Кадр 1 должен быть вытеснен по LRU");
+    assert!(cache.is_cached(2));
+    assert!(cache.is_cached(3));
+    assert!(cache.is_cached(4));
+}
+

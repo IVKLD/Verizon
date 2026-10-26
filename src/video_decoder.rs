@@ -61,6 +61,8 @@ pub struct VideoPlayer {
 
     /// Грубый отпечаток последнего показанного кадра (сетка 16x9, яркость) — для проверки точности кадра в тестах
     pub last_fingerprint: Vec<u8>,
+    /// Последнее фактически отображенное изображение кадра (для интеграции с Render Cache)
+    pub last_displayed_image: Option<Arc<ColorImage>>,
 
     // Фоновый канал для безынерционной асинхронной очистки кадров (исключает вызовы thread::spawn и mmap_lock в UI)
     gc_tx: std::sync::mpsc::Sender<Vec<ColorImage>>,
@@ -174,6 +176,7 @@ impl VideoPlayer {
             fps_sample_time: std::time::Instant::now(),
             rendered_frames_in_sample: 0,
             last_fingerprint: Vec::new(),
+            last_displayed_image: None,
             gc_tx: {
                 let (tx, rx) = std::sync::mpsc::channel::<Vec<ColorImage>>();
                 std::thread::Builder::new()
@@ -361,6 +364,7 @@ impl VideoPlayer {
                 self.rendered_frames_in_sample += 1;
                 self.back_frame = -1;
                 self.last_fingerprint = image_fingerprint(&img);
+                self.last_displayed_image = Some(Arc::clone(&img));
                 let data = ImageData::Color(img);
                 if let Some(tex) = &mut self.texture {
                     tex.set(data, TextureOptions::LINEAR);
@@ -728,7 +732,8 @@ impl VideoPlayer {
     }
 
     /// Выводит кадр воспроизведения через ping-pong двух текстур: предыдущий кадр остаётся на GPU для блендинга
-    fn present_playback_frame(&mut self, ctx: &Context, img: Arc<ColorImage>) {
+    pub fn present_playback_frame(&mut self, ctx: &Context, img: Arc<ColorImage>) {
+        self.last_displayed_image = Some(Arc::clone(&img));
         let data = ImageData::Color(img);
         if self.texture.is_none() {
             self.texture = Some(ctx.load_texture("video_frame", data, TextureOptions::LINEAR));
@@ -834,6 +839,7 @@ impl VideoPlayer {
                 self.last_displayed_epoch = self.last_displayed_epoch.max(epoch);
                 self.rendered_frames_in_sample += 1;
                 self.last_fingerprint = image_fingerprint(&arc_img);
+                self.last_displayed_image = Some(Arc::clone(&arc_img));
                 self.back_frame = -1;
                 let data = ImageData::Color(arc_img);
                 if let Some(tex) = &mut self.texture {
