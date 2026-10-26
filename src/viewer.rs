@@ -84,11 +84,7 @@ impl ViewerState {
 
         if !cache_hit {
             // Декодирование текущего кадра активного клипа на таймлайне (приоритет: самая верхняя видеодорожка и последний перемещенный клип)
-            let active_clip = timeline
-                .clips
-                .iter()
-                .filter(|c| !c.is_audio && c.contains_frame(timeline.playhead_frame))
-                .min_by_key(|c| (c.track_index, if timeline.selected_clip_id == Some(c.id) { 0usize } else { 1usize }));
+            let active_clip = timeline.active_video_clip_at(timeline.playhead_frame);
 
             if let Some(clip) = active_clip {
                 if let Some(path) = &clip.source_path {
@@ -345,9 +341,9 @@ impl ViewerState {
             // 6. Статус аппаратного ускорения GPU и индикатор Drop Frame (DaVinci Resolve)
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (badge_text, badge_color) = if video_player.gpu_accelerated {
-                    (format!("⚡ GPU: {}", video_player.gpu_device_name), ResolveColors::ACCENT_ORANGE)
+                    (video_player.gpu_badge.as_str(), ResolveColors::ACCENT_ORANGE)
                 } else {
-                    ("⚡ GPU: Idle / CPU".to_string(), ResolveColors::TEXT_MUTED)
+                    ("⚡ GPU: Idle / CPU", ResolveColors::TEXT_MUTED)
                 };
                 ui.label(egui::RichText::new(badge_text).size(10.0).strong().color(badge_color))
                     .on_hover_text("Аппаратное ускорение видеодекодирования на GPU (VA-API / CUDA)");
@@ -400,15 +396,21 @@ impl ViewerState {
     fn render_source_viewer(&mut self, ui: &mut Ui, video_player: &VideoPlayer) {
         ui.horizontal(|ui| {
             let label = if let Some(p) = &video_player.current_path {
-                p.file_name().and_then(|n| n.to_str()).unwrap_or("SOURCE")
+                p.file_name().and_then(|n| n.to_str()).unwrap_or("A001_C001_0422.MOV")
             } else {
-                "SOURCE: A001_C001_0422.MOV"
+                "A001_C001_0422.MOV"
             };
             ui.label(
-                egui::RichText::new(format!("SOURCE: {}", label))
+                egui::RichText::new("SOURCE: ")
                     .size(11.0)
                     .strong()
                     .color(ResolveColors::TEXT_MUTED),
+            );
+            ui.label(
+                egui::RichText::new(label)
+                    .size(11.0)
+                    .strong()
+                    .color(ResolveColors::TEXT_PRIMARY),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
@@ -482,11 +484,7 @@ impl ViewerState {
             painter.rect_filled(rect, CornerRadius::same(2), Color32::from_rgb(0x0a, 0x0b, 0x0d));
             painter.rect_stroke(rect, CornerRadius::same(2), Stroke::new(1.0, ResolveColors::BORDER), StrokeKind::Inside);
 
-            let top_clip = timeline
-                .clips
-                .iter()
-                .rev()
-                .find(|c| !c.is_audio && c.contains_frame(timeline.playhead_frame));
+            let top_clip = timeline.active_video_clip_at(timeline.playhead_frame);
 
             if let Some(top_clip) = top_clip {
                 let center = rect.center();

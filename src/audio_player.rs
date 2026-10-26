@@ -13,7 +13,7 @@ pub struct AudioStreamBuffer {
     pub samples: Box<[AtomicU32]>,
     pub decoded_len: AtomicUsize,
     pub finished: AtomicBool,
-    pub peaks: Mutex<Option<Arc<Vec<f32>>>>,
+    pub peaks: std::sync::OnceLock<Arc<Vec<f32>>>,
 }
 
 impl AudioStreamBuffer {
@@ -25,7 +25,7 @@ impl AudioStreamBuffer {
             samples: vec.into_boxed_slice(),
             decoded_len: AtomicUsize::new(0),
             finished: AtomicBool::new(false),
-            peaks: Mutex::new(None),
+            peaks: std::sync::OnceLock::new(),
         })
     }
 
@@ -42,7 +42,7 @@ impl AudioStreamBuffer {
             samples: boxed,
             decoded_len: AtomicUsize::new(len),
             finished: AtomicBool::new(true),
-            peaks: Mutex::new(None),
+            peaks: std::sync::OnceLock::new(),
         })
     }
 
@@ -463,10 +463,8 @@ impl AudioPlayer {
         if let Ok(cache) = self.audio_cache.lock() {
             for ((path, idx), buf) in cache.iter() {
                 if waveform_mgr.get_waveform_stream(path, *idx).is_none() {
-                    if let Ok(pk_guard) = buf.peaks.lock() {
-                        if let Some(ref arc_peaks) = *pk_guard {
-                            waveform_mgr.insert_waveform_arc(path, *idx, arc_peaks.clone());
-                        }
+                    if let Some(arc_peaks) = buf.peaks.get() {
+                        waveform_mgr.insert_waveform_arc(path, *idx, Arc::clone(arc_peaks));
                     }
                 }
             }
@@ -673,9 +671,7 @@ impl AudioPlayer {
                     *p = (*p * gain).clamp(0.0, 1.0);
                 }
             }
-            if let Ok(mut pk_guard) = dec.buf.peaks.lock() {
-                *pk_guard = Some(Arc::new(std::mem::take(&mut dec.peaks)));
-            }
+            let _ = dec.buf.peaks.set(Arc::new(std::mem::take(&mut dec.peaks)));
             dec.buf.finished.store(true, Ordering::Release);
         }
     }

@@ -714,11 +714,11 @@ impl NleApp {
                         }
                     }
 
-                    // Правая часть нижнего бара: таймкод проекта
+                    // Правая часть нижнего бара: таймкод проекта (zero-allocation)
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let tc = crate::timecode::Timecode::new(self.timeline.playhead_frame, self.timeline.fps).to_smpte();
+                        let tc = crate::timecode::Timecode::new(self.timeline.playhead_frame, self.timeline.fps).to_smpte_str();
                         ui.label(
-                            egui::RichText::new(format!("TC: {}", tc))
+                            egui::RichText::new(&*tc)
                                 .size(10.0)
                                 .monospace()
                                 .color(ResolveColors::TEXT_PRIMARY),

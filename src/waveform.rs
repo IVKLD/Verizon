@@ -1,26 +1,26 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Clone, Default)]
 pub struct WaveformManager {
-    cache: Arc<Mutex<HashMap<(PathBuf, usize), Arc<Vec<f32>>>>>,
+    cache: Arc<RwLock<HashMap<(PathBuf, usize), Arc<Vec<f32>>>>>,
     pending: Arc<Mutex<HashSet<(PathBuf, usize)>>>,
 }
 
 impl WaveformManager {
     pub fn new() -> Self {
         Self {
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(RwLock::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
-    /// Получить кэшированную волновую форму для конкретного аудиопотока
+    /// Получить кэшированную волновую форму для конкретного аудиопотока (lock-free concurrent read)
     /// Возвращает Arc: отрисовка клипа каждый кадр не копирует массив пиков (zero-copy)
     pub fn get_waveform_stream(&self, path: &Path, audio_track_index: usize) -> Option<Arc<Vec<f32>>> {
         let key = (path.to_path_buf(), audio_track_index);
-        self.cache.lock().ok()?.get(&key).cloned()
+        self.cache.read().ok()?.get(&key).cloned()
     }
 
     /// Принудительно положить пики в кэш (тесты / предзагрузка)
@@ -32,7 +32,7 @@ impl WaveformManager {
     /// Положить готовый Arc<Vec<f32>> пиков (из единого прохода AudioPlayer) без копирования и снять флаг pending
     pub fn insert_waveform_arc(&self, path: &Path, audio_track_index: usize, peaks: Arc<Vec<f32>>) {
         let key = (path.to_path_buf(), audio_track_index);
-        if let Ok(mut c) = self.cache.lock() {
+        if let Ok(mut c) = self.cache.write() {
             c.insert(key.clone(), peaks);
         }
         if let Ok(mut p) = self.pending.lock() {
@@ -61,7 +61,7 @@ impl WaveformManager {
             if pending.contains(&key) {
                 return;
             }
-            if let Ok(cache) = self.cache.lock() {
+            if let Ok(cache) = self.cache.read() {
                 if cache.contains_key(&key) {
                     return;
                 }
@@ -86,7 +86,7 @@ impl WaveformManager {
             .await;
 
             if let Ok(Ok(all_peaks)) = result {
-                if let Ok(mut c) = cache.lock() {
+                if let Ok(mut c) = cache.write() {
                     for (idx, peaks) in all_peaks {
                         c.insert((path_buf.clone(), idx), Arc::new(peaks));
                     }

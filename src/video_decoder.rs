@@ -36,6 +36,7 @@ pub struct VideoPlayer {
     // Высокопроизводительный движок рендеринга и декодирования
     pub gpu_accelerated: bool,
     pub gpu_device_name: String,
+    pub gpu_badge: String,
 
     // Неблокирующие каналы общения с фоновым потоком декодера
     command_tx: Option<std::sync::mpsc::Sender<DecoderCommand>>,
@@ -161,6 +162,7 @@ impl VideoPlayer {
             last_displayed_epoch: 0,
             gpu_accelerated: true,
             gpu_device_name: "Vulkan (wgpu) + Multi-Threaded Engine".to_string(),
+            gpu_badge: "⚡ GPU: Vulkan (wgpu) + Multi-Threaded Engine".to_string(),
             command_tx: None,
             frame_rx: None,
             worker_handle: None,
@@ -280,6 +282,7 @@ impl VideoPlayer {
         self.total_frames = total_frames;
         self.gpu_accelerated = true;
         self.gpu_device_name = "Vulkan (wgpu) + 32-Thread Engine".to_string();
+        self.gpu_badge = "⚡ GPU: Vulkan (wgpu) + 32-Thread Engine".to_string();
         self.is_real_video = true;
         self.last_decoded_frame = -1;
         self.last_exact_frame = -1;

@@ -154,6 +154,15 @@ pub struct TimelineState {
 }
 
 impl TimelineState {
+    /// Получить активный видеоклип под кадром с учетом приоритета дорожек V2 > V1 и выделения (O(N) за один проход)
+    #[inline]
+    pub fn active_video_clip_at(&self, frame: i64) -> Option<&Clip> {
+        self.clips
+            .iter()
+            .filter(|c| !c.is_audio && c.contains_frame(frame))
+            .min_by_key(|c| (if self.selected_clip_id == Some(c.id) { 0usize } else { 1usize }, c.track_index))
+    }
+
     pub fn new_empty() -> Self {
         let tracks = vec![
             Track {

@@ -249,7 +249,7 @@ impl TimelineView {
 
                     let clip_resp = ui.interact(
                         interact_rect,
-                        ui.id().with(format!("clip_{}", clip.id)),
+                        ui.id().with(("clip", clip.id)),
                         egui::Sense::click_and_drag(),
                     );
 
@@ -905,15 +905,10 @@ impl TimelineView {
         );
 
         // Название дорожки
-        let full_name = if track.is_video {
-            format!("Video {}", index + 1)
-        } else {
-            format!("Audio {}", index.saturating_sub(1))
-        };
         painter.text(
             pos2(rect.min.x + 42.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
-            full_name,
+            &track.name,
             egui::FontId::proportional(11.0),
             ResolveColors::TEXT_PRIMARY,
         );
@@ -922,7 +917,7 @@ impl TimelineView {
         if track.is_video {
             // Кнопка Lock 🔒
             let lock_rect = Rect::from_min_size(pos2(rect.max.x - 22.0, rect.center().y - 9.0), vec2(18.0, 18.0));
-            let lock_resp = ui.interact(lock_rect, ui.id().with(format!("lock_track_{}", index)), egui::Sense::click());
+            let lock_resp = ui.interact(lock_rect, ui.id().with(("lock_v", index)), egui::Sense::click());
             if lock_resp.clicked() {
                 track.is_locked = !track.is_locked;
             }
@@ -931,7 +926,7 @@ impl TimelineView {
 
             // Кнопка включения/выключения видеодорожки (Eye / Mute)
             let eye_rect = Rect::from_min_size(pos2(rect.max.x - 42.0, rect.center().y - 9.0), vec2(18.0, 18.0));
-            let eye_resp = ui.interact(eye_rect, ui.id().with(format!("eye_track_{}", index)), egui::Sense::click());
+            let eye_resp = ui.interact(eye_rect, ui.id().with(("eye_v", index)), egui::Sense::click());
             if eye_resp.clicked() {
                 track.is_muted = !track.is_muted;
             }
@@ -940,14 +935,14 @@ impl TimelineView {
         } else {
             // Аудиодорожка: Solo [S], Mute [M], Lock 🔒
             let lock_rect = Rect::from_min_size(pos2(rect.max.x - 18.0, rect.center().y - 8.0), vec2(15.0, 16.0));
-            let lock_resp = ui.interact(lock_rect, ui.id().with(format!("lock_track_{}", index)), egui::Sense::click());
+            let lock_resp = ui.interact(lock_rect, ui.id().with(("lock_a", index)), egui::Sense::click());
             if lock_resp.clicked() {
                 track.is_locked = !track.is_locked;
             }
             painter.text(lock_rect.center(), egui::Align2::CENTER_CENTER, if track.is_locked { "🔒" } else { "🔓" }, egui::FontId::proportional(9.0), if track.is_locked { ResolveColors::ACCENT_ORANGE } else { ResolveColors::TEXT_MUTED });
 
             let mute_rect = Rect::from_min_size(pos2(rect.max.x - 36.0, rect.center().y - 8.0), vec2(16.0, 16.0));
-            let mute_resp = ui.interact(mute_rect, ui.id().with(format!("mute_track_{}", index)), egui::Sense::click());
+            let mute_resp = ui.interact(mute_rect, ui.id().with(("mute_a", index)), egui::Sense::click());
             if mute_resp.clicked() {
                 track.is_muted = !track.is_muted;
                 audio_changed = true;
@@ -957,7 +952,7 @@ impl TimelineView {
             painter.text(mute_rect.center(), egui::Align2::CENTER_CENTER, "M", egui::FontId::monospace(9.0), if track.is_muted { Color32::WHITE } else { ResolveColors::TEXT_MUTED });
 
             let solo_rect = Rect::from_min_size(pos2(rect.max.x - 54.0, rect.center().y - 8.0), vec2(16.0, 16.0));
-            let solo_resp = ui.interact(solo_rect, ui.id().with(format!("solo_track_{}", index)), egui::Sense::click());
+            let solo_resp = ui.interact(solo_rect, ui.id().with(("solo_a", index)), egui::Sense::click());
             if solo_resp.clicked() {
                 track.is_solo = !track.is_solo;
                 audio_changed = true;
@@ -1102,18 +1097,24 @@ impl TimelineView {
             }
         }
 
-        // Название клипа: прижимаем к левому видимому краю полосы (как в DaVinci Resolve)
+        // Название клипа: прижимаем к левому видимому краю полосы без аллокаций
         let label_left = (rect.min.x + 6.0).max(canvas_rect.min.x + 6.0);
         if rect.max.x - label_left > 20.0 {
-            let label: std::borrow::Cow<'_, str> = if clip.link_group.is_some() {
-                format!("🔗 {}", clip.name).into()
-            } else {
-                clip.name.as_str().into()
-            };
+            let mut x_pos = label_left;
+            if clip.link_group.is_some() {
+                painter.text(
+                    pos2(x_pos, rect.min.y + 2.0),
+                    egui::Align2::LEFT_TOP,
+                    "🔗 ",
+                    egui::FontId::proportional(10.0),
+                    Color32::WHITE,
+                );
+                x_pos += 12.0;
+            }
             painter.text(
-                pos2(label_left, rect.min.y + 2.0),
+                pos2(x_pos, rect.min.y + 2.0),
                 egui::Align2::LEFT_TOP,
-                label,
+                &clip.name,
                 egui::FontId::proportional(10.0),
                 Color32::WHITE,
             );

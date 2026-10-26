@@ -1338,3 +1338,78 @@ fn test_smart_cache_frame_capture_pipeline() {
     );
 }
 
+#[test]
+fn test_smpte_stack_string_zero_alloc() {
+    let tc = crate::timecode::Timecode::new(3661 * 24 + 12, 24);
+    let smpte = tc.to_smpte_str();
+    // 3661 seconds = 1 hour, 1 minute, 1 second, 12 frames -> "01:01:01:12"
+    assert_eq!(smpte.as_str(), "01:01:01:12");
+    assert_eq!(&*smpte, "01:01:01:12");
+    assert_eq!(format!("{}", smpte), "01:01:01:12");
+}
+
+#[test]
+fn test_active_video_clip_priority() {
+    let mut tl = TimelineState::new_empty();
+    // Добавляем клип на дорожку V1 (индекс 1)
+    let clip_v1 = Clip {
+        id: 10,
+        name: "V1_Clip".to_string(),
+        track_index: 1,
+        start_frame: 0,
+        duration_frames: 100,
+        is_audio: false,
+        color: egui::Color32::BLUE,
+        source_path: None,
+        source_in_frame: 0,
+        source_in_secs: 0.0,
+        source_fps: 24.0,
+        link_group: None,
+        zoom_x: 1.0,
+        zoom_y: 1.0,
+        position_x: 0.0,
+        position_y: 0.0,
+        rotation: 0.0,
+        opacity: 100.0,
+        volume_db: 0.0,
+        pan: 0.0,
+        source_audio_stream: 0,
+    };
+    // Добавляем клип на дорожку V2 (индекс 0 - более высокий приоритет композитинга)
+    let clip_v2 = Clip {
+        id: 20,
+        name: "V2_Clip".to_string(),
+        track_index: 0,
+        start_frame: 50,
+        duration_frames: 100,
+        is_audio: false,
+        color: egui::Color32::GREEN,
+        source_path: None,
+        source_in_frame: 0,
+        source_in_secs: 0.0,
+        source_fps: 24.0,
+        link_group: None,
+        zoom_x: 1.0,
+        zoom_y: 1.0,
+        position_x: 0.0,
+        position_y: 0.0,
+        rotation: 0.0,
+        opacity: 100.0,
+        volume_db: 0.0,
+        pan: 0.0,
+        source_audio_stream: 0,
+    };
+    tl.clips.push(clip_v1);
+    tl.clips.push(clip_v2);
+
+    // На кадре 25 активен только клип V1
+    assert_eq!(tl.active_video_clip_at(25).unwrap().id, 10);
+
+    // На кадре 60 активны оба, но V2 (индекс 0) имеет более высокий приоритет
+    assert_eq!(tl.active_video_clip_at(60).unwrap().id, 20);
+
+    // Если клип V1 явно выбран пользователем, он получает приоритет редактирования
+    tl.selected_clip_id = Some(10);
+    assert_eq!(tl.active_video_clip_at(60).unwrap().id, 10);
+}
+
