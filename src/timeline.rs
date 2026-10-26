@@ -130,7 +130,7 @@ impl Clip {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Track {
     pub name: String,
     pub is_video: bool,
@@ -138,6 +138,114 @@ pub struct Track {
     pub is_locked: bool,
     pub is_solo: bool,
     pub height: f32, // Высота дорожки в пикселях
+}
+
+/// Сериализуемое представление клипа для сохранения и экспорта сцены проекта
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SerializedClip {
+    pub id: u64,
+    pub name: String,
+    pub track_index: usize,
+    pub start_frame: i64,
+    pub duration_frames: i64,
+    pub is_audio: bool,
+    pub color_rgba: [u8; 4],
+    pub source_path: Option<PathBuf>,
+    pub source_in_frame: i64,
+    pub source_in_secs: f64,
+    pub source_fps: f64,
+    pub link_group: Option<u64>,
+    pub zoom_x: f32,
+    pub zoom_y: f32,
+    pub position_x: f32,
+    pub position_y: f32,
+    pub rotation: f32,
+    pub opacity: f32,
+    pub volume_db: f32,
+    pub pan: f32,
+    pub source_audio_stream: usize,
+    pub speed: f64,
+    pub is_disabled: bool,
+}
+
+impl From<&Clip> for SerializedClip {
+    fn from(c: &Clip) -> Self {
+        Self {
+            id: c.id,
+            name: c.name.clone(),
+            track_index: c.track_index,
+            start_frame: c.start_frame,
+            duration_frames: c.duration_frames,
+            is_audio: c.is_audio,
+            color_rgba: [c.color.r(), c.color.g(), c.color.b(), c.color.a()],
+            source_path: c.source_path.clone(),
+            source_in_frame: c.source_in_frame,
+            source_in_secs: c.source_in_secs,
+            source_fps: c.source_fps,
+            link_group: c.link_group,
+            zoom_x: c.zoom_x,
+            zoom_y: c.zoom_y,
+            position_x: c.position_x,
+            position_y: c.position_y,
+            rotation: c.rotation,
+            opacity: c.opacity,
+            volume_db: c.volume_db,
+            pan: c.pan,
+            source_audio_stream: c.source_audio_stream,
+            speed: c.speed,
+            is_disabled: c.is_disabled,
+        }
+    }
+}
+
+impl From<SerializedClip> for Clip {
+    fn from(s: SerializedClip) -> Self {
+        Self {
+            id: s.id,
+            name: s.name,
+            track_index: s.track_index,
+            start_frame: s.start_frame,
+            duration_frames: s.duration_frames,
+            is_audio: s.is_audio,
+            color: Color32::from_rgba_premultiplied(
+                s.color_rgba[0],
+                s.color_rgba[1],
+                s.color_rgba[2],
+                s.color_rgba[3],
+            ),
+            source_path: s.source_path,
+            source_in_frame: s.source_in_frame,
+            source_in_secs: s.source_in_secs,
+            source_fps: s.source_fps,
+            link_group: s.link_group,
+            zoom_x: s.zoom_x,
+            zoom_y: s.zoom_y,
+            position_x: s.position_x,
+            position_y: s.position_y,
+            rotation: s.rotation,
+            opacity: s.opacity,
+            volume_db: s.volume_db,
+            pan: s.pan,
+            source_audio_stream: s.source_audio_stream,
+            speed: s.speed,
+            retime_controls_open: false,
+            is_disabled: s.is_disabled,
+        }
+    }
+}
+
+/// Полная сцена проекта DaVinci Resolve для постоянного сохранения на диск
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProjectScene {
+    pub clips: Vec<SerializedClip>,
+    pub tracks: Vec<Track>,
+    pub playhead_frame: i64,
+    pub zoom_factor: f32,
+    pub scroll_x: f32,
+    pub scroll_y: f32,
+    pub fps: u32,
+    pub in_point: Option<i64>,
+    pub out_point: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +317,7 @@ pub struct TimelineState {
     pub resizing_track: Option<(usize, f32, f32)>, // (индекс дорожки, стартовый Y курсора, начальная высота)
     pub retime_session: Option<(u64, f32, i64, f64)>, // (clip_id, mouse_start_x, initial_duration, initial_speed)
     pub show_view_options: bool, // Меню View Options на тулбаре
+    pub zoom_step_percent: f32, // Шаг зума в процентах (по умолчанию 8%)
 }
 
 impl TimelineState {
@@ -324,7 +433,64 @@ impl TimelineState {
             resizing_track: None,
             retime_session: None,
             show_view_options: false,
+            zoom_step_percent: 8.0,
         }
+    }
+
+    /// Экспортировать полное состояние сцены проекта для сохранения
+    pub fn export_scene(&self) -> ProjectScene {
+        ProjectScene {
+            clips: self.clips.iter().map(SerializedClip::from).collect(),
+            tracks: self.tracks.clone(),
+            playhead_frame: self.playhead_frame,
+            zoom_factor: self.zoom_factor,
+            scroll_x: self.scroll_x,
+            scroll_y: self.scroll_y,
+            fps: self.fps,
+            in_point: self.in_point,
+            out_point: self.out_point,
+        }
+    }
+
+    /// Восстановить полное состояние сцены проекта из сохраненных данных
+    pub fn import_scene(&mut self, scene: ProjectScene) {
+        let max_id = scene.clips.iter().map(|c| c.id).max().unwrap_or(0);
+        let max_link = scene.clips.iter().filter_map(|c| c.link_group).max().unwrap_or(0);
+        self.clips = scene.clips.into_iter().map(Clip::from).collect();
+        if !scene.tracks.is_empty() {
+            self.tracks = scene.tracks;
+        }
+        self.next_clip_id = max_id + 1;
+        self.next_link_id = max_link + 1;
+        self.playhead_frame = scene.playhead_frame;
+        self.zoom_factor = scene.zoom_factor.clamp(0.0005, 50.0);
+        self.scroll_x = scene.scroll_x.max(0.0);
+        self.scroll_y = scene.scroll_y.max(0.0);
+        if scene.fps > 0 {
+            self.fps = scene.fps;
+        }
+        self.in_point = scene.in_point;
+        self.out_point = scene.out_point;
+        self.audio_dirty = true;
+        self.structure_dirty = true;
+    }
+
+    /// Сохранить сцену проекта в JSON файл на диске
+    pub fn save_scene_file(&self, path: &std::path::Path) -> Result<(), String> {
+        let scene = self.export_scene();
+        let json = serde_json::to_string_pretty(&scene).map_err(|e| e.to_string())?;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(path, json).map_err(|e| e.to_string())
+    }
+
+    /// Загрузить сцену проекта из JSON файла на диске
+    pub fn load_scene_file(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let scene: ProjectScene = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+        self.import_scene(scene);
+        Ok(())
     }
 
     /// Динамически гарантировать существование аудиодорожек на таймлайне (A1, A2, A3...)
@@ -1360,5 +1526,74 @@ mod tests {
         // Так как верхний клип отключен, активным видеоклипом должен стать нижний (id 20)
         let active = tl.active_video_clip_at(50).expect("should find active bottom clip");
         assert_eq!(active.id, 20);
+    }
+
+    #[test]
+    fn test_scene_serialization_and_persistence() {
+        let mut tl = TimelineState::new_empty();
+        tl.fps = 30;
+        tl.playhead_frame = 42;
+        tl.zoom_factor = 3.5;
+        tl.zoom_step_percent = 8.0;
+
+        let clip1 = Clip {
+            id: 1,
+            name: "Clip 1".to_string(),
+            track_index: 0,
+            start_frame: 0,
+            duration_frames: 120,
+            is_audio: false,
+            color: Color32::from_rgb(100, 150, 200),
+            speed: 1.5,
+            zoom_x: 1.2,
+            ..Default::default()
+        };
+        let clip2 = Clip {
+            id: 2,
+            name: "Audio 1".to_string(),
+            track_index: 2,
+            start_frame: 10,
+            duration_frames: 200,
+            is_audio: true,
+            color: Color32::from_rgb(50, 180, 80),
+            volume_db: -3.5,
+            ..Default::default()
+        };
+        tl.clips.push(clip1);
+        tl.clips.push(clip2);
+
+        let temp_dir = std::env::temp_dir().join("verizon_test_scene");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let scene_file = temp_dir.join("test_scene.json");
+
+        assert!(tl.save_scene_file(&scene_file).is_ok());
+
+        let mut loaded_tl = TimelineState::new_empty();
+        assert!(loaded_tl.load_scene_file(&scene_file).is_ok());
+
+        assert_eq!(loaded_tl.fps, 30);
+        assert_eq!(loaded_tl.playhead_frame, 42);
+        assert!((loaded_tl.zoom_factor - 3.5).abs() < 1e-4);
+        assert_eq!(loaded_tl.clips.len(), 2);
+        assert_eq!(loaded_tl.clips[0].name, "Clip 1");
+        assert_eq!(loaded_tl.clips[0].color, Color32::from_rgb(100, 150, 200));
+        assert!((loaded_tl.clips[0].speed - 1.5).abs() < 1e-4);
+        assert_eq!(loaded_tl.clips[1].name, "Audio 1");
+        assert!(loaded_tl.clips[1].is_audio);
+
+        let _ = std::fs::remove_file(scene_file);
+    }
+
+    #[test]
+    fn test_timeline_zoom_step_customizable() {
+        let tl = TimelineState::new_empty();
+        assert_eq!(tl.zoom_step_percent, 8.0);
+
+        let initial_zoom = tl.zoom_factor;
+        let step = tl.zoom_step_percent / 100.0;
+        let zoomed_in = initial_zoom * (1.0 + step);
+        let zoomed_out = zoomed_in * (1.0 - step);
+        assert!((zoomed_in - initial_zoom * 1.08).abs() < 1e-4);
+        assert!((zoomed_out - initial_zoom).abs() < 0.1);
     }
 }

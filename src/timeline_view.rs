@@ -130,10 +130,11 @@ impl TimelineView {
                     let is_shift = ui.input(|i| i.modifiers.shift);
 
                     if is_zoom {
-                        // Плавный гранулярный зум с центрированием строго под курсором мыши (DaVinci Resolve 21)
+                        // Плавный гранулярный зум с настраиваемым шагом (по умолчанию 8%) под курсором мыши
                         let old_zoom = timeline.zoom_factor;
-                        let raw_delta = if scroll_y.abs() > 30.0 { scroll_y / 60.0 } else { scroll_y * 0.08 };
-                        let factor = (raw_delta * 0.5).clamp(-0.8, 0.8).exp();
+                        let step = (timeline.zoom_step_percent / 100.0).clamp(0.01, 0.35);
+                        let raw_delta = if scroll_y.abs() > 30.0 { scroll_y.signum() } else { scroll_y * 0.05 };
+                        let factor = (1.0 + step * raw_delta).clamp(0.5, 2.0);
                         let new_zoom = (old_zoom * factor).clamp(0.0005, 50.0);
 
                         let mouse_rel_x = m_pos.x - canvas_rect.min.x;
@@ -816,34 +817,35 @@ impl TimelineView {
 
             ui.separator();
 
-            // Zoom контролы (от 1 кадра до многочасовых проектов)
-            ui.label(egui::RichText::new("Zoom:").size(11.0).color(ResolveColors::TEXT_MUTED));
-            if ui.button("➖").on_hover_text("Уменьшить масштаб (Zoom Out)").clicked() {
-                timeline.zoom_factor = (timeline.zoom_factor * 0.90).clamp(0.0005, 50.0);
+            // Zoom контролы с шагом 8% и иконками Resolve
+            ui.label(egui::RichText::new("🔍").size(12.0).color(ResolveColors::TEXT_MUTED));
+            let step = (timeline.zoom_step_percent / 100.0).clamp(0.01, 0.5);
+            if ui.button("➖").on_hover_text(format!("Уменьшить масштаб (-{:.0}%)", timeline.zoom_step_percent)).clicked() {
+                timeline.zoom_factor = (timeline.zoom_factor * (1.0 - step)).clamp(0.0005, 50.0);
             }
             let mut log_zoom = timeline.zoom_factor;
             let slider = egui::Slider::new(&mut log_zoom, 0.0005..=50.0)
                 .logarithmic(true)
                 .show_value(false);
-            if ui.add_sized([120.0, 16.0], slider).on_hover_text("Плавный логарифмический зум (от 1 кадра до 10 часов)").changed() {
+            if ui.add_sized([110.0, 16.0], slider).on_hover_text("Плавный логарифмический зум (от 1 кадра до 10 часов)").changed() {
                 let center_x = 500.0;
                 let target_frame = (center_x + timeline.scroll_x) / timeline.zoom_factor;
                 timeline.zoom_factor = log_zoom;
                 timeline.scroll_x = (target_frame * log_zoom - center_x).max(0.0);
             }
-            if ui.button("➕").on_hover_text("Увеличить масштаб (Zoom In)").clicked() {
-                timeline.zoom_factor = (timeline.zoom_factor * 1.10).clamp(0.0005, 50.0);
+            if ui.button("➕").on_hover_text(format!("Увеличить масштаб (+{:.0}%)", timeline.zoom_step_percent)).clicked() {
+                timeline.zoom_factor = (timeline.zoom_factor * (1.0 + step)).clamp(0.0005, 50.0);
             }
-            if ui.button("⛶ Fit").on_hover_text("Показать весь проект целиком [Shift+Z]").clicked() {
+            if ui.button("⛶").on_hover_text("Показать весь проект целиком [Shift+Z]").clicked() {
                 timeline.zoom_to_fit(ui.available_width().max(400.0));
             }
 
             ui.separator();
 
-            // ☷ View Options (Высота дорожек и отображение)
+            // ☷ View Options
             let view_opts_active = timeline.show_view_options;
             let view_opts_btn = egui::Button::new(
-                egui::RichText::new("☷ View Options").size(11.0).color(if view_opts_active { Color32::WHITE } else { ResolveColors::TEXT_PRIMARY }),
+                egui::RichText::new("☷").size(12.0).color(if view_opts_active { Color32::WHITE } else { ResolveColors::TEXT_PRIMARY }),
             ).fill(if view_opts_active { ResolveColors::ACCENT_ORANGE } else { ResolveColors::BG_HEADER });
             if ui.add(view_opts_btn).on_hover_text("Настройки отображения таймлайна и высоты дорожек").clicked() {
                 timeline.show_view_options = !timeline.show_view_options;
@@ -852,7 +854,7 @@ impl TimelineView {
             // ⚡ Retime Controls кнопка
             let retime_active = timeline.selected_clip_id.and_then(|id| timeline.clips.iter().find(|c| c.id == id)).map(|c| c.retime_controls_open).unwrap_or(false);
             let retime_btn = egui::Button::new(
-                egui::RichText::new("⚡ Retime (Ctrl+R)").size(11.0).color(if retime_active { Color32::WHITE } else { ResolveColors::TEXT_PRIMARY }),
+                egui::RichText::new("⚡ Retime").size(11.0).color(if retime_active { Color32::WHITE } else { ResolveColors::TEXT_PRIMARY }),
             ).fill(if retime_active { ResolveColors::ACCENT_ORANGE } else { ResolveColors::BG_HEADER });
             if ui.add(retime_btn).on_hover_text("Включить/выключить Retime Controls для выбранного клипа [Ctrl+R]").clicked() {
                 if let Some(sel_id) = timeline.selected_clip_id {

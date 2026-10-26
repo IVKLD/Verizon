@@ -163,14 +163,13 @@ impl ViewerState {
             video_player.show_blank_frame_with_prefetch(prefetch_src, ctx);
         }
 
-        // Автоматически сохраняем ТОЛЬКО реально декодированные кадры в Render Cache
-        if render_cache.mode != crate::render_cache::RenderCacheMode::None && cached_img.is_none() {
+        // Автоматически сохраняем декодированные кадры в Render Cache
+        if render_cache.mode != crate::render_cache::RenderCacheMode::None {
             if let Some(clip) = active_clip {
                 let is_same_file = clip.source_path.as_deref() == video_player.current_path.as_deref();
                 if is_same_file {
                     let expected_src = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
-                    // Сохраняем last_displayed_image только если номер кадра строго совпадает с ожидаемым (без дублирования и мерцания)
-                    if video_player.last_decoded_frame == expected_src {
+                    if cached_img.is_none() && video_player.last_decoded_frame == expected_src {
                         if let Some(ref img) = video_player.last_displayed_image {
                             render_cache.insert(timeline.playhead_frame, std::sync::Arc::clone(img), current_sig);
                         }
@@ -225,34 +224,21 @@ impl ViewerState {
     fn render_viewer_toolbar(&mut self, ui: &mut Ui, video_player: &mut VideoPlayer, render_cache: &mut crate::render_cache::RenderCacheManager) {
         ui.horizontal(|ui| {
             // Кнопка Скрыть / Раскрыть Source
-            if self.single_viewer_mode {
-                let btn = egui::Button::new(
-                    egui::RichText::new("👁 Раскрыть Source")
-                        .size(11.0)
-                        .strong()
-                        .color(ResolveColors::TEXT_PRIMARY),
-                )
-                .fill(ResolveColors::BG_HEADER);
-                if ui.add(btn).on_hover_text("Раскрыть левый монитор исходника (Dual Viewer)").clicked() {
-                    self.single_viewer_mode = false;
-                }
-            } else {
-                let btn = egui::Button::new(
-                    egui::RichText::new("👁 Скрыть Source")
-                        .size(11.0)
-                        .strong()
-                        .color(Color32::WHITE),
-                )
-                .fill(ResolveColors::ACCENT_ORANGE);
-                if ui.add(btn).on_hover_text("Скрыть монитор исходника и развернуть Timeline Viewer на 100%").clicked() {
-                    self.single_viewer_mode = true;
-                }
+            let src_text = if self.single_viewer_mode { "👁 Source" } else { "👁 Source" };
+            let src_btn = egui::Button::new(
+                egui::RichText::new(src_text)
+                    .size(11.0)
+                    .strong()
+                    .color(if self.single_viewer_mode { ResolveColors::TEXT_PRIMARY } else { Color32::WHITE }),
+            )
+            .fill(if self.single_viewer_mode { ResolveColors::BG_HEADER } else { ResolveColors::ACCENT_ORANGE });
+            if ui.add(src_btn).on_hover_text(if self.single_viewer_mode { "Раскрыть Source Viewer (Dual Monitor)" } else { "Скрыть Source Viewer (100% Timeline)" }).clicked() {
+                self.single_viewer_mode = !self.single_viewer_mode;
             }
 
             ui.separator();
 
             // 1. Zoom Mode (Fit / 50% / 100% / 200%)
-            ui.label(egui::RichText::new("Zoom:").size(10.0).color(ResolveColors::TEXT_MUTED));
             let zoom_label = match self.zoom_mode {
                 ZoomMode::Fit => "Fit",
                 ZoomMode::Fifty => "50%",
@@ -262,54 +248,53 @@ impl ViewerState {
             egui::ComboBox::from_id_salt("viewer_zoom_combo")
                 .selected_text(zoom_label)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.zoom_mode, ZoomMode::Fit, "Fit (По размеру)");
+                    ui.selectable_value(&mut self.zoom_mode, ZoomMode::Fit, "Fit");
                     ui.selectable_value(&mut self.zoom_mode, ZoomMode::Fifty, "50%");
-                    ui.selectable_value(&mut self.zoom_mode, ZoomMode::Hundred, "100% (Попиксельно)");
+                    ui.selectable_value(&mut self.zoom_mode, ZoomMode::Hundred, "100%");
                     ui.selectable_value(&mut self.zoom_mode, ZoomMode::TwoHundred, "200%");
                 });
 
             ui.separator();
 
             // 2. Aspect Ratio / Framing Masks (Каше: 2.39:1, 9:16 Shorts...)
-            ui.label(egui::RichText::new("Каше:").size(10.0).color(ResolveColors::TEXT_MUTED));
             let mask_label = match self.aspect_mask {
-                AspectMask::Off => "Выкл",
-                AspectMask::Cinema239 => "2.39:1 Cinema",
-                AspectMask::Cinema185 => "1.85:1 Flat",
-                AspectMask::Vertical916 => "9:16 Shorts/Reels",
-                AspectMask::Square11 => "1:1 Square",
+                AspectMask::Off => "16:9",
+                AspectMask::Cinema239 => "2.39:1",
+                AspectMask::Cinema185 => "1.85:1",
+                AspectMask::Vertical916 => "9:16",
+                AspectMask::Square11 => "1:1",
             };
             egui::ComboBox::from_id_salt("viewer_aspect_combo")
                 .selected_text(mask_label)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.aspect_mask, AspectMask::Off, "Выкл (Без каше)");
-                    ui.selectable_value(&mut self.aspect_mask, AspectMask::Cinema239, "2.39:1 Anamorphic Cinema");
-                    ui.selectable_value(&mut self.aspect_mask, AspectMask::Cinema185, "1.85:1 Flat Cinema");
-                    ui.selectable_value(&mut self.aspect_mask, AspectMask::Vertical916, "9:16 Shorts / TikTok");
-                    ui.selectable_value(&mut self.aspect_mask, AspectMask::Square11, "1:1 Square Instagram");
+                    ui.selectable_value(&mut self.aspect_mask, AspectMask::Off, "Off (16:9)");
+                    ui.selectable_value(&mut self.aspect_mask, AspectMask::Cinema239, "2.39:1 Cinema");
+                    ui.selectable_value(&mut self.aspect_mask, AspectMask::Cinema185, "1.85:1 Flat");
+                    ui.selectable_value(&mut self.aspect_mask, AspectMask::Vertical916, "9:16 Shorts");
+                    ui.selectable_value(&mut self.aspect_mask, AspectMask::Square11, "1:1 Square");
                 });
 
             ui.separator();
 
             // 3. Сетки и направляющие (Guides: Thirds, Safe, Cross)
-            ui.menu_button("📐 Сетки / Guides", |ui| {
-                ui.checkbox(&mut self.show_safe_areas, "Safe Action (90%) / Safe Title (80%)");
-                ui.checkbox(&mut self.show_rule_of_thirds, "Сетка третей (Rule of Thirds 3x3)");
-                ui.checkbox(&mut self.show_center_cross, "Центральное перекрестие (Crosshair)");
+            ui.menu_button("📐 Guides", |ui| {
+                ui.checkbox(&mut self.show_safe_areas, "Safe Action / Title");
+                ui.checkbox(&mut self.show_rule_of_thirds, "Rule of Thirds");
+                ui.checkbox(&mut self.show_center_cross, "Center Crosshair");
             });
 
             // 4. Изоляция цветовых каналов (Channel Mode: RGB, R, G, B, Mono)
-            ui.menu_button("🎨 Каналы", |ui| {
-                ui.selectable_value(&mut self.channel_mode, ColorChannelMode::RGB, "RGB (Полный цвет)");
-                ui.selectable_value(&mut self.channel_mode, ColorChannelMode::Red, "Красный канал (Red)");
-                ui.selectable_value(&mut self.channel_mode, ColorChannelMode::Green, "Зеленый канал (Green)");
-                ui.selectable_value(&mut self.channel_mode, ColorChannelMode::Blue, "Синий канал (Blue)");
-                ui.selectable_value(&mut self.channel_mode, ColorChannelMode::Monochrome, "Ч/Б Яркость (Monochrome)");
+            ui.menu_button("🎨 Channels", |ui| {
+                ui.selectable_value(&mut self.channel_mode, ColorChannelMode::RGB, "RGB (Full)");
+                ui.selectable_value(&mut self.channel_mode, ColorChannelMode::Red, "Red (R)");
+                ui.selectable_value(&mut self.channel_mode, ColorChannelMode::Green, "Green (G)");
+                ui.selectable_value(&mut self.channel_mode, ColorChannelMode::Blue, "Blue (B)");
+                ui.selectable_value(&mut self.channel_mode, ColorChannelMode::Monochrome, "Monochrome");
             });
 
             // 5. Интерактивная рамка трансформации на мониторе (Transform OSC)
             let tf_btn = egui::Button::new(
-                egui::RichText::new("⛶ Transform Overlay")
+                egui::RichText::new("⛶ Transform")
                     .size(10.0)
                     .color(if self.show_transform_overlay { Color32::WHITE } else { ResolveColors::TEXT_MUTED }),
             )
@@ -323,9 +308,9 @@ impl ViewerState {
             // 6. Селектор режима Render Cache (DaVinci Resolve Smart Cache)
             let stats = render_cache.stats();
             let cache_label = match stats.mode {
-                crate::render_cache::RenderCacheMode::None => "⚡ Cache: Off",
-                crate::render_cache::RenderCacheMode::Smart => "⚡ Cache: Smart",
-                crate::render_cache::RenderCacheMode::User => "⚡ Cache: User",
+                crate::render_cache::RenderCacheMode::None => "⚡ Off",
+                crate::render_cache::RenderCacheMode::Smart => "⚡ Smart",
+                crate::render_cache::RenderCacheMode::User => "⚡ User",
             };
             egui::ComboBox::from_id_salt("viewer_render_cache_combo")
                 .selected_text(cache_label)

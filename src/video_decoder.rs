@@ -435,6 +435,10 @@ impl VideoPlayer {
             while let Ok((epoch, raw_frame_num, image)) = rx.try_recv() {
                 if epoch == self.current_epoch && raw_frame_num >= 0 {
                     let arc_img = Arc::new(image);
+                    self.newly_cached_frames.push((raw_frame_num, Arc::clone(&arc_img)));
+                    if self.newly_cached_frames.len() > 64 {
+                        self.newly_cached_frames.remove(0);
+                    }
                     if let Some(back) = self.frame_queue.back_mut() {
                         if back.0 == raw_frame_num {
                             back.1 = arc_img;
@@ -442,7 +446,7 @@ impl VideoPlayer {
                         }
                     }
                     self.frame_queue.push_back((raw_frame_num, arc_img));
-                    while self.frame_queue.len() > 64 {
+                    while self.frame_queue.len() > 180 {
                         self.frame_queue.pop_front();
                     }
                 }
@@ -716,11 +720,11 @@ impl VideoPlayer {
                 // являются устаревшими (из прошлого) и ДОЛЖНЫ быть отброшены, чтобы видео не дёргалось назад!
                 if is_continuous_playback && f <= self.last_decoded_frame {
                     garbage.extend(Arc::try_unwrap(img).ok());
-                    dropped += 1;
+                    // Дубликат / уже показанный кадр не считается пропуском воспроизведения
                     continue;
                 }
-                // Кадр реально отстал от живого воспроизведения минимум на 2 кадра
-                let really_late = target_frame - f >= 2;
+                // Кадр реально отстал от живого воспроизведения минимум на 4 кадра (>66 мс)
+                let really_late = target_frame - f >= 4;
                 if self.drop_frames_enabled
                     && is_continuous_playback
                     && really_late
@@ -745,7 +749,7 @@ impl VideoPlayer {
             self.dropped_frames_count += dropped;
         }
 
-        while self.frame_queue.len() > 90 {
+        while self.frame_queue.len() > 180 {
             if let Some((_, old_img)) = self.frame_queue.pop_front() {
                 garbage.extend(Arc::try_unwrap(old_img).ok());
             }

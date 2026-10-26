@@ -1,7 +1,8 @@
 use egui::ColorImage;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use crate::timeline::TimelineState;
 
@@ -41,6 +42,7 @@ pub struct RenderCacheStats {
 }
 
 /// Менеджер Render Cache: thread-safe, lock-free проверка наличия, LRU-вытеснение
+#[derive(Clone)]
 pub struct RenderCacheManager {
     pub mode: RenderCacheMode,
     cache: Arc<Mutex<HashMap<i64, CachedRenderFrame>>>,
@@ -275,6 +277,157 @@ impl RenderCacheManager {
             max_frames: self.max_frames,
             mode: self.mode,
             memory_mb,
+        }
+    }
+}
+
+/// Фоновый авто-рендерер Render Cache для незакэшированных красных участков таймлайна в режиме ожидания (Idle)
+pub struct BackgroundCacheEngine {
+    is_busy: Arc<AtomicBool>,
+    cancel_flag: Arc<AtomicBool>,
+}
+
+impl Default for BackgroundCacheEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BackgroundCacheEngine {
+    pub fn new() -> Self {
+        Self {
+            is_busy: Arc::new(AtomicBool::new(false)),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.is_busy.load(Ordering::Acquire)
+    }
+
+    pub fn cancel(&self) {
+        self.cancel_flag.store(true, Ordering::Release);
+    }
+
+    /// Запросить фоновое кэширование пачки кадров без влияния на UI-поток
+    pub fn request_cache_batch(
+        &self,
+        path: PathBuf,
+        frames: Vec<(i64, i64, u64)>, // (src_frame, timeline_frame, signature)
+        source_fps: f64,
+        cache: RenderCacheManager,
+        egui_ctx: egui::Context,
+    ) {
+        if frames.is_empty() {
+            return;
+        }
+        if self.is_busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            return;
+        }
+        self.cancel_flag.store(false, Ordering::Release);
+
+        let is_busy = Arc::clone(&self.is_busy);
+        let cancel_flag = Arc::clone(&self.cancel_flag);
+
+        std::thread::spawn(move || {
+            Self::run_cache_worker(path, frames, source_fps, cache, egui_ctx, cancel_flag);
+            is_busy.store(false, Ordering::Release);
+        });
+    }
+
+    fn run_cache_worker(
+        path: PathBuf,
+        frames: Vec<(i64, i64, u64)>,
+        source_fps: f64,
+        cache: RenderCacheManager,
+        egui_ctx: egui::Context,
+        cancel_flag: Arc<AtomicBool>,
+    ) {
+        let Ok(mut ictx) = ffmpeg_next::format::input(&path) else { return; };
+        let Some(video_stream) = ictx.streams().best(ffmpeg_next::media::Type::Video) else { return; };
+        let stream_idx = video_stream.index();
+        let time_base = video_stream.time_base();
+        let Ok(context_decoder) = ffmpeg_next::codec::context::Context::from_parameters(video_stream.parameters()) else { return; };
+        let Ok(mut decoder) = context_decoder.decoder().video() else { return; };
+
+        let first_src = frames[0].0;
+        let ts_sec = (first_src as f64 / source_fps.max(1.0)).max(0.0);
+        let ts_tb = (ts_sec * (time_base.denominator() as f64) / (time_base.numerator() as f64).max(1.0)).round() as i64;
+        let _ = ictx.seek(ts_tb, ..ts_tb);
+        decoder.flush();
+
+        let orig_w = decoder.width();
+        let orig_h = decoder.height();
+        let scaled_w = 1280.min(orig_w);
+        let scaled_h = (scaled_w as f32 * (orig_h as f32 / orig_w.max(1) as f32)).round() as u32;
+
+        let Ok(mut scaler) = ffmpeg_next::software::scaling::Context::get(
+            decoder.format(),
+            orig_w,
+            orig_h,
+            ffmpeg_next::format::Pixel::RGBA,
+            scaled_w,
+            scaled_h,
+            ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
+        ) else { return; };
+
+        let mut decoded_frame = ffmpeg_next::util::frame::Video::empty();
+        let mut rgb_frame = ffmpeg_next::util::frame::Video::empty();
+
+        let mut target_map: HashMap<i64, (i64, u64)> = HashMap::with_capacity(frames.len());
+        for (src_f, tl_f, sig) in frames {
+            target_map.insert(src_f, (tl_f, sig));
+        }
+
+        let mut cached_count = 0;
+        for (stream, packet) in ictx.packets() {
+            if cancel_flag.load(Ordering::Acquire) {
+                break;
+            }
+            if stream.index() != stream_idx {
+                continue;
+            }
+
+            if decoder.send_packet(&packet).is_ok() {
+                while decoder.receive_frame(&mut decoded_frame).is_ok() {
+                    if cancel_flag.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let pts = decoded_frame.pts().unwrap_or(0);
+                    let frame_secs = pts as f64 * (time_base.numerator() as f64) / (time_base.denominator() as f64).max(1.0);
+                    let cur_src_f = (frame_secs * source_fps).round() as i64;
+
+                    if let Some(&(tl_f, sig)) = target_map.get(&cur_src_f) {
+                        if scaler.run(&decoded_frame, &mut rgb_frame).is_ok() {
+                            let data = rgb_frame.data(0);
+                            let stride = rgb_frame.stride(0);
+                            let mut pixels = Vec::with_capacity((scaled_w * scaled_h * 4) as usize);
+                            for row in 0..scaled_h as usize {
+                                let start = row * stride;
+                                let end = start + (scaled_w as usize * 4);
+                                if end <= data.len() {
+                                    pixels.extend_from_slice(&data[start..end]);
+                                }
+                            }
+                            let color_img = ColorImage::from_rgba_unmultiplied(
+                                [scaled_w as usize, scaled_h as usize],
+                                &pixels,
+                            );
+                            cache.insert(tl_f, Arc::new(color_img), sig);
+                            cached_count += 1;
+                            target_map.remove(&cur_src_f);
+                        }
+                    }
+
+                    if target_map.is_empty() {
+                        egui_ctx.request_repaint();
+                        return;
+                    }
+                }
+            }
+        }
+        if cached_count > 0 {
+            egui_ctx.request_repaint();
         }
     }
 }

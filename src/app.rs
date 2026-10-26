@@ -97,10 +97,12 @@ pub struct NleApp {
     pub audio_player: AudioPlayer,
     pub waveform_mgr: WaveformManager,
     pub render_cache: crate::render_cache::RenderCacheManager,
+    pub bg_cache_engine: crate::render_cache::BackgroundCacheEngine,
     pub preferences: UserPreferences,
     pub preferences_modal: crate::preferences::PreferencesModalState,
     pub show_preferences_window: bool,
     pub last_frame_time: std::time::Instant,
+    pub last_user_activity: std::time::Instant,
     pub notification: Option<(String, std::time::Instant)>,
     /// Самопроверка реального приложения (включается переменной окружения VERIZON_AUTOPILOT)
     pub autopilot: Option<crate::autopilot::Autopilot>,
@@ -111,6 +113,7 @@ impl NleApp {
         let prefs = UserPreferences::load();
         crate::theme::apply_resolve_theme_with_accent(&cc.egui_ctx, prefs.theme_accent_idx);
         cc.egui_ctx.set_zoom_factor(prefs.ui_scale);
+        cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!prefs.hide_titlebar));
 
         let mut app = Self {
             current_page: Page::Edit,
@@ -124,10 +127,12 @@ impl NleApp {
             audio_player: AudioPlayer::new(),
             waveform_mgr: WaveformManager::new(),
             render_cache: crate::render_cache::RenderCacheManager::default(),
+            bg_cache_engine: crate::render_cache::BackgroundCacheEngine::new(),
             preferences: prefs.clone(),
             preferences_modal: crate::preferences::PreferencesModalState::new(),
             show_preferences_window: false,
             last_frame_time: std::time::Instant::now(),
+            last_user_activity: std::time::Instant::now(),
             notification: None,
             autopilot: crate::autopilot::Autopilot::from_env(),
         };
@@ -137,6 +142,7 @@ impl NleApp {
         app.timeline.linked_selection = prefs.linked_selection;
         app.timeline.loop_enabled = prefs.loop_enabled;
         app.timeline.stop_at_timeline_end = prefs.stop_at_timeline_end;
+        app.timeline.zoom_step_percent = prefs.zoom_step_percent;
 
         app.render_cache.mode = match prefs.render_cache_mode {
             0 => crate::render_cache::RenderCacheMode::None,
@@ -146,6 +152,23 @@ impl NleApp {
         app.render_cache.set_max_memory_mb(prefs.render_cache_ram_mb);
         app.video_player.drop_frames_enabled = prefs.drop_frames_enabled;
         app.audio_player.set_master_volume(prefs.master_volume);
+
+        // Восстановление сохраненного состояния сцены (Project Scene)
+        let scene_path = UserPreferences::scene_path();
+        if scene_path.exists() {
+            if let Ok(()) = app.timeline.load_scene_file(&scene_path) {
+                if let Some(first_video) = app.timeline.clips.iter().find(|c| !c.is_audio) {
+                    if let Some(ref path) = first_video.source_path {
+                        let _ = app.video_player.open_file(path, &cc.egui_ctx);
+                    }
+                }
+                if let Some(first_audio) = app.timeline.clips.iter().find(|c| c.is_audio) {
+                    if let Some(ref path) = first_audio.source_path {
+                        let _ = app.audio_player.load_audio_from_file(path);
+                    }
+                }
+            }
+        }
 
         // Восстановление сохраненного расположения окон (Dock Layout)
         let dock_path = UserPreferences::dock_layout_path();
@@ -375,6 +398,22 @@ impl NleApp {
                 }
             }
 
+            // F10: Скрыть / Показать заголовок окна (Borderless)
+            if i.key_pressed(egui::Key::F10) {
+                self.preferences.hide_titlebar = !self.preferences.hide_titlebar;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.preferences.hide_titlebar));
+                self.preferences.save();
+                let status_msg = if self.preferences.hide_titlebar { "🗔 Заголовок окна скрыт (F10)" } else { "🗔 Заголовок окна отображен (F10)" };
+                self.notification = Some((status_msg.to_string(), std::time::Instant::now()));
+            }
+
+            // Ctrl+S: Сохранение сцены проекта
+            if (i.modifiers.ctrl || i.modifiers.command) && !i.modifiers.shift && i.key_pressed(egui::Key::S) {
+                if self.timeline.save_scene_file(&UserPreferences::scene_path()).is_ok() {
+                    self.notification = Some(("💾 Сцена проекта сохранена".to_string(), std::time::Instant::now()));
+                }
+            }
+
             // Ctrl+I: Import Media
             if (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::I) {
                 import_requested = true;
@@ -395,11 +434,12 @@ impl NleApp {
                     scale_change = Some(1.0);
                 }
             } else if (i.modifiers.ctrl || i.modifiers.command) && !i.modifiers.shift {
-                // Ctrl + / Ctrl - в DaVinci Resolve: Зум таймлайна по плейхеду
+                // Ctrl + / Ctrl - в DaVinci Resolve: Зум таймлайна с настраиваемым шагом (8%)
+                let step = (self.timeline.zoom_step_percent / 100.0).clamp(0.01, 0.5);
                 if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
-                    self.timeline.zoom_factor = (self.timeline.zoom_factor * 1.25).clamp(0.0005, 50.0);
+                    self.timeline.zoom_factor = (self.timeline.zoom_factor * (1.0 + step)).clamp(0.0005, 50.0);
                 } else if i.key_pressed(egui::Key::Minus) {
-                    self.timeline.zoom_factor = (self.timeline.zoom_factor * 0.80).clamp(0.0005, 50.0);
+                    self.timeline.zoom_factor = (self.timeline.zoom_factor * (1.0 - step)).clamp(0.0005, 50.0);
                 }
             }
 
@@ -631,7 +671,27 @@ impl NleApp {
 
                     // Верхнее главное меню DaVinci Resolve
                     ui.menu_button("File", |ui| {
-                        if ui.button("📂 Import Media... [Ctrl+I]").clicked() {
+                        if ui.button("💾 Save Scene [Ctrl+S]").clicked() {
+                            if self.timeline.save_scene_file(&UserPreferences::scene_path()).is_ok() {
+                                self.notification = Some(("💾 Сцена проекта сохранена".to_string(), std::time::Instant::now()));
+                            }
+                            ui.close();
+                        }
+                        if ui.button("📂 Open Scene...").clicked() {
+                            if let Some(file) = rfd::FileDialog::new().add_filter("Scene JSON", &["json"]).pick_file() {
+                                if self.timeline.load_scene_file(&file).is_ok() {
+                                    self.notification = Some(("📂 Сцена проекта загружена".to_string(), std::time::Instant::now()));
+                                    if let Some(first_video) = self.timeline.clips.iter().find(|c| !c.is_audio) {
+                                        if let Some(ref path) = first_video.source_path {
+                                            let _ = self.video_player.open_file(path, ui.ctx());
+                                        }
+                                    }
+                                }
+                            }
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("📥 Import Media... [Ctrl+I]").clicked() {
                             self.prompt_import_media(ui.ctx());
                             ui.close();
                         }
@@ -659,6 +719,26 @@ impl NleApp {
                         }
                         if ui.button("🗑 Delete Selected [Del]").clicked() {
                             self.timeline.delete_selected_clip();
+                            ui.close();
+                        }
+                    });
+
+                    ui.menu_button("View", |ui| {
+                        let titlebar_label = if self.preferences.hide_titlebar {
+                            "🗔 Show Window Title Bar [F10]"
+                        } else {
+                            "🗔 Hide Window Title Bar [F10]"
+                        };
+                        if ui.button(titlebar_label).clicked() {
+                            self.preferences.hide_titlebar = !self.preferences.hide_titlebar;
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Decorations(!self.preferences.hide_titlebar));
+                            self.preferences.save();
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("🔍 Zoom to Fit [Shift+Z]").clicked() {
+                            let w = ui.ctx().input(|i| i.raw.screen_rect.map(|r| r.width()).unwrap_or(1280.0)) * 0.70;
+                            self.timeline.zoom_to_fit(w);
                             ui.close();
                         }
                     });
@@ -707,7 +787,7 @@ impl NleApp {
                     ui.separator();
 
                     // Кнопка быстрого сброса окон прямо на панели
-                    if ui.button(egui::RichText::new("⟲ Сбросить окна").size(10.0)).on_hover_text("Вернуть исходное расположение всех панелей (Media, Viewers, Inspector, Timeline)").clicked() {
+                    if ui.button(egui::RichText::new("⟲").size(11.0)).on_hover_text("Сбросить расположение панелей").clicked() {
                         self.reset_dock_layout();
                     }
 
@@ -720,12 +800,12 @@ impl NleApp {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // 1. Кнопка открытия настроек
-                        if ui.button("⚙ Настройки [Ctrl+,]").on_hover_text("Настройки масштабирования интерфейса и программы").clicked() {
+                        if ui.button(egui::RichText::new("⚙").size(13.0)).on_hover_text("Preferences [Ctrl+,]").clicked() {
                             self.show_preferences_window = true;
                         }
 
                         // 2. Быстрые кнопки масштабирования для 4K
-                        if ui.button("➕").on_hover_text("Увеличить масштаб интерфейса [Ctrl +]").clicked() {
+                        if ui.button("➕").on_hover_text("Увеличить масштаб интерфейса [Ctrl+Alt+]").clicked() {
                             let s = self.preferences.ui_scale + 0.1;
                             self.set_ui_scale(s, ui.ctx());
                         }
@@ -734,11 +814,10 @@ impl NleApp {
                                 .strong()
                                 .color(ResolveColors::ACCENT_ORANGE),
                         );
-                        if ui.button("➖").on_hover_text("Уменьшить масштаб интерфейса [Ctrl -]").clicked() {
+                        if ui.button("➖").on_hover_text("Уменьшить масштаб интерфейса [Ctrl+Alt-]").clicked() {
                             let s = self.preferences.ui_scale - 0.1;
                             self.set_ui_scale(s, ui.ctx());
                         }
-                        ui.label(egui::RichText::new("🔍 UI:").size(11.0).color(ResolveColors::TEXT_MUTED));
                     });
                 });
             });
@@ -754,18 +833,8 @@ impl NleApp {
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    // Статус Wayland слева
-                    ui.label(
-                        egui::RichText::new("WAYLAND NATIVE")
-                            .size(9.0)
-                            .monospace()
-                            .color(ResolveColors::TEXT_MUTED),
-                    );
-
-                    ui.separator();
-
                     // Центрированные кнопки рабочих пространств DaVinci Resolve 21
-                    ui.add_space((ui.available_width() * 0.28).max(0.0));
+                    ui.add_space((ui.available_width() * 0.32).max(0.0));
 
                     let pages = [
                         (Page::Media, "📁 Media"),
@@ -830,6 +899,9 @@ impl NleApp {
         };
         self.render_cache.set_max_memory_mb(self.preferences.render_cache_ram_mb);
 
+        self.timeline.zoom_step_percent = self.preferences.zoom_step_percent;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.preferences.hide_titlebar));
+
         self.video_player.drop_frames_enabled = self.preferences.drop_frames_enabled;
         self.audio_player.set_master_volume(self.preferences.master_volume);
 
@@ -863,7 +935,51 @@ impl eframe::App for NleApp {
         if self.timeline.structure_dirty {
             self.render_cache.invalidate_all();
             self.video_player.flush_queues_on_cut();
+            let _ = self.timeline.save_scene_file(&UserPreferences::scene_path());
             self.timeline.structure_dirty = false;
+        }
+
+        // Отслеживание активности пользователя для фонового Smart Cache в режиме ожидания (Idle)
+        let user_interacted = ctx.input(|i| {
+            i.pointer.any_down()
+                || i.pointer.delta() != egui::Vec2::ZERO
+                || !i.raw.events.is_empty()
+        }) || self.timeline.is_playing || self.timeline.is_scrubbing;
+
+        if user_interacted {
+            self.last_user_activity = std::time::Instant::now();
+            self.bg_cache_engine.cancel();
+        } else if self.render_cache.mode == crate::render_cache::RenderCacheMode::Smart
+            && self.last_user_activity.elapsed().as_secs_f32() >= self.preferences.auto_cache_idle_secs
+            && !self.bg_cache_engine.is_busy()
+        {
+            'find_uncached: for clip in &self.timeline.clips {
+                if clip.is_audio || clip.is_disabled {
+                    continue;
+                }
+                let Some(ref path) = clip.source_path else { continue; };
+                let mut uncached_batch = Vec::new();
+                for tl_f in clip.start_frame..clip.end_frame() {
+                    if !self.render_cache.is_cached(tl_f) {
+                        let src_f = clip.source_frame_from_timeline(tl_f, self.timeline.fps);
+                        let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(&self.timeline, tl_f);
+                        uncached_batch.push((src_f, tl_f, sig));
+                        if uncached_batch.len() >= 48 {
+                            break;
+                        }
+                    }
+                }
+                if !uncached_batch.is_empty() {
+                    self.bg_cache_engine.request_cache_batch(
+                        path.clone(),
+                        uncached_batch,
+                        clip.source_fps,
+                        self.render_cache.clone(),
+                        ctx.clone(),
+                    );
+                    break 'find_uncached;
+                }
+            }
         }
 
         // 0. Обработка очереди импорта из таймлайна

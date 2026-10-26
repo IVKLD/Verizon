@@ -34,6 +34,7 @@ pub struct UserPreferences {
     pub ui_scale: f32,
     pub timecode_display_frames: bool, // false: SMPTE, true: Frames
     pub theme_accent_idx: usize,       // 0: DaVinci Orange, 1: Resolve Blue, 2: Studio Gold
+    pub hide_titlebar: bool,           // Скрыть заголовок окна (Borderless)
 
     // 2. Editing & Timeline
     pub default_fps: u32,
@@ -44,6 +45,7 @@ pub struct UserPreferences {
     pub linked_selection: bool,
     pub loop_enabled: bool,
     pub stop_at_timeline_end: bool,
+    pub zoom_step_percent: f32,        // Шаг зума таймлайна в процентах (по умолчанию 8%)
 
     // 3. Playback & Render Cache
     pub render_cache_mode: usize, // 0: None, 1: Smart (Resolve Auto), 2: User
@@ -89,6 +91,7 @@ impl Default for UserPreferences {
             ui_scale: 1.5,
             timecode_display_frames: false,
             theme_accent_idx: 0, // DaVinci Orange
+            hide_titlebar: false,
 
             default_fps: 60,
             default_width: 1920,
@@ -98,6 +101,7 @@ impl Default for UserPreferences {
             linked_selection: true,
             loop_enabled: false,
             stop_at_timeline_end: true,
+            zoom_step_percent: 8.0,
 
             render_cache_mode: 1, // Smart
             render_cache_ram_mb: 2048,
@@ -140,6 +144,10 @@ impl UserPreferences {
 
     pub fn dock_layout_path() -> PathBuf {
         Self::config_dir().join("dock_layout.json")
+    }
+
+    pub fn scene_path() -> PathBuf {
+        Self::config_dir().join("autosave_scene.json")
     }
 
     pub fn load() -> Self {
@@ -901,14 +909,14 @@ impl PreferencesModalState {
     }
 
     fn render_system_hardware(&mut self, ui: &mut Ui) {
-        pref_card(ui, "HARDWARE ACCELERATION & ZERO-COPY DECODE", Some("Аппаратное декодирование через VAAPI и нативные протоколы Wayland"), |ui| {
+        pref_card(ui, "HARDWARE ACCELERATION & ZERO-COPY DECODE", Some("Аппаратное декодирование через VAAPI и GPU-акселерация"), |ui| {
             pref_grid(ui, "grid_hw_decode", |ui| {
                 pref_grid_row(ui, "Аппаратное декодирование:", |ui| {
                     pref_checkbox(ui, &mut self.draft.hardware_decoding_enabled, "AMD / Intel VAAPI аппаратное декодирование H.264, HEVC, AV1");
                 });
 
-                pref_grid_row(ui, "Zero-copy Wayland:", |ui| {
-                    pref_checkbox(ui, &mut self.draft.gpu_blending_enabled, "Zero-copy трансфер текстур в Wayland через DMABUF");
+                pref_grid_row(ui, "Zero-copy ускорение:", |ui| {
+                    pref_checkbox(ui, &mut self.draft.gpu_blending_enabled, "Прямой Zero-copy трансфер текстур через DMABUF");
                 });
             });
         });
@@ -939,6 +947,10 @@ impl PreferencesModalState {
 
         pref_card(ui, "DISPLAY SCALING (HiDPI / 4K UHD)", Some("Масштабирование экранов высокого разрешения"), |ui| {
             pref_grid(ui, "grid_disp_scale", |ui| {
+                pref_grid_row(ui, "Заголовок окна:", |ui| {
+                    pref_checkbox(ui, &mut self.draft.hide_titlebar, "Скрыть заголовок окна (Borderless / Полноэкранный вид [F10])");
+                });
+
                 pref_grid_row(ui, "Пресеты разрешения:", |ui| {
                     ui.horizontal_wrapped(|ui| {
                         let presets = [
@@ -1040,6 +1052,14 @@ impl PreferencesModalState {
                     ui.add(
                         egui::Slider::new(&mut self.draft.snapping_threshold_px, 2.0..=30.0)
                             .suffix(" px"),
+                    );
+                });
+
+                pref_grid_row(ui, "Шаг зума таймлайна:", |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.draft.zoom_step_percent, 1.0..=25.0)
+                            .step_by(1.0)
+                            .suffix("%"),
                     );
                 });
             });
@@ -1243,9 +1263,14 @@ mod tests {
         assert!(prefs.gpu_blending_enabled);
         assert!((prefs.master_volume - 1.0).abs() < 1e-4);
 
+        assert_eq!(prefs.zoom_step_percent, 8.0);
+        assert!(!prefs.hide_titlebar);
+
         let json = serde_json::to_string(&prefs).expect("serialize");
         let parsed: UserPreferences = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.default_fps, prefs.default_fps);
+        assert_eq!(parsed.zoom_step_percent, 8.0);
+        assert!(!parsed.hide_titlebar);
         assert_eq!(parsed.render_cache_ram_mb, prefs.render_cache_ram_mb);
         assert_eq!(parsed.theme_accent_idx, prefs.theme_accent_idx);
         assert_eq!(parsed.proxy_resolution, 1);

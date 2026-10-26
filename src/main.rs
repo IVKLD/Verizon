@@ -35,12 +35,15 @@ fn main() -> Result<(), eframe::Error> {
     // Чистый нативный Wayland бэкенд (никакого X11 / XWayland)
     std::env::set_var("WINIT_UNIX_BACKEND", "wayland");
 
+    let prefs = preferences::UserPreferences::load();
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Verizon NLE - DaVinci Resolve Edition (Zero-Lag)")
+            .with_title("Verizon NLE - DaVinci Resolve Edition")
             .with_inner_size([1600.0, 950.0])
             .with_min_inner_size([1024.0, 600.0])
             .with_active(true)
+            .with_decorations(!prefs.hide_titlebar)
             .with_transparent(false),
         // Нативный Wayland + Vulkan: плавная буферизация без блокировки DRM-композитора при частых обновлениях текстур
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
