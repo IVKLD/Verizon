@@ -256,6 +256,13 @@ impl RenderCacheManager {
         self.generation.fetch_add(1, Ordering::Release);
     }
 
+    /// Установить лимит оперативной памяти для кэша рендера (в мегабайтах)
+    pub fn set_max_memory_mb(&mut self, mb: usize) {
+        // Кадр 720p/1080p ~ 3.68 МБ
+        let frames = (mb as f32 / 3.68).round() as usize;
+        self.max_frames = frames.clamp(30, 10000);
+    }
+
     /// Получить статистику для GUI
     pub fn stats(&self) -> RenderCacheStats {
         let count = self.cached_set.read().map(|s| s.len()).unwrap_or(0);

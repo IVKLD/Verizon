@@ -7,7 +7,7 @@ use crate::inspector::InspectorState;
 use crate::media_page::MediaPageState;
 use crate::media_pool::MediaPoolState;
 use crate::preferences::UserPreferences;
-use crate::theme::{apply_resolve_theme, ResolveColors};
+use crate::theme::ResolveColors;
 use crate::timeline::{TimelineState, Tool};
 use crate::timeline_view::TimelineView;
 use crate::video_decoder::VideoPlayer;
@@ -98,6 +98,7 @@ pub struct NleApp {
     pub waveform_mgr: WaveformManager,
     pub render_cache: crate::render_cache::RenderCacheManager,
     pub preferences: UserPreferences,
+    pub preferences_modal: crate::preferences::PreferencesModalState,
     pub show_preferences_window: bool,
     pub last_frame_time: std::time::Instant,
     pub notification: Option<(String, std::time::Instant)>,
@@ -107,9 +108,8 @@ pub struct NleApp {
 
 impl NleApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        apply_resolve_theme(&cc.egui_ctx);
-
         let prefs = UserPreferences::load();
+        crate::theme::apply_resolve_theme_with_accent(&cc.egui_ctx, prefs.theme_accent_idx);
         cc.egui_ctx.set_zoom_factor(prefs.ui_scale);
 
         let mut app = Self {
@@ -125,6 +125,7 @@ impl NleApp {
             waveform_mgr: WaveformManager::new(),
             render_cache: crate::render_cache::RenderCacheManager::default(),
             preferences: prefs.clone(),
+            preferences_modal: crate::preferences::PreferencesModalState::new(),
             show_preferences_window: false,
             last_frame_time: std::time::Instant::now(),
             notification: None,
@@ -132,8 +133,19 @@ impl NleApp {
         };
 
         app.timeline.snapping_enabled = prefs.snapping_enabled;
+        app.timeline.snapping_threshold_px = prefs.snapping_threshold_px;
         app.timeline.linked_selection = prefs.linked_selection;
         app.timeline.loop_enabled = prefs.loop_enabled;
+        app.timeline.stop_at_timeline_end = prefs.stop_at_timeline_end;
+
+        app.render_cache.mode = match prefs.render_cache_mode {
+            0 => crate::render_cache::RenderCacheMode::None,
+            1 => crate::render_cache::RenderCacheMode::Smart,
+            _ => crate::render_cache::RenderCacheMode::User,
+        };
+        app.render_cache.set_max_memory_mb(prefs.render_cache_ram_mb);
+        app.video_player.drop_frames_enabled = prefs.drop_frames_enabled;
+        app.audio_player.set_master_volume(prefs.master_volume);
 
         // Восстановление сохраненного расположения окон (Dock Layout)
         let dock_path = UserPreferences::dock_layout_path();
@@ -719,8 +731,15 @@ impl NleApp {
                         }
                     }
 
-                    // Правая часть нижнего бара: таймкод проекта (zero-allocation)
+                    // Правая часть нижнего бара: таймкод проекта и кнопка настроек ⚙ как в DaVinci Resolve
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(egui::RichText::new("⚙").size(12.0))
+                            .on_hover_text("Preferences / Настройки DaVinci Resolve [Ctrl+,]")
+                            .clicked()
+                        {
+                            self.show_preferences_window = true;
+                        }
+                        ui.separator();
                         let tc = crate::timecode::Timecode::new(self.timeline.playhead_frame, self.timeline.fps).to_smpte_str();
                         ui.label(
                             egui::RichText::new(&*tc)
@@ -733,104 +752,49 @@ impl NleApp {
             });
     }
 
+    /// Применить новые настройки ко всем подсистемам приложения и сохранить на диск
+    pub fn apply_preferences(&mut self, prefs: UserPreferences, ctx: &Context) {
+        self.preferences = prefs.clone();
+        self.preferences.save();
+
+        crate::theme::apply_resolve_theme_with_accent(ctx, self.preferences.theme_accent_idx);
+        ctx.set_zoom_factor(self.preferences.ui_scale);
+
+        self.timeline.snapping_enabled = self.preferences.snapping_enabled;
+        self.timeline.snapping_threshold_px = self.preferences.snapping_threshold_px;
+        self.timeline.linked_selection = self.preferences.linked_selection;
+        self.timeline.loop_enabled = self.preferences.loop_enabled;
+        self.timeline.stop_at_timeline_end = self.preferences.stop_at_timeline_end;
+
+        self.render_cache.mode = match self.preferences.render_cache_mode {
+            0 => crate::render_cache::RenderCacheMode::None,
+            1 => crate::render_cache::RenderCacheMode::Smart,
+            _ => crate::render_cache::RenderCacheMode::User,
+        };
+        self.render_cache.set_max_memory_mb(self.preferences.render_cache_ram_mb);
+
+        self.video_player.drop_frames_enabled = self.preferences.drop_frames_enabled;
+        self.audio_player.set_master_volume(self.preferences.master_volume);
+
+        self.notification = Some((
+            "✔ Настройки DaVinci Resolve 21 успешно сохранены и применены".to_string(),
+            std::time::Instant::now(),
+        ));
+    }
+
     fn render_preferences_window(&mut self, ctx: &Context) {
         if !self.show_preferences_window {
+            self.preferences_modal.initialized = false;
             return;
         }
 
-        let mut open = self.show_preferences_window;
-        let mut close_clicked = false;
-
-        egui::Window::new("⚙ Настройки (Preferences)")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(480.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.heading(
-                    egui::RichText::new("Масштабирование интерфейса (HiDPI / 4K)")
-                        .color(ResolveColors::ACCENT_ORANGE)
-                        .size(15.0),
-                );
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new("Выберите подходящий масштаб под разрешение вашего экрана:")
-                        .size(12.0)
-                        .color(ResolveColors::TEXT_PRIMARY),
-                );
-                ui.add_space(8.0);
-
-                let current_scale = self.preferences.ui_scale;
-                let mut chosen_scale = current_scale;
-
-                // Быстрые пресеты масштабирования для 1080p, 2K, 4K
-                ui.horizontal_wrapped(|ui| {
-                    let presets = [
-                        (1.0, "100% (FHD 1080p)"),
-                        (1.25, "125% (2K)"),
-                        (1.5, "150% (QHD)"),
-                        (1.75, "175% (3K)"),
-                        (2.0, "200% (4K UHD)"),
-                        (2.5, "250% (4K Ultra)"),
-                    ];
-
-                    for (scale, label) in presets {
-                        let is_active = (current_scale - scale).abs() < 0.02;
-                        let btn = egui::Button::new(label).fill(if is_active {
-                            ResolveColors::ACCENT_ORANGE
-                        } else {
-                            ResolveColors::BG_HEADER
-                        });
-                        if ui.add(btn).clicked() {
-                            chosen_scale = scale;
-                        }
-                    }
-                });
-
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                // Плавный ползунок точной настройки
-                ui.horizontal(|ui| {
-                    ui.label("Точный масштаб:");
-                    ui.add(
-                        egui::Slider::new(&mut chosen_scale, 0.75..=3.5)
-                            .step_by(0.05)
-                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-                    );
-                });
-
-                if (chosen_scale - current_scale).abs() > 0.001 {
-                    self.set_ui_scale(chosen_scale, ctx);
-                }
-
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new("💡 Горячие клавиши масштабирования: Ctrl + / Ctrl - / Ctrl 0")
-                        .size(11.0)
-                        .color(ResolveColors::TEXT_MUTED),
-                );
-
-                ui.add_space(12.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("Сбросить на 100%").clicked() {
-                        self.set_ui_scale(1.0, ctx);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("✔ Закрыть").clicked() {
-                            close_clicked = true;
-                        }
-                    });
-                });
-            });
-
-        if close_clicked {
-            open = false;
+        if !self.preferences_modal.initialized {
+            self.preferences_modal.sync_from_saved(&self.preferences);
         }
-        self.show_preferences_window = open;
+
+        if let Some(applied) = self.preferences_modal.render(ctx, &mut self.show_preferences_window) {
+            self.apply_preferences(applied, ctx);
+        }
     }
 }
 

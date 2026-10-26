@@ -125,6 +125,8 @@ pub struct TimelineState {
 
     pub active_tool: Tool,
     pub snapping_enabled: bool,
+    pub snapping_threshold_px: f32,
+    pub stop_at_timeline_end: bool,
     pub linked_selection: bool, // Связность клипов (Linked Selection Ctrl+Shift+L)
     pub selected_clip_id: Option<u64>,
     pub is_playing: bool,
@@ -210,6 +212,8 @@ impl TimelineState {
             loop_enabled: false,
             active_tool: Tool::Selection,
             snapping_enabled: true,
+            snapping_threshold_px: 10.0,
+            stop_at_timeline_end: true,
             linked_selection: true, // По умолчанию связность включена как в Resolve
             selected_clip_id: None,
             is_playing: false,
@@ -472,7 +476,7 @@ impl TimelineState {
         let mut target_frame = raw_start.max(0);
 
         if self.snapping_enabled {
-            let snap_threshold = (10.0 / self.zoom_factor).max(2.0) as i64;
+            let snap_threshold = (self.snapping_threshold_px / self.zoom_factor).max(2.0) as i64;
 
             // Прилипание к плейхеду
             if (target_frame - self.playhead_frame).abs() <= snap_threshold {
@@ -603,10 +607,12 @@ impl TimelineState {
                     if end_frame > 0 && next >= end_frame {
                         if self.loop_enabled {
                             self.playhead_frame = self.in_point.unwrap_or(0);
-                        } else {
+                        } else if self.stop_at_timeline_end {
                             // ОСТАНОВКА ВОСПРОИЗВЕДЕНИЯ В КОНЦЕ ТАЙМЛАЙНА
                             self.playhead_frame = end_frame;
                             self.is_playing = false;
+                        } else {
+                            self.playhead_frame = next.max(0);
                         }
                     } else {
                         self.playhead_frame = next.max(0);

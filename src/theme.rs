@@ -17,6 +17,10 @@ impl ResolveColors {
     pub const ACCENT_ORANGE_HOVER: Color32 = Color32::from_rgb(0xff, 0x85, 0x3d);
 
     // Дополнительные акцентные цвета Resolve (Fairlight / Cut / Fusion)
+    pub const ACCENT_BLUE: Color32 = Color32::from_rgb(0x2f, 0x7b, 0xe5);
+    pub const ACCENT_BLUE_HOVER: Color32 = Color32::from_rgb(0x4a, 0x90, 0xeb);
+    pub const ACCENT_GOLD: Color32 = Color32::from_rgb(0xf5, 0xa6, 0x23);
+    pub const ACCENT_GOLD_HOVER: Color32 = Color32::from_rgb(0xf7, 0xb8, 0x4f);
 
     // Цвета дорожек и клипов (DaVinci Resolve 21 Color Palette)
     pub const VIDEO_CLIP: Color32 = Color32::from_rgb(0x27, 0x62, 0x97);
@@ -36,8 +40,18 @@ impl ResolveColors {
     pub const VU_RED: Color32 = Color32::from_rgb(0xef, 0x44, 0x44);
 }
 
-/// Применение визуальной темы DaVinci Resolve к egui Context
-pub fn apply_resolve_theme(ctx: &Context) {
+/// Получить цвет акцента по индексу (0: DaVinci Orange, 1: Resolve Blue, 2: Studio Gold)
+pub fn get_accent_colors(idx: usize) -> (Color32, Color32) {
+    match idx {
+        1 => (ResolveColors::ACCENT_BLUE, ResolveColors::ACCENT_BLUE_HOVER),
+        2 => (ResolveColors::ACCENT_GOLD, ResolveColors::ACCENT_GOLD_HOVER),
+        _ => (ResolveColors::ACCENT_ORANGE, ResolveColors::ACCENT_ORANGE_HOVER),
+    }
+}
+
+/// Применение визуальной темы DaVinci Resolve с выбранным акцентным цветом
+pub fn apply_resolve_theme_with_accent(ctx: &Context, accent_idx: usize) {
+    let (accent, accent_hover) = get_accent_colors(accent_idx);
     let mut visuals = Visuals::dark();
 
     // Панели и окна
@@ -60,22 +74,22 @@ pub fn apply_resolve_theme(ctx: &Context) {
 
     // При наведении (Hover)
     visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x2d, 0x30, 0x36);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ResolveColors::ACCENT_ORANGE);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, accent);
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
     visuals.widgets.hovered.corner_radius = CornerRadius::same(2);
 
     // При нажатии / активные
-    visuals.widgets.active.bg_fill = ResolveColors::ACCENT_ORANGE;
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, ResolveColors::ACCENT_ORANGE_HOVER);
+    visuals.widgets.active.bg_fill = accent;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, accent_hover);
     visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
     visuals.widgets.active.corner_radius = CornerRadius::same(2);
 
     // Поля ввода текста
     visuals.widgets.open.bg_fill = ResolveColors::BG_INPUT;
-    visuals.widgets.open.bg_stroke = Stroke::new(1.0, ResolveColors::ACCENT_ORANGE);
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0, accent);
 
-    visuals.selection.bg_fill = ResolveColors::ACCENT_ORANGE.gamma_multiply(0.4);
-    visuals.selection.stroke = Stroke::new(1.0, ResolveColors::ACCENT_ORANGE);
+    visuals.selection.bg_fill = accent.gamma_multiply(0.4);
+    visuals.selection.stroke = Stroke::new(1.0, accent);
 
     ctx.set_visuals(visuals);
 }

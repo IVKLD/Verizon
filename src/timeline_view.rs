@@ -352,7 +352,7 @@ impl TimelineView {
 
                     // Магнитное прилипание лезвия к плейхеду и границам клипов
                     if timeline.snapping_enabled {
-                        let snap_thresh = (12.0 / timeline.zoom_factor).max(2.0) as i64;
+                        let snap_thresh = (timeline.snapping_threshold_px / timeline.zoom_factor).max(2.0) as i64;
                         if (cut_frame - timeline.playhead_frame).abs() <= snap_thresh {
                             cut_frame = timeline.playhead_frame;
                             cut_x = canvas_rect.min.x + (cut_frame as f32 * timeline.zoom_factor) - timeline.scroll_x;
@@ -430,7 +430,7 @@ impl TimelineView {
                     // Прилипание при сбросе
                     let mut drop_frame = raw_frame;
                     if timeline.snapping_enabled {
-                        let snap_thresh = (12.0 / timeline.zoom_factor) as i64;
+                        let snap_thresh = (timeline.snapping_threshold_px / timeline.zoom_factor).max(2.0) as i64;
                         if (raw_frame - timeline.playhead_frame).abs() <= snap_thresh {
                             drop_frame = timeline.playhead_frame;
                         }

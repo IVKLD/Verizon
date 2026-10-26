@@ -205,6 +205,16 @@ impl AudioPlayer {
         }
     }
 
+    /// Установить уровень мастер-громкости аппаратного вывода (0.0..=2.0)
+    pub fn set_master_volume(&self, vol: f32) {
+        self.engine.volume_bits.store(vol.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Получить текущий уровень мастер-громкости
+    pub fn get_master_volume(&self) -> f32 {
+        f32::from_bits(self.engine.volume_bits.load(Ordering::Relaxed))
+    }
+
     fn init_cpal_stream(
         engine: Arc<AudioEngineState>,
         vu_l: Arc<AtomicU32>,
@@ -1010,5 +1020,17 @@ mod tests {
         println!("Real hardware CPAL VU levels after 300ms: L={:.4}, R={:.4}", vu_l, vu_r);
         assert!(vu_l > 0.001 || vu_r > 0.001, "Real CPAL callback must process audio samples and generate non-zero VU!");
         player.sync_playhead_frame(0, 60, false);
+    }
+
+    #[test]
+    fn test_audio_player_master_volume_control() {
+        let player = AudioPlayer::new();
+        assert!((player.get_master_volume() - 1.0).abs() < 1e-4);
+
+        player.set_master_volume(0.75);
+        assert!((player.get_master_volume() - 0.75).abs() < 1e-4);
+
+        player.set_master_volume(1.5);
+        assert!((player.get_master_volume() - 1.5).abs() < 1e-4);
     }
 }
