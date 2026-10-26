@@ -351,9 +351,20 @@ impl BackgroundCacheEngine {
         let Ok(mut decoder) = context_decoder.decoder().video() else { return; };
 
         let first_src = frames[0].0;
-        let ts_sec = (first_src as f64 / source_fps.max(1.0)).max(0.0);
-        let ts_tb = (ts_sec * (time_base.denominator() as f64) / (time_base.numerator() as f64).max(1.0)).round() as i64;
-        let _ = ictx.seek(ts_tb, ..ts_tb);
+        let time_base_f = time_base.numerator() as f64 / time_base.denominator() as f64;
+        let target_pts = if time_base_f > 0.0 {
+            (first_src as f64 / source_fps.max(1.0) / time_base_f).round() as i64
+        } else {
+            first_src
+        };
+        unsafe {
+            ffmpeg_next::ffi::av_seek_frame(
+                ictx.as_mut_ptr(),
+                stream_idx as i32,
+                target_pts,
+                ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
+            );
+        }
         decoder.flush();
 
         let orig_w = decoder.width();
@@ -380,12 +391,20 @@ impl BackgroundCacheEngine {
         }
 
         let mut cached_count = 0;
+        let mut waiting_for_keyframe = true;
         for (stream, packet) in ictx.packets() {
             if cancel_flag.load(Ordering::Acquire) {
                 break;
             }
             if stream.index() != stream_idx {
                 continue;
+            }
+            if waiting_for_keyframe {
+                if packet.is_key() {
+                    waiting_for_keyframe = false;
+                } else {
+                    continue;
+                }
             }
 
             if decoder.send_packet(&packet).is_ok() {
@@ -394,10 +413,24 @@ impl BackgroundCacheEngine {
                         return;
                     }
                     let pts = decoded_frame.pts().unwrap_or(0);
-                    let frame_secs = pts as f64 * (time_base.numerator() as f64) / (time_base.denominator() as f64).max(1.0);
-                    let cur_src_f = (frame_secs * source_fps).round() as i64;
+                    let cur_src_f = if time_base_f > 0.0 {
+                        (pts as f64 * time_base_f * source_fps).round() as i64
+                    } else {
+                        pts
+                    };
 
-                    if let Some(&(tl_f, sig)) = target_map.get(&cur_src_f) {
+                    let matched_key = if target_map.contains_key(&cur_src_f) {
+                        Some(cur_src_f)
+                    } else if target_map.contains_key(&(cur_src_f - 1)) {
+                        Some(cur_src_f - 1)
+                    } else if target_map.contains_key(&(cur_src_f + 1)) {
+                        Some(cur_src_f + 1)
+                    } else {
+                        None
+                    };
+
+                    if let Some(key) = matched_key {
+                        let (tl_f, sig) = target_map.remove(&key).unwrap();
                         if scaler.run(&decoded_frame, &mut rgb_frame).is_ok() {
                             let data = rgb_frame.data(0);
                             let stride = rgb_frame.stride(0);
@@ -415,7 +448,6 @@ impl BackgroundCacheEngine {
                             );
                             cache.insert(tl_f, Arc::new(color_img), sig);
                             cached_count += 1;
-                            target_map.remove(&cur_src_f);
                         }
                     }
 
@@ -423,6 +455,58 @@ impl BackgroundCacheEngine {
                         egui_ctx.request_repaint();
                         return;
                     }
+                }
+            }
+        }
+
+        // Дренируем буфер декодера до EOF, чтобы не терялись хвостовые кадры
+        if !target_map.is_empty() && !cancel_flag.load(Ordering::Acquire) {
+            let _ = decoder.send_eof();
+            while decoder.receive_frame(&mut decoded_frame).is_ok() {
+                if cancel_flag.load(Ordering::Acquire) {
+                    return;
+                }
+                let pts = decoded_frame.pts().unwrap_or(0);
+                let cur_src_f = if time_base_f > 0.0 {
+                    (pts as f64 * time_base_f * source_fps).round() as i64
+                } else {
+                    pts
+                };
+
+                let matched_key = if target_map.contains_key(&cur_src_f) {
+                    Some(cur_src_f)
+                } else if target_map.contains_key(&(cur_src_f - 1)) {
+                    Some(cur_src_f - 1)
+                } else if target_map.contains_key(&(cur_src_f + 1)) {
+                    Some(cur_src_f + 1)
+                } else {
+                    None
+                };
+
+                if let Some(key) = matched_key {
+                    let (tl_f, sig) = target_map.remove(&key).unwrap();
+                    if scaler.run(&decoded_frame, &mut rgb_frame).is_ok() {
+                        let data = rgb_frame.data(0);
+                        let stride = rgb_frame.stride(0);
+                        let mut pixels = Vec::with_capacity((scaled_w * scaled_h * 4) as usize);
+                        for row in 0..scaled_h as usize {
+                            let start = row * stride;
+                            let end = start + (scaled_w as usize * 4);
+                            if end <= data.len() {
+                                pixels.extend_from_slice(&data[start..end]);
+                            }
+                        }
+                        let color_img = ColorImage::from_rgba_unmultiplied(
+                            [scaled_w as usize, scaled_h as usize],
+                            &pixels,
+                        );
+                        cache.insert(tl_f, Arc::new(color_img), sig);
+                        cached_count += 1;
+                    }
+                }
+
+                if target_map.is_empty() {
+                    break;
                 }
             }
         }

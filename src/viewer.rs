@@ -169,14 +169,17 @@ impl ViewerState {
                 let is_same_file = clip.source_path.as_deref() == video_player.current_path.as_deref();
                 if is_same_file {
                     let expected_src = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
-                    if cached_img.is_none() && video_player.last_decoded_frame == expected_src {
+                    if cached_img.is_none()
+                        && (video_player.last_decoded_frame == expected_src
+                            || video_player.last_exact_frame == expected_src)
+                    {
                         if let Some(ref img) = video_player.last_displayed_image {
                             render_cache.insert(timeline.playhead_frame, std::sync::Arc::clone(img), current_sig);
                         }
                     }
                     for (src_f, img) in video_player.newly_cached_frames.drain(..) {
                         let tl_f = clip.timeline_frame_from_source(src_f, timeline.fps);
-                        if clip.contains_frame(tl_f) && clip.source_frame_from_timeline(tl_f, timeline.fps) == src_f {
+                        if clip.contains_frame(tl_f) {
                             let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
                             render_cache.insert(tl_f, img, sig);
                         }
@@ -536,28 +539,121 @@ impl ViewerState {
                     painter.image(tex.id(), video_box_rect, uv, tint);
                 }
 
-                // Интерактивная рамка трансформации (Transform Overlay как в Resolve)
+                // Интерактивная рамка трансформации (Transform Overlay как в DaVinci Resolve)
                 if self.show_transform_overlay {
+                    // Контур рамки клипа
                     painter.rect_stroke(
                         video_box_rect,
                         CornerRadius::ZERO,
                         Stroke::new(1.5, ResolveColors::ACCENT_ORANGE),
                         StrokeKind::Inside,
                     );
-                    // 4 угловые точки управления
-                    let handle_sz = 6.0;
-                    let corners = [
-                        video_box_rect.left_top(),
-                        video_box_rect.right_top(),
-                        video_box_rect.left_bottom(),
-                        video_box_rect.right_bottom(),
-                    ];
-                    for c in corners {
-                        painter.rect_filled(
-                            Rect::from_center_size(c, vec2(handle_sz, handle_sz)),
-                            CornerRadius::ZERO,
-                            ResolveColors::ACCENT_ORANGE,
-                        );
+
+                    // Центральная точка привязки (Anchor Point с перекрестием)
+                    let c_pos = video_box_rect.center();
+                    painter.circle_stroke(c_pos, 5.0, Stroke::new(1.5, ResolveColors::ACCENT_ORANGE));
+                    painter.line_segment([pos2(c_pos.x - 7.0, c_pos.y), pos2(c_pos.x + 7.0, c_pos.y)], Stroke::new(1.5, ResolveColors::ACCENT_ORANGE));
+                    painter.line_segment([pos2(c_pos.x, c_pos.y - 7.0), pos2(c_pos.x, c_pos.y + 7.0)], Stroke::new(1.5, ResolveColors::ACCENT_ORANGE));
+
+                    // 8 интерактивных ручек управления (4 угла + 4 середины сторон)
+                    let handle_sz = 9.0;
+                    let h_lt = Rect::from_center_size(video_box_rect.left_top(), vec2(handle_sz, handle_sz));
+                    let h_rt = Rect::from_center_size(video_box_rect.right_top(), vec2(handle_sz, handle_sz));
+                    let h_lb = Rect::from_center_size(video_box_rect.left_bottom(), vec2(handle_sz, handle_sz));
+                    let h_rb = Rect::from_center_size(video_box_rect.right_bottom(), vec2(handle_sz, handle_sz));
+
+                    let h_tc = Rect::from_center_size(pos2(video_box_rect.center().x, video_box_rect.min.y), vec2(handle_sz, handle_sz));
+                    let h_bc = Rect::from_center_size(pos2(video_box_rect.center().x, video_box_rect.max.y), vec2(handle_sz, handle_sz));
+                    let h_lc = Rect::from_center_size(pos2(video_box_rect.min.x, video_box_rect.center().y), vec2(handle_sz, handle_sz));
+                    let h_rc = Rect::from_center_size(pos2(video_box_rect.max.x, video_box_rect.center().y), vec2(handle_sz, handle_sz));
+
+                    let resp_lt = ui.interact(h_lt, ui.id().with("tr_lt"), egui::Sense::drag());
+                    let resp_rt = ui.interact(h_rt, ui.id().with("tr_rt"), egui::Sense::drag());
+                    let resp_lb = ui.interact(h_lb, ui.id().with("tr_lb"), egui::Sense::drag());
+                    let resp_rb = ui.interact(h_rb, ui.id().with("tr_rb"), egui::Sense::drag());
+                    let resp_tc = ui.interact(h_tc, ui.id().with("tr_tc"), egui::Sense::drag());
+                    let resp_bc = ui.interact(h_bc, ui.id().with("tr_bc"), egui::Sense::drag());
+                    let resp_lc = ui.interact(h_lc, ui.id().with("tr_lc"), egui::Sense::drag());
+                    let resp_rc = ui.interact(h_rc, ui.id().with("tr_rc"), egui::Sense::drag());
+
+                    let any_handle_active = resp_lt.hovered() || resp_rt.hovered() || resp_lb.hovered() || resp_rb.hovered()
+                        || resp_tc.hovered() || resp_bc.hovered() || resp_lc.hovered() || resp_rc.hovered()
+                        || resp_lt.dragged() || resp_rt.dragged() || resp_lb.dragged() || resp_rb.dragged()
+                        || resp_tc.dragged() || resp_bc.dragged() || resp_lc.dragged() || resp_rc.dragged();
+
+                    let body_resp = ui.interact(video_box_rect, ui.id().with("tr_body"), egui::Sense::drag());
+
+                    // Адаптивные курсоры мыши
+                    if resp_lt.hovered() || resp_rb.hovered() {
+                        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeNorthWest);
+                    } else if resp_rt.hovered() || resp_lb.hovered() {
+                        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeNorthEast);
+                    } else if resp_tc.hovered() || resp_bc.hovered() {
+                        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeVertical);
+                    } else if resp_lc.hovered() || resp_rc.hovered() {
+                        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
+                    } else if body_resp.hovered() && !any_handle_active {
+                        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
+                    }
+                    if body_resp.dragged() && !any_handle_active {
+                        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
+                    }
+
+                    // Обработка интерактивного изменения положения и масштаба клипа
+                    let mut clip_mutated = false;
+                    let top_clip_id = top_clip.id;
+
+                    if let Some(target_clip) = timeline.clips.iter_mut().find(|c| c.id == top_clip_id) {
+                        if body_resp.dragged() && !any_handle_active {
+                            let delta = body_resp.drag_delta();
+                            // Перемещение (Position X, Y)
+                            target_clip.position_x += delta.x * 5.0;
+                            target_clip.position_y += delta.y * 5.0;
+                            clip_mutated = true;
+                        } else if resp_rb.dragged() || resp_lt.dragged() || resp_rt.dragged() || resp_lb.dragged() {
+                            let delta = if resp_rb.dragged() {
+                                resp_rb.drag_delta()
+                            } else if resp_lt.dragged() {
+                                -resp_lt.drag_delta()
+                            } else if resp_rt.dragged() {
+                                vec2(resp_rt.drag_delta().x, -resp_rt.drag_delta().y)
+                            } else {
+                                vec2(-resp_lb.drag_delta().x, resp_lb.drag_delta().y)
+                            };
+                            let zoom_delta = (delta.x / (video_w * monitor_scale).max(1.0) + delta.y / (video_h * monitor_scale).max(1.0)) * 1.5;
+                            target_clip.zoom_x = (target_clip.zoom_x + zoom_delta).clamp(0.05, 10.0);
+                            target_clip.zoom_y = (target_clip.zoom_y + zoom_delta).clamp(0.05, 10.0);
+                            clip_mutated = true;
+                        } else if resp_rc.dragged() || resp_lc.dragged() {
+                            let dx = if resp_rc.dragged() { resp_rc.drag_delta().x } else { -resp_lc.drag_delta().x };
+                            let zoom_delta = (dx / (video_w * monitor_scale).max(1.0)) * 2.0;
+                            target_clip.zoom_x = (target_clip.zoom_x + zoom_delta).clamp(0.05, 10.0);
+                            clip_mutated = true;
+                        } else if resp_bc.dragged() || resp_tc.dragged() {
+                            let dy = if resp_bc.dragged() { resp_bc.drag_delta().y } else { -resp_tc.drag_delta().y };
+                            let zoom_delta = (dy / (video_h * monitor_scale).max(1.0)) * 2.0;
+                            target_clip.zoom_y = (target_clip.zoom_y + zoom_delta).clamp(0.05, 10.0);
+                            clip_mutated = true;
+                        }
+                    }
+
+                    if clip_mutated {
+                        timeline.structure_dirty = true;
+                        ui.ctx().request_repaint();
+                    }
+
+                    // Отрисовка ручек поверх рамки
+                    for (h_rect, resp) in [
+                        (h_lt, &resp_lt), (h_rt, &resp_rt), (h_lb, &resp_lb), (h_rb, &resp_rb),
+                        (h_tc, &resp_tc), (h_bc, &resp_bc), (h_lc, &resp_lc), (h_rc, &resp_rc),
+                    ] {
+                        let fill = if resp.hovered() || resp.dragged() {
+                            Color32::WHITE
+                        } else {
+                            ResolveColors::ACCENT_ORANGE
+                        };
+                        painter.rect_filled(h_rect, CornerRadius::same(1), fill);
+                        painter.rect_stroke(h_rect, CornerRadius::same(1), Stroke::new(1.0, Color32::BLACK), StrokeKind::Inside);
                     }
                 }
             } else {

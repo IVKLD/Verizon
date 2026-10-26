@@ -35,8 +35,8 @@ pub struct VideoPlayer {
     pub gpu_badge: String,
 
     // Неблокирующие каналы общения с фоновым потоком декодера
-    command_tx: Option<std::sync::mpsc::Sender<DecoderCommand>>,
-    frame_rx: Option<std::sync::mpsc::Receiver<(u64, i64, ColorImage)>>,
+    pub(crate) command_tx: Option<std::sync::mpsc::Sender<DecoderCommand>>,
+    pub(crate) frame_rx: Option<std::sync::mpsc::Receiver<(u64, i64, ColorImage)>>,
     worker_handle: Option<std::thread::JoinHandle<()>>,
     pub frame_queue: VecDeque<(i64, Arc<ColorImage>)>,
     pub scrub_cache: VecDeque<(i64, Arc<ColorImage>)>,
@@ -152,7 +152,7 @@ impl VideoPlayer {
             last_decoded_frame: -1,
             last_exact_frame: -1,
             last_playback_target: -1,
-            current_epoch: 1,
+            current_epoch: 0,
             last_displayed_epoch: 0,
             gpu_accelerated: true,
             gpu_device_name: "Vulkan (wgpu) + Multi-Threaded Engine".to_string(),
@@ -967,19 +967,23 @@ impl VideoPlayer {
             let now = std::time::Instant::now();
             let elapsed = now.duration_since(self.last_request_time).as_millis();
             if let Some(dist) = self.try_apply_scrub_cache(target_frame, 45, ctx) {
-                if dist == 0 || (dist <= 15 && elapsed < 90) {
+                if dist == 0 {
                     self.last_playback_target = target_frame;
+                    self.last_exact_frame = target_frame;
                     return;
                 }
-            }
-            if target_frame == self.last_playback_target && self.texture.is_some() {
-                return;
+                // Если dist > 0, мы показали ближайший кадр из скраб-кэша для мгновенного отклика (Zero-Lag),
+                // но точный целевой кадр target_frame обязан быть декодирован и отправлен в Render Cache!
             }
             let prev_delivered = self.last_displayed_epoch >= self.current_epoch;
-            // Обратное давление: новый аппаратный запрос к /dev/dri/renderD128 уходит только после доставки
-            // предыдущего (не чаще ~12 Hz). Каждый Seek декодирует GOP от ключевого кадра, и очередь запросов
-            // забивает VCN/DRM, из-за чего подвисает вся система (в т.ч. YouTube в браузере).
-            if (prev_delivered && elapsed >= SCRUB_MIN_REQUEST_INTERVAL_MS) || elapsed >= SCRUB_STALL_TIMEOUT_MS || target_frame == 0 {
+            let is_target_in_flight = target_frame == self.last_playback_target && !prev_delivered;
+            if is_target_in_flight && elapsed < SCRUB_STALL_TIMEOUT_MS {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                return;
+            }
+
+            // Обратное давление: аппаратный запрос уходит, когда предыдущий готов или истек интервал скраббинга
+            if prev_delivered || elapsed >= SCRUB_MIN_REQUEST_INTERVAL_MS || target_frame == 0 {
                 self.last_request_time = now;
                 self.last_playback_target = target_frame;
                 self.current_epoch = self.current_epoch.wrapping_add(1);
@@ -989,6 +993,7 @@ impl VideoPlayer {
                         epoch: self.current_epoch,
                     });
                 }
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
             } else {
                 // Гарантируем повторную попытку после паузы лимитера, чтобы финальный кадр скраббинга не потерялся
                 let wait_ms = SCRUB_MIN_REQUEST_INTERVAL_MS.saturating_sub(elapsed).max(1) as u64;

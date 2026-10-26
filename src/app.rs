@@ -940,45 +940,103 @@ impl eframe::App for NleApp {
         }
 
         // Отслеживание активности пользователя для фонового Smart Cache в режиме ожидания (Idle)
-        let user_interacted = ctx.input(|i| {
-            i.pointer.any_down()
-                || i.pointer.delta() != egui::Vec2::ZERO
-                || !i.raw.events.is_empty()
-        }) || self.timeline.is_playing || self.timeline.is_scrubbing;
+        let user_busy = self.timeline.is_playing
+            || self.timeline.is_scrubbing
+            || ctx.input(|i| i.pointer.any_down() || i.pointer.any_pressed());
 
-        if user_interacted {
+        if user_busy {
             self.last_user_activity = std::time::Instant::now();
             self.bg_cache_engine.cancel();
         } else if self.render_cache.mode == crate::render_cache::RenderCacheMode::Smart
             && self.last_user_activity.elapsed().as_secs_f32() >= self.preferences.auto_cache_idle_secs
             && !self.bg_cache_engine.is_busy()
         {
-            'find_uncached: for clip in &self.timeline.clips {
-                if clip.is_audio || clip.is_disabled {
-                    continue;
-                }
-                let Some(ref path) = clip.source_path else { continue; };
-                let mut uncached_batch = Vec::new();
-                for tl_f in clip.start_frame..clip.end_frame() {
-                    if !self.render_cache.is_cached(tl_f) {
-                        let src_f = clip.source_frame_from_timeline(tl_f, self.timeline.fps);
-                        let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(&self.timeline, tl_f);
-                        uncached_batch.push((src_f, tl_f, sig));
-                        if uncached_batch.len() >= 48 {
-                            break;
+            // DaVinci Smart Cache: приоритизируем кэширование вокруг текущего положения курсора (плейхеда)!
+            let cur_playhead = self.timeline.playhead_frame;
+            let mut uncached_batch = Vec::new();
+            let mut chosen_path = None;
+            let mut chosen_fps = 60.0;
+
+            // 1) Сначала ищем клип под плейхедом и кэшируем вперед от плейхеда
+            if let Some(clip) = self.timeline.active_video_clip_at(cur_playhead) {
+                if !clip.is_disabled {
+                    if let Some(ref path) = clip.source_path {
+                        for tl_f in cur_playhead..clip.end_frame() {
+                            if !self.render_cache.is_cached(tl_f) {
+                                let src_f = clip.source_frame_from_timeline(tl_f, self.timeline.fps);
+                                let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(&self.timeline, tl_f);
+                                uncached_batch.push((src_f, tl_f, sig));
+                                if uncached_batch.len() >= 48 {
+                                    break;
+                                }
+                            }
+                        }
+                        if !uncached_batch.is_empty() {
+                            chosen_path = Some(path.clone());
+                            chosen_fps = clip.source_fps;
                         }
                     }
                 }
-                if !uncached_batch.is_empty() {
-                    self.bg_cache_engine.request_cache_batch(
-                        path.clone(),
-                        uncached_batch,
-                        clip.source_fps,
-                        self.render_cache.clone(),
-                        ctx.clone(),
-                    );
-                    break 'find_uncached;
+            }
+
+            // 2) Если впереди от плейхеда всё закэшировано — ищем в клипе под плейхедом назад
+            if uncached_batch.is_empty() {
+                if let Some(clip) = self.timeline.active_video_clip_at(cur_playhead) {
+                    if !clip.is_disabled {
+                        if let Some(ref path) = clip.source_path {
+                            for tl_f in (clip.start_frame..cur_playhead).rev() {
+                                if !self.render_cache.is_cached(tl_f) {
+                                    let src_f = clip.source_frame_from_timeline(tl_f, self.timeline.fps);
+                                    let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(&self.timeline, tl_f);
+                                    uncached_batch.push((src_f, tl_f, sig));
+                                    if uncached_batch.len() >= 48 {
+                                        break;
+                                    }
+                                }
+                            }
+                            if !uncached_batch.is_empty() {
+                                uncached_batch.reverse();
+                                chosen_path = Some(path.clone());
+                                chosen_fps = clip.source_fps;
+                            }
+                        }
+                    }
                 }
+            }
+
+            // 3) Если под плейхедом всё закэшировано — ищем любой другой клип с красными сегментами
+            if uncached_batch.is_empty() {
+                'find_any: for clip in &self.timeline.clips {
+                    if clip.is_audio || clip.is_disabled {
+                        continue;
+                    }
+                    let Some(ref path) = clip.source_path else { continue; };
+                    for tl_f in clip.start_frame..clip.end_frame() {
+                        if !self.render_cache.is_cached(tl_f) {
+                            let src_f = clip.source_frame_from_timeline(tl_f, self.timeline.fps);
+                            let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(&self.timeline, tl_f);
+                            uncached_batch.push((src_f, tl_f, sig));
+                            if uncached_batch.len() >= 48 {
+                                break;
+                            }
+                        }
+                    }
+                    if !uncached_batch.is_empty() {
+                        chosen_path = Some(path.clone());
+                        chosen_fps = clip.source_fps;
+                        break 'find_any;
+                    }
+                }
+            }
+
+            if let (Some(path), false) = (chosen_path, uncached_batch.is_empty()) {
+                self.bg_cache_engine.request_cache_batch(
+                    path,
+                    uncached_batch,
+                    chosen_fps,
+                    self.render_cache.clone(),
+                    ctx.clone(),
+                );
             }
         }
 

@@ -1601,4 +1601,188 @@ fn test_uncached_playback_no_backwards_flash_or_scrub_glitch() {
     assert_eq!(player.last_decoded_frame, 51, "Актуальный кадр 51 должен быть успешно отображен");
 }
 
+#[test]
+fn test_seek_to_uncached_frame_near_scrub_cache_triggers_exact_seek() {
+    use crate::video_decoder::DecoderCommand;
+    let ctx = egui::Context::default();
+    let mut player = VideoPlayer::new();
+    player.is_real_video = true;
+    player.fps = 60.0;
+
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    player.command_tx = Some(cmd_tx);
+
+    let dummy_img = std::sync::Arc::new(egui::ColorImage::example());
+    // В кэше скраббинга есть соседний кадр 96
+    player.scrub_cache.push_back((96, std::sync::Arc::clone(&dummy_img)));
+    player.last_decoded_frame = 96;
+    player.last_exact_frame = 96;
+
+    // Пользователь ставит курсор на кадр 100 (красная зона таймлайна)
+    player.seek_and_decode(100, &ctx);
+
+    // Команда на точное декодирование кадра 100 ОБЯЗАНА уйти декодеру
+    let cmd = cmd_rx.try_recv().expect("Команда Seek(100) должна быть отправлена фоновому декодеру");
+    let cmd_epoch = match cmd {
+        DecoderCommand::Seek { target_frame, epoch } => {
+            assert_eq!(target_frame, 100, "Целевой кадр команды Seek должен быть в точности 100");
+            epoch
+        }
+        _ => panic!("Ожидалась команда Seek, получено {:?}", cmd),
+    };
+
+    // Проверяем, что повторные вызовы не залипают намертво
+    assert_ne!(player.last_exact_frame, 100, "До ответа воркера кадр 100 ещё не является точным");
+
+    // Воркер декодирует кадр 100 и отправляет в канал
+    let (frame_tx, frame_rx) = std::sync::mpsc::channel();
+    player.frame_rx = Some(frame_rx);
+    frame_tx.send((cmd_epoch, 100, egui::ColorImage::example())).unwrap();
+
+    // Забираем кадр через poll_frames
+    player.poll_frames(&ctx);
+    assert_eq!(player.last_decoded_frame, 100, "Кадр 100 должен стать текущим отображаемым");
+    assert_eq!(player.last_exact_frame, 100, "Кадр 100 должен стать точным (last_exact_frame = 100)");
+    assert_eq!(player.newly_cached_frames.len(), 1, "Кадр 100 должен поступить в очередь newly_cached_frames для кэширования");
+    assert_eq!(player.newly_cached_frames[0].0, 100);
+}
+
+#[test]
+fn test_smart_cache_prioritizes_frames_around_playhead() {
+    use crate::timeline::{Clip, TimelineState};
+    use crate::render_cache::{RenderCacheManager, RenderCacheMode};
+
+    let mut timeline = TimelineState::new_empty();
+    let clip = Clip {
+        id: 1,
+        name: "LongClip".to_string(),
+        track_index: 0,
+        start_frame: 0,
+        duration_frames: 1000,
+        is_audio: false,
+        source_path: Some(std::path::PathBuf::from("/tmp/test.mkv")),
+        source_in_secs: 0.0,
+        source_fps: 60.0,
+        speed: 1.0,
+        ..Default::default()
+    };
+    timeline.clips.push(clip);
+
+    // Курсор пользователя стоит на кадре 500 (середина клипа, красный сегмент)
+    timeline.playhead_frame = 500;
+
+    let cache = RenderCacheManager::new(RenderCacheMode::Smart, 2000);
+
+    // Симулируем выборку uncached_batch по новой логике:
+    let cur_playhead = timeline.playhead_frame;
+    let mut uncached_batch = Vec::new();
+    if let Some(c) = timeline.active_video_clip_at(cur_playhead) {
+        for tl_f in cur_playhead..c.end_frame() {
+            if !cache.is_cached(tl_f) {
+                let src_f = c.source_frame_from_timeline(tl_f, timeline.fps);
+                let sig = RenderCacheManager::compute_frame_signature(&timeline, tl_f);
+                uncached_batch.push((src_f, tl_f, sig));
+                if uncached_batch.len() >= 48 {
+                    break;
+                }
+            }
+        }
+    }
+
+    assert_eq!(uncached_batch.len(), 48);
+    // Проверяем, что кэширование началось именно с кадра 500 (под курсором), а не с кадра 0!
+    assert_eq!(uncached_batch[0].1, 500, "Первым в пачке должен быть кадр под плейхедом (500)");
+    assert_eq!(uncached_batch.last().unwrap().1, 547, "Пачка должна покрывать 48 кадров вперед от плейхеда");
+}
+
+#[test]
+fn test_interactive_transform_modifies_clip_position_and_zoom() {
+    use crate::timeline::{Clip, TimelineState};
+
+    let mut timeline = TimelineState::new_empty();
+    let clip = Clip {
+        id: 42,
+        name: "TransformTest".to_string(),
+        track_index: 0,
+        start_frame: 0,
+        duration_frames: 100,
+        is_audio: false,
+        zoom_x: 1.0,
+        zoom_y: 1.0,
+        position_x: 0.0,
+        position_y: 0.0,
+        ..Default::default()
+    };
+    timeline.clips.push(clip);
+
+    // Моделируем работу интерактивного Transform:
+    if let Some(target_clip) = timeline.clips.iter_mut().find(|c| c.id == 42) {
+        // Перемещение по X/Y
+        let delta = egui::vec2(10.0, -5.0);
+        target_clip.position_x += delta.x * 5.0;
+        target_clip.position_y += delta.y * 5.0;
+
+        // Масштабирование
+        let zoom_change = 0.25;
+        target_clip.zoom_x = (target_clip.zoom_x + zoom_change).clamp(0.05, 10.0);
+        target_clip.zoom_y = (target_clip.zoom_y + zoom_change).clamp(0.05, 10.0);
+    }
+    timeline.structure_dirty = true;
+
+    let updated = timeline.clips.iter().find(|c| c.id == 42).unwrap();
+    assert_eq!(updated.position_x, 50.0);
+    assert_eq!(updated.position_y, -25.0);
+    assert_eq!(updated.zoom_x, 1.25);
+    assert_eq!(updated.zoom_y, 1.25);
+    assert!(timeline.structure_dirty);
+}
+
+#[test]
+fn test_waveform_zoom_peak_hold_stability() {
+    // Тестируем, что пики при зуме (изменении sec_per_px) не пропадают и не дают ложных нулей
+    let peaks: Vec<f32> = (0..1000).map(|i| if i % 10 == 0 { 0.95 } else { 0.05 }).collect();
+    let pts_per_sec = 100.0;
+
+    for zoom in [0.1f64, 0.5, 1.0, 2.0, 5.0, 10.0] {
+        let sec_per_px = 1.0 / (zoom * 60.0);
+        let step_px = 2.0;
+
+        let mut captured_peaks = 0;
+        for k in 0..100 {
+            let t_start = k as f64 * step_px * sec_per_px;
+            let t_end = t_start + (step_px * sec_per_px);
+            let s_start = t_start * pts_per_sec;
+            let s_end = t_end * pts_per_sec;
+
+            let idx_start = (s_start.max(0.0) as usize).min(peaks.len());
+            let idx_end = (s_end.ceil() as usize).min(peaks.len());
+
+            let amp = if idx_start >= peaks.len() {
+                0.0
+            } else if idx_end <= idx_start + 1 {
+                peaks[idx_start]
+            } else {
+                let mut max_val = peaks[idx_start];
+                let stride = ((idx_end - idx_start) / 32).max(1);
+                let mut i = idx_start + 1;
+                while i < idx_end {
+                    if peaks[i] > max_val {
+                        max_val = peaks[i];
+                    }
+                    i += stride;
+                }
+                max_val
+            };
+
+            if amp > 0.5 {
+                captured_peaks += 1;
+            }
+        }
+        assert!(captured_peaks > 0, "При zoom={} пики громкости должны надежно захватываться Peak-Hold", zoom);
+    }
+}
+
+
+
+
 

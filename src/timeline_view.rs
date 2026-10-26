@@ -1349,10 +1349,8 @@ impl TimelineView {
                 if let Some(path) = &clip.source_path {
                     if let Some(peaks) = waveform_mgr.get_waveform_stream(path, clip.source_audio_stream) {
                         let pts_per_sec = 100.0;
-                        let sec_per_px = 1.0 / (timeline.zoom_factor * timeline.fps as f32);
-                        let pts_per_px = pts_per_sec * sec_per_px as f64;
+                        let sec_per_px = 1.0 / (timeline.zoom_factor * timeline.fps as f32) as f64;
                         let step_px: f32 = 2.0;
-                        let sample_step = step_px as f64 * pts_per_px;
 
                         // Привязываем сетку полос жестко к началу клипа rect.min.x,
                         // чтобы при горизонтальном скролле волна монолитно и плавно двигалась с клипом без дёргания
@@ -1363,7 +1361,7 @@ impl TimelineView {
                         };
 
                         let mut x = rect.min.x + (first_k as f32 * step_px);
-                        let mut sample_float = (clip.source_in_secs + (first_k as f32 * step_px * sec_per_px) as f64) * pts_per_sec;
+                        let mut k = first_k;
 
                         let num_steps = (((visible_end_x - x).max(0.0) / step_px).ceil() as usize + 2).max(1);
                         let mut mesh = egui::Mesh::default();
@@ -1375,15 +1373,45 @@ impl TimelineView {
                         let peaks_slice = peaks.as_slice();
                         let peaks_len = peaks_slice.len();
 
-                        while x < visible_end_x {
-                            let sample_idx = sample_float as usize;
-                            sample_float += sample_step;
+                        // Коэффициент усиления клипа в линейной шкале
+                        let gain = if clip.volume_db != 0.0 {
+                            10.0f32.powf(clip.volume_db / 20.0)
+                        } else {
+                            1.0
+                        };
 
-                            let amp = if sample_idx < peaks_len {
-                                peaks_slice[sample_idx]
-                            } else {
+                        while x < visible_end_x {
+                            let t_start = clip.source_in_secs + (k as f64 * step_px as f64 * sec_per_px);
+                            let t_end = t_start + (step_px as f64 * sec_per_px);
+                            let s_start = t_start * pts_per_sec;
+                            let s_end = t_end * pts_per_sec;
+
+                            let idx_start = (s_start.max(0.0) as usize).min(peaks_len);
+                            let idx_end = (s_end.ceil() as usize).min(peaks_len);
+
+                            let base_amp = if idx_start >= peaks_len {
                                 0.0
+                            } else if idx_end <= idx_start + 1 {
+                                // Zoom In (сильное приближение): плавная субпиксельная интерполяция
+                                let frac = (s_start - idx_start as f64).clamp(0.0, 1.0) as f32;
+                                let p0 = peaks_slice[idx_start];
+                                let p1 = if idx_start + 1 < peaks_len { peaks_slice[idx_start + 1] } else { p0 };
+                                p0 * (1.0 - frac) + p1 * frac
+                            } else {
+                                // Zoom Out (отдаление): Peak-Hold агрегация по пиксельному окну (устраняет 100% дёрганий и алиасинга)
+                                let mut max_val = peaks_slice[idx_start];
+                                let stride = ((idx_end - idx_start) / 32).max(1);
+                                let mut i = idx_start + 1;
+                                while i < idx_end {
+                                    if peaks_slice[i] > max_val {
+                                        max_val = peaks_slice[i];
+                                    }
+                                    i += stride;
+                                }
+                                max_val
                             };
+
+                            let amp = (base_amp * gain).clamp(0.0, 1.0);
 
                             if amp > 0.005 {
                                 let bar_h = (amp * half_h).max(1.0);
@@ -1398,6 +1426,7 @@ impl TimelineView {
                                 );
                             }
                             x += step_px;
+                            k += 1;
                         }
                         if !mesh.is_empty() {
                             painter.add(egui::Shape::mesh(mesh));
