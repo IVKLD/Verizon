@@ -261,8 +261,9 @@ impl NleApp {
 
     fn handle_drag_and_drop(&mut self, ctx: &Context) {
         // 1. Прямой сброс файлов из файлового менеджера Nautilus (Drag & Drop)
-        let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
-        if !dropped_files.is_empty() {
+        let has_dropped = ctx.input(|i| !i.raw.dropped_files.is_empty());
+        if has_dropped {
+            let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
             let mut total_imported = 0;
             for file in dropped_files {
                 let p = file.path();
@@ -307,27 +308,34 @@ impl NleApp {
         }
 
         // 2. Вставка из буфера обмена (Ctrl+V) файлов, скопированных в Nautilus / Dolphin
-        for event in &ctx.input(|i| i.events.clone()) {
-            if let egui::Event::Paste(text) = event {
-                for line in text.lines() {
-                    let line = line.trim();
-                    if line.starts_with('#') || line.is_empty() {
-                        continue;
-                    }
-                    if let Some(path) = Self::decode_uri_path(line) {
-                        let count = self.media_pool.import_path(&path);
-                        if count > 0 {
-                            self.media_pool.insert_selected_to_timeline(&mut self.timeline);
-                            if MediaPoolState::is_media_file(&path) {
-                                self.waveform_mgr.mark_pending_streams(&path, 8);
-                                let _ = self.video_player.open_file(&path, ctx);
-                                let _ = self.audio_player.load_audio_from_file(&path);
-                            }
-                            self.notification = Some((
-                                format!("✅ Вставлен клип на дорожку (Ctrl+V): {}", path.file_name().and_then(|n| n.to_str()).unwrap_or("")),
-                                std::time::Instant::now(),
-                            ));
+        let paste_text = ctx.input(|i| {
+            i.events.iter().find_map(|e| {
+                if let egui::Event::Paste(text) = e {
+                    Some(text.clone())
+                } else {
+                    None
+                }
+            })
+        });
+        if let Some(text) = paste_text {
+            for line in text.lines() {
+                let line = line.trim();
+                if line.starts_with('#') || line.is_empty() {
+                    continue;
+                }
+                if let Some(path) = Self::decode_uri_path(line) {
+                    let count = self.media_pool.import_path(&path);
+                    if count > 0 {
+                        self.media_pool.insert_selected_to_timeline(&mut self.timeline);
+                        if MediaPoolState::is_media_file(&path) {
+                            self.waveform_mgr.mark_pending_streams(&path, 8);
+                            let _ = self.video_player.open_file(&path, ctx);
+                            let _ = self.audio_player.load_audio_from_file(&path);
                         }
+                        self.notification = Some((
+                            format!("✅ Вставлен клип на дорожку (Ctrl+V): {}", path.file_name().and_then(|n| n.to_str()).unwrap_or("")),
+                            std::time::Instant::now(),
+                        ));
                     }
                 }
             }

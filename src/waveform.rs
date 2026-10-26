@@ -66,26 +66,17 @@ impl WaveformManager {
                     return;
                 }
             }
-            pending.insert(key.clone());
+            // Если фоновый декодер уже запущен для этого файла (другой дорожки) — регистрируем ключ и не спавним дубликат
+            if pending.iter().any(|(p, _)| p == path) {
+                pending.insert(key);
+                return;
+            }
+            pending.insert(key);
         }
 
         let cache = self.cache.clone();
         let pending = self.pending.clone();
         let path_buf = path.to_path_buf();
-
-        // Чтобы один файл с несколькими дорожками (A1, A2...) не читал весь диск повторно N раз,
-        // помечаем все дорожки файла как pending и расшифровываем пики ВСЕХ дорожек за один проход!
-        if let Ok(ictx) = ffmpeg_next::format::input(&path_buf) {
-            let n = ictx
-                .streams()
-                .filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Audio)
-                .count();
-            if let Ok(mut p) = self.pending.lock() {
-                for idx in 0..n {
-                    p.insert((path_buf.clone(), idx));
-                }
-            }
-        }
 
         tokio::spawn(async move {
             let path_for_blocking = path_buf.clone();

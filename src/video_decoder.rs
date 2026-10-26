@@ -41,11 +41,11 @@ pub struct VideoPlayer {
     command_tx: Option<std::sync::mpsc::Sender<DecoderCommand>>,
     frame_rx: Option<std::sync::mpsc::Receiver<(u64, i64, ColorImage)>>,
     worker_handle: Option<std::thread::JoinHandle<()>>,
-    pub frame_queue: VecDeque<(i64, ColorImage)>,
+    pub frame_queue: VecDeque<(i64, Arc<ColorImage>)>,
     pub scrub_cache: VecDeque<(i64, Arc<ColorImage>)>,
     pub prefetch_target: Option<i64>,
     pub prefetch_epoch: u64,
-    pub prefetch_queue: VecDeque<(i64, ColorImage)>,
+    pub prefetch_queue: VecDeque<(i64, Arc<ColorImage>)>,
     pub is_playing_mode: bool,
 
     // Время последнего отправленного запроса (для троттлинга скраббинга)
@@ -203,10 +203,12 @@ impl VideoPlayer {
 
     /// Безопасная фоновая утилизация очереди кадров без системных вызовов в UI-потоке
     #[inline]
-    pub fn recycle_queue(&self, q: VecDeque<(i64, ColorImage)>) {
+    pub fn recycle_queue(&self, q: VecDeque<(i64, Arc<ColorImage>)>) {
         if !q.is_empty() {
-            let images: Vec<ColorImage> = q.into_iter().map(|(_, img)| img).collect();
-            let _ = self.gc_tx.send(images);
+            let images: Vec<ColorImage> = q.into_iter().filter_map(|(_, img)| Arc::try_unwrap(img).ok()).collect();
+            if !images.is_empty() {
+                let _ = self.gc_tx.send(images);
+            }
         }
     }
 
@@ -319,16 +321,16 @@ impl VideoPlayer {
     }
 
     /// Сохраняет декодированный кадр в кольцевой кэш быстрого скраббинга (0 мс при движении курсора туда-сюда, не нагружая DRM/VCN)
-    fn cache_scrub_frame(&mut self, frame_num: i64, img: ColorImage, garbage: &mut Vec<ColorImage>) {
+    fn cache_scrub_frame(&mut self, frame_num: i64, img: Arc<ColorImage>, garbage: &mut Vec<ColorImage>) {
         if frame_num < 0 {
-            garbage.push(img);
+            garbage.extend(Arc::try_unwrap(img).ok());
             return;
         }
         if let Some(pos) = self.scrub_cache.iter().position(|(f, _)| *f == frame_num) {
             if let Some(entry) = self.scrub_cache.remove(pos) {
                 self.scrub_cache.push_back(entry);
             }
-            garbage.push(img);
+            garbage.extend(Arc::try_unwrap(img).ok());
             return;
         }
         if self.scrub_cache.len() >= 120 {
@@ -336,7 +338,7 @@ impl VideoPlayer {
                 garbage.extend(Arc::try_unwrap(old_img).ok());
             }
         }
-        self.scrub_cache.push_back((frame_num, Arc::new(img)));
+        self.scrub_cache.push_back((frame_num, img));
     }
 
     /// Мгновенная подстановка ближайшего кадра из RAM-кэша при перемещении курсора туда-сюда (0 обращений к DRM/VAAPI)
@@ -391,10 +393,10 @@ impl VideoPlayer {
             if idx % step == 0 && f_num >= 0 && !self.scrub_cache.iter().any(|(f, _)| *f == f_num) {
                 if self.scrub_cache.len() >= 120 {
                     if let Some((old_f, old)) = self.scrub_cache.pop_front() {
-                        drop_q.extend(Arc::try_unwrap(old).ok().map(|img| (old_f, img)));
+                        drop_q.push_back((old_f, old));
                     }
                 }
-                self.scrub_cache.push_back((f_num, Arc::new(img)));
+                self.scrub_cache.push_back((f_num, img));
             } else {
                 drop_q.push_back((f_num, img));
             }
@@ -526,41 +528,42 @@ impl VideoPlayer {
         ctx: &Context,
     ) {
         let cut_limit = upcoming_cut.map(|(last_src, _)| last_src).unwrap_or(i64::MAX);
-        let mut fallback_preview: Option<(u64, i64, ColorImage)> = None;
-        let mut newly_cached: Vec<(i64, ColorImage)> = Vec::new();
+        let mut fallback_preview: Option<(u64, i64, Arc<ColorImage>)> = None;
+        let mut newly_cached: Vec<(i64, Arc<ColorImage>)> = Vec::new();
         let mut garbage: Vec<ColorImage> = Vec::new();
         if let Some(rx) = &self.frame_rx {
             while let Ok((epoch, raw_frame_num, image)) = rx.try_recv() {
+                let arc_img = Arc::new(image);
                 if self.prefetch_target.is_some() && epoch == self.prefetch_epoch {
                     if raw_frame_num < 0 {
                         let pf = -raw_frame_num - 1;
                         if self.prefetch_queue.is_empty() {
-                            self.prefetch_queue.push_back((pf, image));
+                            self.prefetch_queue.push_back((pf, arc_img));
                         } else {
-                            garbage.push(image);
+                            garbage.extend(Arc::try_unwrap(arc_img).ok());
                         }
                     } else {
                         let frame_num = raw_frame_num;
                         if let Some(back) = self.prefetch_queue.back_mut() {
                             if back.0 == frame_num {
-                                let old = std::mem::replace(&mut back.1, image);
-                                garbage.push(old);
+                                let old = std::mem::replace(&mut back.1, arc_img);
+                                garbage.extend(Arc::try_unwrap(old).ok());
                                 continue;
                             }
                         }
-                        self.prefetch_queue.push_back((frame_num, image));
+                        self.prefetch_queue.push_back((frame_num, arc_img));
                     }
                     continue;
                 }
                 if raw_frame_num < 0 {
                     let preview_f = -raw_frame_num - 1;
                     if epoch <= self.current_epoch && (epoch == self.current_epoch || epoch > self.last_displayed_epoch) {
-                        newly_cached.push((preview_f, image.clone()));
-                        if let Some((_, _, old_prev)) = fallback_preview.replace((epoch, preview_f, image)) {
-                            garbage.push(old_prev);
+                        newly_cached.push((preview_f, Arc::clone(&arc_img)));
+                        if let Some((_, _, old_prev)) = fallback_preview.replace((epoch, preview_f, arc_img)) {
+                            garbage.extend(Arc::try_unwrap(old_prev).ok());
                         }
                     } else {
-                        garbage.push(image);
+                        garbage.extend(Arc::try_unwrap(arc_img).ok());
                     }
                     continue;
                 }
@@ -568,25 +571,25 @@ impl VideoPlayer {
                 if epoch == self.current_epoch {
                     if frame_num <= cut_limit {
                         if frame_num % 8 == 0 {
-                            newly_cached.push((frame_num, image.clone()));
+                            newly_cached.push((frame_num, Arc::clone(&arc_img)));
                         }
                         if let Some(back) = self.frame_queue.back_mut() {
                             if back.0 == frame_num {
-                                let old = std::mem::replace(&mut back.1, image);
-                                garbage.push(old);
+                                let old = std::mem::replace(&mut back.1, arc_img);
+                                garbage.extend(Arc::try_unwrap(old).ok());
                                 continue;
                             }
                         }
-                        self.frame_queue.push_back((frame_num, image));
+                        self.frame_queue.push_back((frame_num, arc_img));
                     } else {
-                        garbage.push(image);
+                        garbage.extend(Arc::try_unwrap(arc_img).ok());
                     }
                 } else if epoch < self.current_epoch && epoch > self.last_displayed_epoch {
-                    if let Some((_, _, old_prev)) = fallback_preview.replace((epoch, frame_num, image)) {
-                        garbage.push(old_prev);
+                    if let Some((_, _, old_prev)) = fallback_preview.replace((epoch, frame_num, arc_img)) {
+                        garbage.extend(Arc::try_unwrap(old_prev).ok());
                     }
                 } else {
-                    garbage.push(image);
+                    garbage.extend(Arc::try_unwrap(arc_img).ok());
                 }
             }
         }
@@ -615,7 +618,7 @@ impl VideoPlayer {
                 self.prefetch_epoch = self.current_epoch.max(self.prefetch_epoch).wrapping_add(1);
                 let old_pq = std::mem::take(&mut self.prefetch_queue);
                 for (_, img) in old_pq {
-                    garbage.push(img);
+                    garbage.extend(Arc::try_unwrap(img).ok());
                 }
                 if let Some(tx) = &self.command_tx {
                     let _ = tx.send(DecoderCommand::Play {
@@ -626,7 +629,7 @@ impl VideoPlayer {
             }
         }
 
-        let mut best_img: Option<ColorImage> = None;
+        let mut best_img: Option<Arc<ColorImage>> = None;
         let mut best_frame = self.last_decoded_frame;
 
         // Если еще ничего не отобразили или произошел скачок назад за пределы старого кадра
@@ -649,11 +652,11 @@ impl VideoPlayer {
                     && really_late
                     && self.frame_queue.front().map(|(next_f, _)| *next_f <= target_frame).unwrap_or(false)
                 {
-                    garbage.push(img);
+                    garbage.extend(Arc::try_unwrap(img).ok());
                     dropped += 1;
                 } else {
                     if let Some(old_best) = best_img.replace(img) {
-                        garbage.push(old_best);
+                        garbage.extend(Arc::try_unwrap(old_best).ok());
                     }
                     best_frame = f;
                     // Если этот кадр отстал всего на 1 кадр из-за фазы 60Hz VSync — показываем его сейчас,
@@ -670,14 +673,14 @@ impl VideoPlayer {
 
         while self.frame_queue.len() > 90 {
             if let Some((_, old_img)) = self.frame_queue.pop_front() {
-                garbage.push(old_img);
+                garbage.extend(Arc::try_unwrap(old_img).ok());
             }
             self.dropped_frames_count += 1;
         }
 
         if let Some(img) = best_img {
             if let Some((_, _, old_prev)) = fallback_preview.take() {
-                garbage.push(old_prev);
+                garbage.extend(Arc::try_unwrap(old_prev).ok());
             }
             self.rendered_frames_in_sample += 1;
             self.last_displayed_epoch = self.current_epoch;
@@ -690,10 +693,11 @@ impl VideoPlayer {
             self.last_displayed_epoch = ep;
             self.last_fingerprint = image_fingerprint(&prev_img);
             self.back_frame = -1;
+            let data = ImageData::Color(prev_img);
             if let Some(tex) = &mut self.texture {
-                tex.set(prev_img, TextureOptions::LINEAR);
+                tex.set(data, TextureOptions::LINEAR);
             } else {
-                self.texture = Some(ctx.load_texture("video_frame", prev_img, TextureOptions::LINEAR));
+                self.texture = Some(ctx.load_texture("video_frame", data, TextureOptions::LINEAR));
             }
             self.last_decoded_frame = prev_f;
         } else {
@@ -728,8 +732,8 @@ impl VideoPlayer {
     }
 
     /// Выводит кадр воспроизведения через ping-pong двух текстур: предыдущий кадр остаётся на GPU для блендинга
-    fn present_playback_frame(&mut self, ctx: &Context, img: ColorImage) {
-        let data = ImageData::Color(Arc::new(img));
+    fn present_playback_frame(&mut self, ctx: &Context, img: Arc<ColorImage>) {
+        let data = ImageData::Color(img);
         if self.texture.is_none() {
             self.texture = Some(ctx.load_texture("video_frame", data, TextureOptions::LINEAR));
             self.back_frame = -1;
@@ -813,29 +817,33 @@ impl VideoPlayer {
 
     /// Неблокирующая выборка готовых кадров из фонового потока
     pub fn poll_frames(&mut self, ctx: &Context) {
-        let mut newly_cached: Vec<(i64, ColorImage)> = Vec::new();
+        let mut newly_cached: Vec<(i64, Arc<ColorImage>)> = Vec::new();
         let mut stale = Vec::new();
         if let Some(rx) = &self.frame_rx {
             while let Ok((epoch, raw_frame_num, image)) = rx.try_recv() {
                 let is_preview = raw_frame_num < 0;
                 let frame_num = if is_preview { -raw_frame_num - 1 } else { raw_frame_num };
+                let arc_img = Arc::new(image);
                 if epoch != self.current_epoch && epoch <= self.last_displayed_epoch {
                     if !is_preview {
-                        newly_cached.push((frame_num, image));
+                        newly_cached.push((frame_num, arc_img));
+                    } else {
+                        stale.extend(Arc::try_unwrap(arc_img).ok());
                     }
                     continue;
                 }
                 if !is_preview {
-                    newly_cached.push((frame_num, image.clone()));
+                    newly_cached.push((frame_num, Arc::clone(&arc_img)));
                 }
                 self.last_displayed_epoch = self.last_displayed_epoch.max(epoch);
                 self.rendered_frames_in_sample += 1;
-                self.last_fingerprint = image_fingerprint(&image);
+                self.last_fingerprint = image_fingerprint(&arc_img);
                 self.back_frame = -1;
+                let data = ImageData::Color(arc_img);
                 if let Some(tex) = &mut self.texture {
-                    tex.set(image, TextureOptions::LINEAR);
+                    tex.set(data, TextureOptions::LINEAR);
                 } else {
-                    self.texture = Some(ctx.load_texture("video_frame", image, TextureOptions::LINEAR));
+                    self.texture = Some(ctx.load_texture("video_frame", data, TextureOptions::LINEAR));
                 }
                 self.last_decoded_frame = frame_num;
                 if !is_preview && epoch == self.current_epoch {

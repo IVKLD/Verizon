@@ -974,7 +974,10 @@ impl TimelineView {
 
                         let mut x = visible_start_x;
                         let step_px = 2.0;
+                        let num_steps = (((visible_end_x - visible_start_x) / step_px).ceil() as usize).max(1);
                         let mut mesh = egui::Mesh::default();
+                        mesh.reserve_triangles(num_steps * 2);
+                        mesh.reserve_vertices(num_steps * 4);
                         let wave_color = Color32::from_rgb(0x38, 0xd4, 0x8a);
                         let silence_color = Color32::from_rgba_unmultiplied(255, 255, 255, 45);
 
@@ -1022,10 +1025,10 @@ impl TimelineView {
         // Название клипа: прижимаем к левому видимому краю полосы (как в DaVinci Resolve)
         let label_left = (rect.min.x + 6.0).max(canvas_rect.min.x + 6.0);
         if rect.max.x - label_left > 20.0 {
-            let label = if clip.link_group.is_some() {
-                format!("🔗 {}", clip.name)
+            let label: std::borrow::Cow<'_, str> = if clip.link_group.is_some() {
+                format!("🔗 {}", clip.name).into()
             } else {
-                clip.name.clone()
+                clip.name.as_str().into()
             };
             painter.text(
                 pos2(label_left, rect.min.y + 2.0),

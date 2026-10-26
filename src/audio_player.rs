@@ -100,18 +100,48 @@ impl MixSnapshot {
                 continue;
             }
             let src_base = seg.in_off + (lo - seg.start);
-            let dst = &mut out[lo - pos..hi - pos];
             let pcm = &seg.samples;
             let avail_len = pcm.decoded_len.load(Ordering::Acquire).min(pcm.samples.len());
-            for (k, d) in dst.iter_mut().enumerate() {
-                let src = src_base + k;
-                if src >= avail_len {
-                    break;
+            if src_base >= avail_len {
+                continue;
+            }
+            let max_mix = (hi - lo).min(avail_len - src_base);
+            if max_mix == 0 {
+                continue;
+            }
+            let dst = &mut out[lo - pos..lo - pos + max_mix];
+
+            let dst_len = dst.len();
+            if lo & 1 == 0 {
+                let mut chunks = dst.chunks_exact_mut(2);
+                for (pair_idx, pair) in chunks.by_ref().enumerate() {
+                    let src = src_base + pair_idx * 2;
+                    let sl = f32::from_bits(pcm.samples[src].load(Ordering::Relaxed));
+                    let sr = f32::from_bits(pcm.samples[src + 1].load(Ordering::Relaxed));
+                    pair[0] += sl * seg.gain_l;
+                    pair[1] += sr * seg.gain_r;
                 }
-                // Чётность относительно начала таймлайна: чётный индекс = L, нечётный = R
-                let gain = if (lo + k) & 1 == 0 { seg.gain_l } else { seg.gain_r };
-                let s = f32::from_bits(pcm.samples[src].load(Ordering::Relaxed));
-                *d += s * gain;
+                let rem = chunks.into_remainder();
+                if !rem.is_empty() {
+                    let src = src_base + dst_len - 1;
+                    let s = f32::from_bits(pcm.samples[src].load(Ordering::Relaxed));
+                    rem[0] += s * seg.gain_l;
+                }
+            } else {
+                let mut chunks = dst.chunks_exact_mut(2);
+                for (pair_idx, pair) in chunks.by_ref().enumerate() {
+                    let src = src_base + pair_idx * 2;
+                    let sr = f32::from_bits(pcm.samples[src].load(Ordering::Relaxed));
+                    let sl = f32::from_bits(pcm.samples[src + 1].load(Ordering::Relaxed));
+                    pair[0] += sr * seg.gain_r;
+                    pair[1] += sl * seg.gain_l;
+                }
+                let rem = chunks.into_remainder();
+                if !rem.is_empty() {
+                    let src = src_base + dst_len - 1;
+                    let s = f32::from_bits(pcm.samples[src].load(Ordering::Relaxed));
+                    rem[0] += s * seg.gain_r;
+                }
             }
         }
         for s in out.iter_mut() {
@@ -270,15 +300,27 @@ impl AudioPlayer {
         let volume = f32::from_bits(engine.volume_bits.load(Ordering::Relaxed));
         let mut peak_l: f32 = 0.0;
         let mut peak_r: f32 = 0.0;
-        for (i, s) in output.iter_mut().enumerate() {
-            *s *= volume;
+        for chunk in output.chunks_exact_mut(2) {
+            let l = (chunk[0] * volume).clamp(-1.0, 1.0);
+            let r = (chunk[1] * volume).clamp(-1.0, 1.0);
+            chunk[0] = l;
+            chunk[1] = r;
+            let al = l.abs();
+            let ar = r.abs();
+            if al > peak_l {
+                peak_l = al;
+            }
+            if ar > peak_r {
+                peak_r = ar;
+            }
+        }
+        let rem = output.chunks_exact_mut(2).into_remainder();
+        if !rem.is_empty() {
+            let s = (rem[0] * volume).clamp(-1.0, 1.0);
+            rem[0] = s;
             let a = s.abs();
-            if i & 1 == 0 {
-                if a > peak_l {
-                    peak_l = a;
-                }
-            } else if a > peak_r {
-                peak_r = a;
+            if a > peak_l {
+                peak_l = a;
             }
         }
 
