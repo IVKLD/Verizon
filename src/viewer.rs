@@ -39,6 +39,10 @@ pub struct ViewerState {
     pub show_center_cross: bool,
     pub channel_mode: ColorChannelMode,
     pub show_transform_overlay: bool,
+    pub cinema_mode: bool,
+
+    pub pan_offset: egui::Vec2,
+    pub custom_zoom: Option<f32>,
 
     pub vu_level_left: f32,
     pub vu_level_right: f32,
@@ -55,6 +59,10 @@ impl ViewerState {
             show_center_cross: false,
             channel_mode: ColorChannelMode::RGB,
             show_transform_overlay: true,
+            cinema_mode: false,
+
+            pan_offset: egui::Vec2::ZERO,
+            custom_zoom: None,
 
             vu_level_left: 0.65,
             vu_level_right: 0.62,
@@ -321,20 +329,42 @@ impl ViewerState {
 
             ui.separator();
 
-            // 1. Zoom Mode (Fit / 50% / 100% / 200%)
-            let zoom_label = match self.zoom_mode {
-                ZoomMode::Fit => "Fit",
-                ZoomMode::Fifty => "50%",
-                ZoomMode::Hundred => "100%",
-                ZoomMode::TwoHundred => "200%",
+            // 1. Zoom Mode (Fit / 50% / 100% / 200% / Custom smooth zoom)
+            let custom_str;
+            let zoom_label = if let Some(cz) = self.custom_zoom {
+                custom_str = format!("{:.0}%", cz * 100.0);
+                &custom_str
+            } else {
+                match self.zoom_mode {
+                    ZoomMode::Fit => "Fit",
+                    ZoomMode::Fifty => "50%",
+                    ZoomMode::Hundred => "100%",
+                    ZoomMode::TwoHundred => "200%",
+                }
             };
             egui::ComboBox::from_id_salt("viewer_zoom_combo")
                 .selected_text(zoom_label)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.zoom_mode, ZoomMode::Fit, "Fit");
-                    ui.selectable_value(&mut self.zoom_mode, ZoomMode::Fifty, "50%");
-                    ui.selectable_value(&mut self.zoom_mode, ZoomMode::Hundred, "100%");
-                    ui.selectable_value(&mut self.zoom_mode, ZoomMode::TwoHundred, "200%");
+                    if ui.selectable_label(self.custom_zoom.is_none() && self.zoom_mode == ZoomMode::Fit, "Fit").clicked() {
+                        self.zoom_mode = ZoomMode::Fit;
+                        self.custom_zoom = None;
+                        self.pan_offset = egui::Vec2::ZERO;
+                    }
+                    if ui.selectable_label(self.custom_zoom.is_none() && self.zoom_mode == ZoomMode::Fifty, "50%").clicked() {
+                        self.zoom_mode = ZoomMode::Fifty;
+                        self.custom_zoom = None;
+                        self.pan_offset = egui::Vec2::ZERO;
+                    }
+                    if ui.selectable_label(self.custom_zoom.is_none() && self.zoom_mode == ZoomMode::Hundred, "100%").clicked() {
+                        self.zoom_mode = ZoomMode::Hundred;
+                        self.custom_zoom = None;
+                        self.pan_offset = egui::Vec2::ZERO;
+                    }
+                    if ui.selectable_label(self.custom_zoom.is_none() && self.zoom_mode == ZoomMode::TwoHundred, "200%").clicked() {
+                        self.zoom_mode = ZoomMode::TwoHundred;
+                        self.custom_zoom = None;
+                        self.pan_offset = egui::Vec2::ZERO;
+                    }
                 });
 
             ui.separator();
@@ -578,20 +608,47 @@ impl ViewerState {
             (avail_w, avail_w / aspect)
         };
 
-        // Применение зума монитора (Fit / 50% / 100% / 200%)
-        let monitor_scale = match self.zoom_mode {
+        // Применение зума монитора (Fit / 50% / 100% / 200% / Custom)
+        let monitor_scale = self.custom_zoom.unwrap_or_else(|| match self.zoom_mode {
             ZoomMode::Fit => 1.0,
             ZoomMode::Fifty => 0.5,
             ZoomMode::Hundred => 1.0 * (1080.0 / fit_h.max(1.0)),
             ZoomMode::TwoHundred => 2.0,
-        };
+        });
         let screen_w = fit_w * monitor_scale;
         let screen_h = fit_h * monitor_scale;
 
         ui.horizontal(|ui| {
-            // Контейнер предпросмотра занимает полную высоту контейнера dock
-            let (rect, _response) = ui.allocate_exact_size(vec2(avail_w, avail_h), egui::Sense::hover());
+            // Контейнер предпросмотра занимает полную высоту контейнера dock с поддержкой панорамирования и зума
+            let (rect, rect_resp) = ui.allocate_exact_size(vec2(avail_w, avail_h), egui::Sense::click_and_drag());
             let painter = ui.painter_at(rect);
+
+            // Обработка панорамирования вьюера (Middle Mouse Drag или Space + Left Drag) и зума (Ctrl + MouseWheel)
+            let is_space = ui.input(|i| i.key_down(egui::Key::Space));
+            let mmb_drag = rect_resp.dragged_by(egui::PointerButton::Middle);
+            let space_drag = is_space && rect_resp.dragged();
+            if mmb_drag || space_drag {
+                self.pan_offset += rect_resp.drag_delta();
+                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
+            } else if is_space && rect_resp.hovered() {
+                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
+            }
+
+            if rect_resp.hovered() && ui.input(|i| i.modifiers.ctrl || i.modifiers.command) {
+                let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll_y.abs() > 0.1 {
+                    let cur = self.custom_zoom.unwrap_or(monitor_scale);
+                    let factor = (1.0f32 + scroll_y * 0.002f32).clamp(0.8f32, 1.25f32);
+                    self.custom_zoom = Some((cur * factor).clamp(0.1, 10.0));
+                    ui.ctx().request_repaint();
+                }
+            }
+
+            if rect_resp.double_clicked() {
+                self.zoom_mode = ZoomMode::Fit;
+                self.custom_zoom = None;
+                self.pan_offset = egui::Vec2::ZERO;
+            }
 
             // 1. Задний фон монитора (студийный тёмно-серый backdrop DaVinci Resolve)
             painter.rect_filled(rect, CornerRadius::same(2), Color32::from_rgb(0x13, 0x14, 0x18));
@@ -599,7 +656,7 @@ impl ViewerState {
 
             // 2. Экран проекта (Screen Canvas) — чисто чёрный (#000000) прямоугольник 16:9
             // Это границы кадра проекта, которые видит зритель и которые идут на финальный рендер
-            let screen_rect = Rect::from_center_size(rect.center(), vec2(screen_w, screen_h));
+            let screen_rect = Rect::from_center_size(rect.center() + self.pan_offset, vec2(screen_w, screen_h));
             painter.rect_filled(screen_rect, CornerRadius::ZERO, Color32::BLACK);
             painter.rect_stroke(
                 screen_rect,
@@ -618,6 +675,25 @@ impl ViewerState {
                 let clip_h = screen_rect.height() * top_clip.zoom_y;
                 let clip_center = screen_rect.center() + vec2(top_clip.position_x * px_scale, top_clip.position_y * px_scale);
                 let video_box_rect = Rect::from_center_size(clip_center, vec2(clip_w, clip_h));
+
+                // Учет обрезки кадра (Cropping Left/Right/Top/Bottom) и отражения (Flip H/V)
+                let u0 = (top_clip.crop_left / 100.0).clamp(0.0, 0.49);
+                let u1 = (1.0 - top_clip.crop_right / 100.0).clamp(0.51, 1.0);
+                let v0 = (top_clip.crop_top / 100.0).clamp(0.0, 0.49);
+                let v1 = (1.0 - top_clip.crop_bottom / 100.0).clamp(0.51, 1.0);
+
+                let (uv_min_x, uv_max_x) = if top_clip.flip_h { (u1, u0) } else { (u0, u1) };
+                let (uv_min_y, uv_max_y) = if top_clip.flip_v { (v1, v0) } else { (v0, v1) };
+
+                let crop_l_px = clip_w * (top_clip.crop_left / 100.0);
+                let crop_r_px = clip_w * (top_clip.crop_right / 100.0);
+                let crop_t_px = clip_h * (top_clip.crop_top / 100.0);
+                let crop_b_px = clip_h * (top_clip.crop_bottom / 100.0);
+
+                let cropped_rect = Rect::from_min_max(
+                    pos2(video_box_rect.min.x + crop_l_px, video_box_rect.min.y + crop_t_px),
+                    pos2(video_box_rect.max.x - crop_r_px, video_box_rect.max.y - crop_b_px),
+                );
 
                 // Угол поворота клипа
                 let rot_deg = top_clip.rotation;
@@ -642,19 +718,19 @@ impl ViewerState {
                 // Отрисовка живого кадра видео (Frame-Accurate без двоения и мерцания)
                 if let Some(tex) = &video_player.texture {
                     if rot_deg.abs() <= 0.01 {
-                        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-                        painter.image(tex.id(), video_box_rect, uv, tint);
+                        let uv = Rect::from_min_max(pos2(uv_min_x, uv_min_y), pos2(uv_max_x, uv_max_y));
+                        painter.image(tex.id(), cropped_rect, uv, tint);
                     } else {
                         let mut mesh = egui::Mesh::with_texture(tex.id());
-                        let p_lt = rotate_pt(video_box_rect.left_top());
-                        let p_rt = rotate_pt(video_box_rect.right_top());
-                        let p_rb = rotate_pt(video_box_rect.right_bottom());
-                        let p_lb = rotate_pt(video_box_rect.left_bottom());
+                        let p_lt = rotate_pt(cropped_rect.left_top());
+                        let p_rt = rotate_pt(cropped_rect.right_top());
+                        let p_rb = rotate_pt(cropped_rect.right_bottom());
+                        let p_lb = rotate_pt(cropped_rect.left_bottom());
                         let idx = mesh.vertices.len() as u32;
-                        mesh.vertices.push(egui::epaint::Vertex { pos: p_lt, uv: pos2(0.0, 0.0), color: tint });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: p_rt, uv: pos2(1.0, 0.0), color: tint });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: p_rb, uv: pos2(1.0, 1.0), color: tint });
-                        mesh.vertices.push(egui::epaint::Vertex { pos: p_lb, uv: pos2(0.0, 1.0), color: tint });
+                        mesh.vertices.push(egui::epaint::Vertex { pos: p_lt, uv: pos2(uv_min_x, uv_min_y), color: tint });
+                        mesh.vertices.push(egui::epaint::Vertex { pos: p_rt, uv: pos2(uv_max_x, uv_min_y), color: tint });
+                        mesh.vertices.push(egui::epaint::Vertex { pos: p_rb, uv: pos2(uv_max_x, uv_max_y), color: tint });
+                        mesh.vertices.push(egui::epaint::Vertex { pos: p_lb, uv: pos2(uv_min_x, uv_max_y), color: tint });
                         mesh.add_triangle(idx, idx + 1, idx + 2);
                         mesh.add_triangle(idx, idx + 2, idx + 3);
                         painter.add(egui::Shape::mesh(mesh));
@@ -739,18 +815,32 @@ impl ViewerState {
 
                     if let Some(target_clip) = timeline.clips.iter_mut().find(|c| c.id == top_clip_id) {
                         if resp_rot.dragged() {
+                            let is_shift = ui.input(|i| i.modifiers.shift);
                             if let Some(mouse_pos) = ui.input(|i| i.pointer.latest_pos()) {
                                 let v = mouse_pos - clip_center;
                                 let mut angle = v.y.atan2(v.x).to_degrees() + 90.0;
                                 while angle > 180.0 { angle -= 360.0; }
                                 while angle < -180.0 { angle += 360.0; }
+                                if is_shift {
+                                    angle = (angle / 15.0).round() * 15.0;
+                                }
                                 target_clip.rotation = (angle * 10.0).round() / 10.0;
                                 clip_mutated = true;
                             }
                         } else if body_resp.dragged() && !any_handle_active {
                             let delta = body_resp.drag_delta();
-                            target_clip.position_x += delta.x / px_scale;
-                            target_clip.position_y += delta.y / px_scale;
+                            let is_shift = ui.input(|i| i.modifiers.shift);
+                            let (dx, dy) = if is_shift {
+                                if delta.x.abs() > delta.y.abs() {
+                                    (delta.x, 0.0)
+                                } else {
+                                    (0.0, delta.y)
+                                }
+                            } else {
+                                (delta.x, delta.y)
+                            };
+                            target_clip.position_x += dx / px_scale;
+                            target_clip.position_y += dy / px_scale;
                             clip_mutated = true;
                         } else if resp_rb.dragged() || resp_lt.dragged() || resp_rt.dragged() || resp_lb.dragged() {
                             let raw_delta = if resp_rb.dragged() {
@@ -830,11 +920,17 @@ impl ViewerState {
                     // Информационный HUD вверху экрана при трансформации (показывает текущие координаты, масштаб и угол)
                     let is_transforming = any_handle_active || body_resp.dragged() || body_resp.hovered();
                     if is_transforming {
+                        let mut extra = String::new();
+                        if top_clip.flip_h { extra.push_str("  [Flip H]"); }
+                        if top_clip.flip_v { extra.push_str("  [Flip V]"); }
+                        if top_clip.crop_left > 0.0 || top_clip.crop_right > 0.0 || top_clip.crop_top > 0.0 || top_clip.crop_bottom > 0.0 {
+                            extra.push_str("  [Cropped]");
+                        }
                         let hud_text = format!(
-                            "X: {:+.0} px   Y: {:+.0} px   Zoom: {:.2}x   Rot: {:+.1}°",
-                            top_clip.position_x, top_clip.position_y, top_clip.zoom_x, top_clip.rotation
+                            "X: {:+.0} px   Y: {:+.0} px   Zoom: {:.2}x   Rot: {:+.1}°{}",
+                            top_clip.position_x, top_clip.position_y, top_clip.zoom_x, top_clip.rotation, extra
                         );
-                        let hud_w = 280.0;
+                        let hud_w = if extra.is_empty() { 280.0 } else { 380.0 };
                         let hud_h = 24.0;
                         let hud_rect = Rect::from_min_size(
                             pos2(screen_rect.min.x + 12.0, screen_rect.min.y + 12.0),
@@ -1059,5 +1155,36 @@ impl ViewerState {
                 timeline.loop_enabled = !timeline.loop_enabled;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_viewer_pan_zoom_and_cinema_mode() {
+        let mut viewer = ViewerState::new();
+        assert_eq!(viewer.zoom_mode, ZoomMode::Fit);
+        assert_eq!(viewer.pan_offset, egui::Vec2::ZERO);
+        assert_eq!(viewer.custom_zoom, None);
+        assert!(!viewer.cinema_mode);
+
+        // Включение Cinema Mode
+        viewer.cinema_mode = true;
+        assert!(viewer.cinema_mode);
+
+        // Панорамирование и произвольный зум
+        viewer.pan_offset += egui::vec2(50.0, -30.0);
+        viewer.custom_zoom = Some(1.75);
+        assert_eq!(viewer.pan_offset, egui::vec2(50.0, -30.0));
+        assert_eq!(viewer.custom_zoom, Some(1.75));
+
+        // Сброс к Fit
+        viewer.zoom_mode = ZoomMode::Fit;
+        viewer.pan_offset = egui::Vec2::ZERO;
+        viewer.custom_zoom = None;
+        assert_eq!(viewer.pan_offset, egui::Vec2::ZERO);
+        assert_eq!(viewer.custom_zoom, None);
     }
 }

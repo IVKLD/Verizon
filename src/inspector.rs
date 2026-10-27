@@ -141,6 +141,80 @@ impl InspectorState {
                                             clip.rotation = 0.0;
                                         }
                                         ui.end_row();
+
+                                        // Flip H / V (DaVinci Resolve Mirroring)
+                                        ui.label(egui::RichText::new("Flip").size(11.0).color(ResolveColors::TEXT_MUTED));
+                                        ui.horizontal(|ui| {
+                                            let h_btn = egui::Button::new(
+                                                egui::RichText::new("↔ H")
+                                                    .size(10.0)
+                                                    .color(if clip.flip_h { egui::Color32::WHITE } else { ResolveColors::TEXT_MUTED }),
+                                            )
+                                            .fill(if clip.flip_h { ResolveColors::ACCENT_ORANGE } else { ResolveColors::BG_HEADER });
+                                            if ui.add(h_btn).on_hover_text("Отразить по горизонтали (Flip Horizontal)").clicked() {
+                                                clip.flip_h = !clip.flip_h;
+                                            }
+
+                                            let v_btn = egui::Button::new(
+                                                egui::RichText::new("↕ V")
+                                                    .size(10.0)
+                                                    .color(if clip.flip_v { egui::Color32::WHITE } else { ResolveColors::TEXT_MUTED }),
+                                            )
+                                            .fill(if clip.flip_v { ResolveColors::ACCENT_ORANGE } else { ResolveColors::BG_HEADER });
+                                            if ui.add(v_btn).on_hover_text("Отразить по вертикали (Flip Vertical)").clicked() {
+                                                clip.flip_v = !clip.flip_v;
+                                            }
+                                        });
+                                        if ui.button("⟲").on_hover_text("Сбросить отражение").clicked() {
+                                            clip.flip_h = false;
+                                            clip.flip_v = false;
+                                        }
+                                        ui.end_row();
+                                    });
+                            });
+
+                            ui.add_space(6.0);
+
+                            // Секция CROPPING (DaVinci Resolve обрезка кадра)
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new("CROPPING")
+                                    .size(11.0)
+                                    .color(ResolveColors::TEXT_PRIMARY)
+                                    .strong(),
+                            )
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                egui::Grid::new("cropping_grid")
+                                    .num_columns(3)
+                                    .spacing([8.0, 6.0])
+                                    .show(ui, |ui| {
+                                        ui.label(egui::RichText::new("Crop Left").size(11.0).color(ResolveColors::TEXT_MUTED));
+                                        ui.add(Slider::new(&mut clip.crop_left, 0.0..=50.0).suffix("%"));
+                                        if ui.button("⟲").on_hover_text("Сбросить Crop Left").clicked() {
+                                            clip.crop_left = 0.0;
+                                        }
+                                        ui.end_row();
+
+                                        ui.label(egui::RichText::new("Crop Right").size(11.0).color(ResolveColors::TEXT_MUTED));
+                                        ui.add(Slider::new(&mut clip.crop_right, 0.0..=50.0).suffix("%"));
+                                        if ui.button("⟲").on_hover_text("Сбросить Crop Right").clicked() {
+                                            clip.crop_right = 0.0;
+                                        }
+                                        ui.end_row();
+
+                                        ui.label(egui::RichText::new("Crop Top").size(11.0).color(ResolveColors::TEXT_MUTED));
+                                        ui.add(Slider::new(&mut clip.crop_top, 0.0..=50.0).suffix("%"));
+                                        if ui.button("⟲").on_hover_text("Сбросить Crop Top").clicked() {
+                                            clip.crop_top = 0.0;
+                                        }
+                                        ui.end_row();
+
+                                        ui.label(egui::RichText::new("Crop Bottom").size(11.0).color(ResolveColors::TEXT_MUTED));
+                                        ui.add(Slider::new(&mut clip.crop_bottom, 0.0..=50.0).suffix("%"));
+                                        if ui.button("⟲").on_hover_text("Сбросить Crop Bottom").clicked() {
+                                            clip.crop_bottom = 0.0;
+                                        }
+                                        ui.end_row();
                                     });
                             });
 

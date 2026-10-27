@@ -90,6 +90,12 @@ impl RenderCacheManager {
                 c.position_y.to_bits().hash(&mut hasher);
                 c.rotation.to_bits().hash(&mut hasher);
                 c.opacity.to_bits().hash(&mut hasher);
+                c.flip_h.hash(&mut hasher);
+                c.flip_v.hash(&mut hasher);
+                c.crop_left.to_bits().hash(&mut hasher);
+                c.crop_right.to_bits().hash(&mut hasher);
+                c.crop_top.to_bits().hash(&mut hasher);
+                c.crop_bottom.to_bits().hash(&mut hasher);
                 c.speed.to_bits().hash(&mut hasher);
                 c.is_disabled.hash(&mut hasher);
                 if let Some(ref path) = c.source_path {
@@ -549,5 +555,41 @@ impl BackgroundCacheEngine {
         if cached_count > 0 {
             egui_ctx.request_repaint();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::timeline::{Clip, TimelineState};
+    use egui::Color32;
+
+    #[test]
+    fn test_render_cache_signature_changes_on_crop_or_flip() {
+        let mut tl = TimelineState::new_empty();
+        let clip = Clip {
+            id: 1,
+            name: "Video".to_string(),
+            track_index: 0,
+            start_frame: 0,
+            duration_frames: 100,
+            is_audio: false,
+            color: Color32::BLUE,
+            ..Default::default()
+        };
+        tl.clips.push(clip);
+
+        let sig_base = RenderCacheManager::compute_frame_signature(&tl, 10);
+
+        // Изменение flip_h меняет сигнатуру
+        tl.clips[0].flip_h = true;
+        let sig_flip = RenderCacheManager::compute_frame_signature(&tl, 10);
+        assert_ne!(sig_base, sig_flip);
+
+        // Изменение crop_left меняет сигнатуру
+        tl.clips[0].flip_h = false;
+        tl.clips[0].crop_left = 15.0;
+        let sig_crop = RenderCacheManager::compute_frame_signature(&tl, 10);
+        assert_ne!(sig_base, sig_crop);
     }
 }

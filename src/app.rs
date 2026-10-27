@@ -634,6 +634,29 @@ impl NleApp {
             if (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::Backslash) {
                 self.timeline.blade_all_at_playhead();
             }
+
+            // Ctrl + F / P: Cinema Viewer (полноэкранный предпросмотр видео без доков как в DaVinci Resolve)
+            if ((i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::F))
+                || (!i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.command && i.key_pressed(egui::Key::P))
+            {
+                self.viewer.cinema_mode = !self.viewer.cinema_mode;
+                let msg = if self.viewer.cinema_mode {
+                    "🎬 Cinema Viewer активирован (Esc / Ctrl+F для выхода)"
+                } else {
+                    "🎬 Обычный режим окон"
+                };
+                self.notification = Some((msg.to_string(), std::time::Instant::now()));
+            }
+
+            // Esc: выход из Cinema Viewer
+            if i.key_pressed(egui::Key::Escape) && self.viewer.cinema_mode {
+                self.viewer.cinema_mode = false;
+            }
+
+            // Ctrl+Shift+W: Быстрое переключение интерактивного оверлея Transform
+            if (i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(egui::Key::W) {
+                self.viewer.show_transform_overlay = !self.viewer.show_transform_overlay;
+            }
         });
 
         if import_requested {
@@ -1098,23 +1121,47 @@ impl eframe::App for NleApp {
                 let mut dock_style = DockStyle::from_egui(ui.style());
                 dock_style.dock_area_padding = None;
 
-                let mut tab_viewer = ResolveTabViewer {
-                    media_pool: &mut self.media_pool,
-                    viewer: &mut self.viewer,
-                    inspector: &mut self.inspector,
-                    timeline: &mut self.timeline,
-                    video_player: &mut self.video_player,
-                    audio_player: &mut self.audio_player,
-                    waveform_mgr: &self.waveform_mgr,
-                    render_cache: &mut self.render_cache,
-                };
+                if self.viewer.cinema_mode {
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            let exit_btn = egui::Button::new(
+                                egui::RichText::new("🗗 Выйти из Cinema Viewer [Esc / Ctrl+F]")
+                                    .size(11.0)
+                                    .color(ResolveColors::TEXT_PRIMARY),
+                            )
+                            .fill(ResolveColors::BG_HEADER);
+                            if ui.add(exit_btn).clicked() {
+                                self.viewer.cinema_mode = false;
+                            }
+                        });
+                        self.viewer.render_dual_viewers(
+                            ui,
+                            &mut self.timeline,
+                            &mut self.video_player,
+                            &mut self.render_cache,
+                            self.audio_player.get_vu_levels(),
+                            &ctx,
+                        );
+                    });
+                } else {
+                    let mut tab_viewer = ResolveTabViewer {
+                        media_pool: &mut self.media_pool,
+                        viewer: &mut self.viewer,
+                        inspector: &mut self.inspector,
+                        timeline: &mut self.timeline,
+                        video_player: &mut self.video_player,
+                        audio_player: &mut self.audio_player,
+                        waveform_mgr: &self.waveform_mgr,
+                        render_cache: &mut self.render_cache,
+                    };
 
-                DockArea::new(&mut self.dock_state)
-                    .style(dock_style)
-                    .draggable_tabs(true)
-                    .show_close_buttons(false)
-                    .show_add_buttons(false)
-                    .show_inside(ui, &mut tab_viewer);
+                    DockArea::new(&mut self.dock_state)
+                        .style(dock_style)
+                        .draggable_tabs(true)
+                        .show_close_buttons(false)
+                        .show_add_buttons(false)
+                        .show_inside(ui, &mut tab_viewer);
+                }
             }
         }
 

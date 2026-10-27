@@ -1013,6 +1013,7 @@ mod tests {
             speed: 1.0,
             retime_controls_open: false,
             is_disabled: false,
+            ..Default::default()
         };
         timeline.clips.push(clip);
         player.rebuild_timeline_audio(&timeline);

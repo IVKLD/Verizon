@@ -261,6 +261,7 @@ impl MediaPoolState {
                         speed: 1.0,
                         retime_controls_open: false,
                         is_disabled: false,
+                        ..Default::default()
                     };
                     timeline.next_clip_id += 1;
                     timeline.selected_clip_id = Some(v_clip.id);
@@ -304,6 +305,7 @@ impl MediaPoolState {
                             speed: 1.0,
                             retime_controls_open: false,
                             is_disabled: false,
+                            ..Default::default()
                         };
                         timeline.next_clip_id += 1;
                         if !asset.has_video && a_idx == 0 {
