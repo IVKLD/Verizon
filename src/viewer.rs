@@ -1,4 +1,4 @@
-use egui::{pos2, vec2, Color32, CornerRadius, Rect, Stroke, StrokeKind, Ui};
+use egui::{pos2, vec2, Color32, CornerRadius, Pos2, Rect, Stroke, StrokeKind, Ui};
 use crate::theme::ResolveColors;
 use crate::timeline::TimelineState;
 use crate::timecode::Timecode;
@@ -514,14 +514,19 @@ impl ViewerState {
         let (rect, _response) = ui.allocate_exact_size(vec2(avail_w, avail_h), egui::Sense::hover());
 
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, CornerRadius::same(2), Color32::from_rgb(0x0a, 0x0b, 0x0d));
+        // Задний фон монитора (нейтральный студийный тёмно-серый как в DaVinci Resolve)
+        painter.rect_filled(rect, CornerRadius::same(2), Color32::from_rgb(0x13, 0x14, 0x18));
         painter.rect_stroke(rect, CornerRadius::same(2), Stroke::new(1.0, ResolveColors::BORDER), StrokeKind::Inside);
 
-        let video_rect = Rect::from_center_size(rect.center(), vec2(video_w, video_h));
+        // Экран проекта (Screen Canvas) — чисто чёрный (#000000) прямоугольник с чёткими границами
+        let screen_rect = Rect::from_center_size(rect.center(), vec2(video_w, video_h));
+        painter.rect_filled(screen_rect, CornerRadius::ZERO, Color32::BLACK);
+        painter.rect_stroke(screen_rect, CornerRadius::ZERO, Stroke::new(1.0, Color32::from_rgb(0x38, 0x3c, 0x48)), StrokeKind::Outside);
+
         if let Some(tex) = &video_player.texture {
             painter.image(
                 tex.id(),
-                video_rect,
+                screen_rect,
                 Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                 Color32::WHITE,
             );
@@ -565,43 +570,64 @@ impl ViewerState {
         let avail_h = (ui.available_height() - transport_h - 6.0).max(60.0);
 
         let aspect = 16.0 / 9.0;
-        let (video_w, video_h) = if avail_w / avail_h > aspect {
-            // Контейнер шире, чем 16:9 (например, закрыт Source Viewer): высота = высоте контейнера!
+        let (fit_w, fit_h) = if avail_w / avail_h > aspect {
+            // Контейнер шире, чем 16:9: высота = высоте контейнера!
             (avail_h * aspect, avail_h)
         } else {
             // Контейнер уже: ширина = ширине контейнера
             (avail_w, avail_w / aspect)
         };
 
+        // Применение зума монитора (Fit / 50% / 100% / 200%)
+        let monitor_scale = match self.zoom_mode {
+            ZoomMode::Fit => 1.0,
+            ZoomMode::Fifty => 0.5,
+            ZoomMode::Hundred => 1.0 * (1080.0 / fit_h.max(1.0)),
+            ZoomMode::TwoHundred => 2.0,
+        };
+        let screen_w = fit_w * monitor_scale;
+        let screen_h = fit_h * monitor_scale;
+
         ui.horizontal(|ui| {
             // Контейнер предпросмотра занимает полную высоту контейнера dock
             let (rect, _response) = ui.allocate_exact_size(vec2(avail_w, avail_h), egui::Sense::hover());
             let painter = ui.painter_at(rect);
 
-            painter.rect_filled(rect, CornerRadius::same(2), Color32::from_rgb(0x0a, 0x0b, 0x0d));
+            // 1. Задний фон монитора (студийный тёмно-серый backdrop DaVinci Resolve)
+            painter.rect_filled(rect, CornerRadius::same(2), Color32::from_rgb(0x13, 0x14, 0x18));
             painter.rect_stroke(rect, CornerRadius::same(2), Stroke::new(1.0, ResolveColors::BORDER), StrokeKind::Inside);
 
-            let top_clip = timeline.active_video_clip_at(timeline.playhead_frame);
+            // 2. Экран проекта (Screen Canvas) — чисто чёрный (#000000) прямоугольник 16:9
+            // Это границы кадра проекта, которые видит зритель и которые идут на финальный рендер
+            let screen_rect = Rect::from_center_size(rect.center(), vec2(screen_w, screen_h));
+            painter.rect_filled(screen_rect, CornerRadius::ZERO, Color32::BLACK);
+            painter.rect_stroke(
+                screen_rect,
+                CornerRadius::ZERO,
+                Stroke::new(1.0, Color32::from_rgb(0x38, 0x3c, 0x48)),
+                StrokeKind::Outside,
+            );
 
-            if let Some(top_clip) = top_clip {
-                let center = rect.center();
+            let top_clip = timeline.active_video_clip_at(timeline.playhead_frame).cloned();
 
-                // Применение зума монитора (Fit / 50% / 100% / 200%)
-                let monitor_scale = match self.zoom_mode {
-                    ZoomMode::Fit => 1.0,
-                    ZoomMode::Fifty => 0.5,
-                    ZoomMode::Hundred => 1.0 * (1080.0 / video_h.max(1.0)),
-                    ZoomMode::TwoHundred => 2.0,
+            if let Some(mut top_clip) = top_clip {
+                // Коэффициент масштаба пикселей таймлайна (в координатах растра 1920x1080 DaVinci Resolve)
+                let px_scale = screen_rect.width() / 1920.0;
+
+                let clip_w = screen_rect.width() * top_clip.zoom_x;
+                let clip_h = screen_rect.height() * top_clip.zoom_y;
+                let clip_center = screen_rect.center() + vec2(top_clip.position_x * px_scale, top_clip.position_y * px_scale);
+                let video_box_rect = Rect::from_center_size(clip_center, vec2(clip_w, clip_h));
+
+                // Угол поворота клипа
+                let rot_deg = top_clip.rotation;
+                let rot_rad = rot_deg.to_radians();
+                let (sin_a, cos_a) = rot_rad.sin_cos();
+                let rotate_pt = |p: Pos2| -> Pos2 {
+                    let dx = p.x - clip_center.x;
+                    let dy = p.y - clip_center.y;
+                    pos2(clip_center.x + dx * cos_a - dy * sin_a, clip_center.y + dx * sin_a + dy * cos_a)
                 };
-
-                let video_box_size = vec2(
-                    video_w * top_clip.zoom_x * monitor_scale,
-                    video_h * top_clip.zoom_y * monitor_scale,
-                );
-                let video_box_rect = Rect::from_center_size(
-                    center + vec2(top_clip.position_x * 0.2, top_clip.position_y * 0.2),
-                    video_box_size,
-                );
 
                 // Изоляция цветовых каналов
                 let alpha = (top_clip.opacity / 100.0 * 255.0) as u8;
@@ -615,56 +641,84 @@ impl ViewerState {
 
                 // Отрисовка живого кадра видео (Frame-Accurate без двоения и мерцания)
                 if let Some(tex) = &video_player.texture {
-                    let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-                    painter.image(tex.id(), video_box_rect, uv, tint);
+                    if rot_deg.abs() <= 0.01 {
+                        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                        painter.image(tex.id(), video_box_rect, uv, tint);
+                    } else {
+                        let mut mesh = egui::Mesh::with_texture(tex.id());
+                        let p_lt = rotate_pt(video_box_rect.left_top());
+                        let p_rt = rotate_pt(video_box_rect.right_top());
+                        let p_rb = rotate_pt(video_box_rect.right_bottom());
+                        let p_lb = rotate_pt(video_box_rect.left_bottom());
+                        let idx = mesh.vertices.len() as u32;
+                        mesh.vertices.push(egui::epaint::Vertex { pos: p_lt, uv: pos2(0.0, 0.0), color: tint });
+                        mesh.vertices.push(egui::epaint::Vertex { pos: p_rt, uv: pos2(1.0, 0.0), color: tint });
+                        mesh.vertices.push(egui::epaint::Vertex { pos: p_rb, uv: pos2(1.0, 1.0), color: tint });
+                        mesh.vertices.push(egui::epaint::Vertex { pos: p_lb, uv: pos2(0.0, 1.0), color: tint });
+                        mesh.add_triangle(idx, idx + 1, idx + 2);
+                        mesh.add_triangle(idx, idx + 2, idx + 3);
+                        painter.add(egui::Shape::mesh(mesh));
+                    }
                 }
 
                 // Интерактивная рамка трансформации (Transform Overlay как в DaVinci Resolve)
                 if self.show_transform_overlay {
-                    // Контур рамки клипа
-                    painter.rect_stroke(
-                        video_box_rect,
-                        CornerRadius::ZERO,
-                        Stroke::new(1.5, ResolveColors::ACCENT_ORANGE),
-                        StrokeKind::Inside,
-                    );
+                    // Вычисляем ключевые точки рамки с учётом поворота
+                    let p_lt = rotate_pt(video_box_rect.left_top());
+                    let p_rt = rotate_pt(video_box_rect.right_top());
+                    let p_rb = rotate_pt(video_box_rect.right_bottom());
+                    let p_lb = rotate_pt(video_box_rect.left_bottom());
 
-                    // Центральная точка привязки (Anchor Point с перекрестием)
-                    let c_pos = video_box_rect.center();
-                    painter.circle_stroke(c_pos, 5.0, Stroke::new(1.5, ResolveColors::ACCENT_ORANGE));
-                    painter.line_segment([pos2(c_pos.x - 7.0, c_pos.y), pos2(c_pos.x + 7.0, c_pos.y)], Stroke::new(1.5, ResolveColors::ACCENT_ORANGE));
-                    painter.line_segment([pos2(c_pos.x, c_pos.y - 7.0), pos2(c_pos.x, c_pos.y + 7.0)], Stroke::new(1.5, ResolveColors::ACCENT_ORANGE));
+                    let p_tc = pos2((p_lt.x + p_rt.x) * 0.5, (p_lt.y + p_rt.y) * 0.5);
+                    let p_bc = pos2((p_lb.x + p_rb.x) * 0.5, (p_lb.y + p_rb.y) * 0.5);
+                    let p_lc = pos2((p_lt.x + p_lb.x) * 0.5, (p_lt.y + p_lb.y) * 0.5);
+                    let p_rc = pos2((p_rt.x + p_rb.x) * 0.5, (p_rt.y + p_rb.y) * 0.5);
 
-                    // 8 интерактивных ручек управления (4 угла + 4 середины сторон)
-                    let handle_sz = 9.0;
-                    let h_lt = Rect::from_center_size(video_box_rect.left_top(), vec2(handle_sz, handle_sz));
-                    let h_rt = Rect::from_center_size(video_box_rect.right_top(), vec2(handle_sz, handle_sz));
-                    let h_lb = Rect::from_center_size(video_box_rect.left_bottom(), vec2(handle_sz, handle_sz));
-                    let h_rb = Rect::from_center_size(video_box_rect.right_bottom(), vec2(handle_sz, handle_sz));
+                    // Тонкая белая рамка клипа как в Resolve
+                    let frame_stroke = Stroke::new(1.0, Color32::from_rgb(235, 235, 240));
+                    painter.line_segment([p_lt, p_rt], frame_stroke);
+                    painter.line_segment([p_rt, p_rb], frame_stroke);
+                    painter.line_segment([p_rb, p_lb], frame_stroke);
+                    painter.line_segment([p_lb, p_lt], frame_stroke);
 
-                    let h_tc = Rect::from_center_size(pos2(video_box_rect.center().x, video_box_rect.min.y), vec2(handle_sz, handle_sz));
-                    let h_bc = Rect::from_center_size(pos2(video_box_rect.center().x, video_box_rect.max.y), vec2(handle_sz, handle_sz));
-                    let h_lc = Rect::from_center_size(pos2(video_box_rect.min.x, video_box_rect.center().y), vec2(handle_sz, handle_sz));
-                    let h_rc = Rect::from_center_size(pos2(video_box_rect.max.x, video_box_rect.center().y), vec2(handle_sz, handle_sz));
+                    // Центральная точка привязки (Anchor Point с перекрестием в стиле Resolve)
+                    let resolve_blue = Color32::from_rgb(41, 151, 255);
+                    painter.circle_stroke(clip_center, 5.0, Stroke::new(1.2, resolve_blue));
+                    painter.line_segment([pos2(clip_center.x - 8.0, clip_center.y), pos2(clip_center.x + 8.0, clip_center.y)], Stroke::new(1.2, resolve_blue));
+                    painter.line_segment([pos2(clip_center.x, clip_center.y - 8.0), pos2(clip_center.x, clip_center.y + 8.0)], Stroke::new(1.2, resolve_blue));
 
-                    let resp_lt = ui.interact(h_lt, ui.id().with("tr_lt"), egui::Sense::drag());
-                    let resp_rt = ui.interact(h_rt, ui.id().with("tr_rt"), egui::Sense::drag());
-                    let resp_lb = ui.interact(h_lb, ui.id().with("tr_lb"), egui::Sense::drag());
-                    let resp_rb = ui.interact(h_rb, ui.id().with("tr_rb"), egui::Sense::drag());
-                    let resp_tc = ui.interact(h_tc, ui.id().with("tr_tc"), egui::Sense::drag());
-                    let resp_bc = ui.interact(h_bc, ui.id().with("tr_bc"), egui::Sense::drag());
-                    let resp_lc = ui.interact(h_lc, ui.id().with("tr_lc"), egui::Sense::drag());
-                    let resp_rc = ui.interact(h_rc, ui.id().with("tr_rc"), egui::Sense::drag());
+                    // Стебель и ручка вращения (Rotation Stalk & Handle вверху клипа)
+                    let stalk_len = 32.0;
+                    let stalk_dir = rotate_pt(pos2(clip_center.x, clip_center.y - 1.0)) - clip_center;
+                    let stalk_norm = stalk_dir.normalized();
+                    let p_rot = p_tc + stalk_norm * stalk_len;
+                    painter.line_segment([p_tc, p_rot], Stroke::new(1.2, resolve_blue));
+
+                    // Интерактивные области ручек управления
+                    let h_sz = vec2(16.0, 16.0);
+                    let resp_lt = ui.interact(Rect::from_center_size(p_lt, h_sz), ui.id().with("tr_lt"), egui::Sense::drag());
+                    let resp_rt = ui.interact(Rect::from_center_size(p_rt, h_sz), ui.id().with("tr_rt"), egui::Sense::drag());
+                    let resp_lb = ui.interact(Rect::from_center_size(p_lb, h_sz), ui.id().with("tr_lb"), egui::Sense::drag());
+                    let resp_rb = ui.interact(Rect::from_center_size(p_rb, h_sz), ui.id().with("tr_rb"), egui::Sense::drag());
+
+                    let resp_tc = ui.interact(Rect::from_center_size(p_tc, h_sz), ui.id().with("tr_tc"), egui::Sense::drag());
+                    let resp_bc = ui.interact(Rect::from_center_size(p_bc, h_sz), ui.id().with("tr_bc"), egui::Sense::drag());
+                    let resp_lc = ui.interact(Rect::from_center_size(p_lc, h_sz), ui.id().with("tr_lc"), egui::Sense::drag());
+                    let resp_rc = ui.interact(Rect::from_center_size(p_rc, h_sz), ui.id().with("tr_rc"), egui::Sense::drag());
+
+                    let resp_rot = ui.interact(Rect::from_center_size(p_rot, vec2(18.0, 18.0)), ui.id().with("tr_rot"), egui::Sense::drag());
+                    let body_resp = ui.interact(video_box_rect, ui.id().with("tr_body"), egui::Sense::drag());
 
                     let any_handle_active = resp_lt.hovered() || resp_rt.hovered() || resp_lb.hovered() || resp_rb.hovered()
                         || resp_tc.hovered() || resp_bc.hovered() || resp_lc.hovered() || resp_rc.hovered()
+                        || resp_rot.hovered() || resp_rot.dragged()
                         || resp_lt.dragged() || resp_rt.dragged() || resp_lb.dragged() || resp_rb.dragged()
                         || resp_tc.dragged() || resp_bc.dragged() || resp_lc.dragged() || resp_rc.dragged();
 
-                    let body_resp = ui.interact(video_box_rect, ui.id().with("tr_body"), egui::Sense::drag());
-
                     // Адаптивные курсоры мыши
-                    if resp_lt.hovered() || resp_rb.hovered() {
+                    if resp_rot.hovered() || resp_rot.dragged() {
+                        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Crosshair);
+                    } else if resp_lt.hovered() || resp_rb.hovered() {
                         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeNorthWest);
                     } else if resp_rt.hovered() || resp_lb.hovered() {
                         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeNorthEast);
@@ -679,19 +733,27 @@ impl ViewerState {
                         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
                     }
 
-                    // Обработка интерактивного изменения положения и масштаба клипа
+                    // Обработка интерактивного изменения положения, масштаба и угла клипа
                     let mut clip_mutated = false;
                     let top_clip_id = top_clip.id;
 
                     if let Some(target_clip) = timeline.clips.iter_mut().find(|c| c.id == top_clip_id) {
-                        if body_resp.dragged() && !any_handle_active {
+                        if resp_rot.dragged() {
+                            if let Some(mouse_pos) = ui.input(|i| i.pointer.latest_pos()) {
+                                let v = mouse_pos - clip_center;
+                                let mut angle = v.y.atan2(v.x).to_degrees() + 90.0;
+                                while angle > 180.0 { angle -= 360.0; }
+                                while angle < -180.0 { angle += 360.0; }
+                                target_clip.rotation = (angle * 10.0).round() / 10.0;
+                                clip_mutated = true;
+                            }
+                        } else if body_resp.dragged() && !any_handle_active {
                             let delta = body_resp.drag_delta();
-                            // Перемещение (Position X, Y)
-                            target_clip.position_x += delta.x * 5.0;
-                            target_clip.position_y += delta.y * 5.0;
+                            target_clip.position_x += delta.x / px_scale;
+                            target_clip.position_y += delta.y / px_scale;
                             clip_mutated = true;
                         } else if resp_rb.dragged() || resp_lt.dragged() || resp_rt.dragged() || resp_lb.dragged() {
-                            let delta = if resp_rb.dragged() {
+                            let raw_delta = if resp_rb.dragged() {
                                 resp_rb.drag_delta()
                             } else if resp_lt.dragged() {
                                 -resp_lt.drag_delta()
@@ -700,51 +762,92 @@ impl ViewerState {
                             } else {
                                 vec2(-resp_lb.drag_delta().x, resp_lb.drag_delta().y)
                             };
-                            let zoom_delta = (delta.x / (video_w * monitor_scale).max(1.0) + delta.y / (video_h * monitor_scale).max(1.0)) * 1.5;
+                            let local_dx = raw_delta.x * cos_a + raw_delta.y * sin_a;
+                            let local_dy = -raw_delta.x * sin_a + raw_delta.y * cos_a;
+                            let zoom_delta = (local_dx / screen_rect.width().max(1.0) + local_dy / screen_rect.height().max(1.0)) * 1.5;
                             target_clip.zoom_x = (target_clip.zoom_x + zoom_delta).clamp(0.05, 10.0);
                             target_clip.zoom_y = (target_clip.zoom_y + zoom_delta).clamp(0.05, 10.0);
                             clip_mutated = true;
                         } else if resp_rc.dragged() || resp_lc.dragged() {
-                            let dx = if resp_rc.dragged() { resp_rc.drag_delta().x } else { -resp_lc.drag_delta().x };
-                            let zoom_delta = (dx / (video_w * monitor_scale).max(1.0)) * 2.0;
+                            let raw_dx = if resp_rc.dragged() { resp_rc.drag_delta().x } else { -resp_lc.drag_delta().x };
+                            let raw_dy = if resp_rc.dragged() { resp_rc.drag_delta().y } else { -resp_lc.drag_delta().y };
+                            let local_dx = raw_dx * cos_a + raw_dy * sin_a;
+                            let zoom_delta = (local_dx / screen_rect.width().max(1.0)) * 2.0;
                             target_clip.zoom_x = (target_clip.zoom_x + zoom_delta).clamp(0.05, 10.0);
                             clip_mutated = true;
                         } else if resp_bc.dragged() || resp_tc.dragged() {
-                            let dy = if resp_bc.dragged() { resp_bc.drag_delta().y } else { -resp_tc.drag_delta().y };
-                            let zoom_delta = (dy / (video_h * monitor_scale).max(1.0)) * 2.0;
+                            let raw_dx = if resp_bc.dragged() { resp_bc.drag_delta().x } else { -resp_tc.drag_delta().x };
+                            let raw_dy = if resp_bc.dragged() { resp_bc.drag_delta().y } else { -resp_tc.drag_delta().y };
+                            let local_dy = -raw_dx * sin_a + raw_dy * cos_a;
+                            let zoom_delta = (local_dy / screen_rect.height().max(1.0)) * 2.0;
                             target_clip.zoom_y = (target_clip.zoom_y + zoom_delta).clamp(0.05, 10.0);
                             clip_mutated = true;
                         }
                     }
 
                     if clip_mutated {
+                        if let Some(target_clip) = timeline.clips.iter().find(|c| c.id == top_clip_id) {
+                            top_clip.position_x = target_clip.position_x;
+                            top_clip.position_y = target_clip.position_y;
+                            top_clip.zoom_x = target_clip.zoom_x;
+                            top_clip.zoom_y = target_clip.zoom_y;
+                            top_clip.rotation = target_clip.rotation;
+                        }
                         ui.ctx().request_repaint();
                     }
 
                     let any_drag_stopped = body_resp.drag_stopped()
+                        || resp_rot.drag_stopped()
                         || resp_lt.drag_stopped() || resp_rt.drag_stopped() || resp_lb.drag_stopped() || resp_rb.drag_stopped()
                         || resp_tc.drag_stopped() || resp_bc.drag_stopped() || resp_lc.drag_stopped() || resp_rc.drag_stopped();
                     if any_drag_stopped {
                         let _ = timeline.save_scene_file(&crate::preferences::UserPreferences::scene_path());
                     }
 
-                    // Отрисовка ручек поверх рамки
-                    for (h_rect, resp) in [
-                        (h_lt, &resp_lt), (h_rt, &resp_rt), (h_lb, &resp_lb), (h_rb, &resp_rb),
-                        (h_tc, &resp_tc), (h_bc, &resp_bc), (h_lc, &resp_lc), (h_rc, &resp_rc),
-                    ] {
-                        let fill = if resp.hovered() || resp.dragged() {
-                            Color32::WHITE
+                    // Отрисовка круглых ручек DaVinci Resolve (белый круг с синей каймой #2997ff)
+                    let draw_handle = |painter: &egui::Painter, pos: Pos2, radius: f32, hovered: bool, dragged: bool| {
+                        let (fill, stroke_color, stroke_w) = if dragged {
+                            (resolve_blue, Color32::WHITE, 2.0)
+                        } else if hovered {
+                            (Color32::from_rgb(70, 170, 255), Color32::WHITE, 1.5)
                         } else {
-                            ResolveColors::ACCENT_ORANGE
+                            (Color32::WHITE, resolve_blue, 1.5)
                         };
-                        painter.rect_filled(h_rect, CornerRadius::same(1), fill);
-                        painter.rect_stroke(h_rect, CornerRadius::same(1), Stroke::new(1.0, Color32::BLACK), StrokeKind::Inside);
+                        painter.circle_filled(pos, radius, fill);
+                        painter.circle_stroke(pos, radius, Stroke::new(stroke_w, stroke_color));
+                    };
+
+                    for (pt, resp) in [
+                        (p_lt, &resp_lt), (p_rt, &resp_rt), (p_lb, &resp_lb), (p_rb, &resp_rb),
+                        (p_tc, &resp_tc), (p_bc, &resp_bc), (p_lc, &resp_lc), (p_rc, &resp_rc),
+                    ] {
+                        draw_handle(&painter, pt, 4.5, resp.hovered(), resp.dragged());
+                    }
+
+                    // Ручка вращения на конце стебля
+                    draw_handle(&painter, p_rot, 5.5, resp_rot.hovered(), resp_rot.dragged());
+
+                    // Информационный HUD вверху экрана при трансформации (показывает текущие координаты, масштаб и угол)
+                    let is_transforming = any_handle_active || body_resp.dragged() || body_resp.hovered();
+                    if is_transforming {
+                        let hud_text = format!(
+                            "X: {:+.0} px   Y: {:+.0} px   Zoom: {:.2}x   Rot: {:+.1}°",
+                            top_clip.position_x, top_clip.position_y, top_clip.zoom_x, top_clip.rotation
+                        );
+                        let hud_w = 280.0;
+                        let hud_h = 24.0;
+                        let hud_rect = Rect::from_min_size(
+                            pos2(screen_rect.min.x + 12.0, screen_rect.min.y + 12.0),
+                            vec2(hud_w, hud_h),
+                        );
+                        painter.rect_filled(hud_rect, CornerRadius::same(4), Color32::from_rgba_unmultiplied(12, 14, 18, 220));
+                        painter.rect_stroke(hud_rect, CornerRadius::same(4), Stroke::new(1.0, resolve_blue), StrokeKind::Inside);
+                        painter.text(hud_rect.center(), egui::Align2::CENTER_CENTER, hud_text, egui::FontId::monospace(11.0), Color32::WHITE);
                     }
                 }
             } else {
                 painter.text(
-                    rect.center(),
+                    screen_rect.center(),
                     egui::Align2::CENTER_CENTER,
                     "NO CLIP AT PLAYHEAD",
                     egui::FontId::monospace(11.0),
@@ -752,31 +855,31 @@ impl ViewerState {
                 );
             }
 
-            // 1. Оверлей Каше (Aspect Ratio Mask: Cinema 2.39:1, 9:16 Shorts...)
-            Self::draw_aspect_mask(&painter, rect, self.aspect_mask);
+            // 1. Оверлей Каше (Aspect Ratio Mask: Cinema 2.39:1, 9:16 Shorts...) привязан к границам экрана screen_rect
+            Self::draw_aspect_mask(&painter, screen_rect, self.aspect_mask);
 
             // 2. Направляющие Safe Areas (80% / 90%)
             if self.show_safe_areas {
-                let safe_action = rect.shrink2(vec2(rect.width() * 0.05, rect.height() * 0.05));
-                let safe_title = rect.shrink2(vec2(rect.width() * 0.10, rect.height() * 0.10));
+                let safe_action = screen_rect.shrink2(vec2(screen_rect.width() * 0.05, screen_rect.height() * 0.05));
+                let safe_title = screen_rect.shrink2(vec2(screen_rect.width() * 0.10, screen_rect.height() * 0.10));
                 painter.rect_stroke(safe_action, CornerRadius::ZERO, Stroke::new(1.0, Color32::from_rgb(0x3a, 0x55, 0x77)), StrokeKind::Inside);
                 painter.rect_stroke(safe_title, CornerRadius::ZERO, Stroke::new(1.0, Color32::from_rgb(0x66, 0x44, 0x22)), StrokeKind::Inside);
             }
 
             // 3. Сетка третей (Rule of Thirds)
             if self.show_rule_of_thirds {
-                let w_third = rect.width() / 3.0;
-                let h_third = rect.height() / 3.0;
+                let w_third = screen_rect.width() / 3.0;
+                let h_third = screen_rect.height() / 3.0;
                 let stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 60));
-                painter.line_segment([pos2(rect.min.x + w_third, rect.min.y), pos2(rect.min.x + w_third, rect.max.y)], stroke);
-                painter.line_segment([pos2(rect.min.x + w_third * 2.0, rect.min.y), pos2(rect.min.x + w_third * 2.0, rect.max.y)], stroke);
-                painter.line_segment([pos2(rect.min.x, rect.min.y + h_third), pos2(rect.max.x, rect.min.y + h_third)], stroke);
-                painter.line_segment([pos2(rect.min.x, rect.min.y + h_third * 2.0), pos2(rect.max.x, rect.min.y + h_third * 2.0)], stroke);
+                painter.line_segment([pos2(screen_rect.min.x + w_third, screen_rect.min.y), pos2(screen_rect.min.x + w_third, screen_rect.max.y)], stroke);
+                painter.line_segment([pos2(screen_rect.min.x + w_third * 2.0, screen_rect.min.y), pos2(screen_rect.min.x + w_third * 2.0, screen_rect.max.y)], stroke);
+                painter.line_segment([pos2(screen_rect.min.x, screen_rect.min.y + h_third), pos2(screen_rect.max.x, screen_rect.min.y + h_third)], stroke);
+                painter.line_segment([pos2(screen_rect.min.x, screen_rect.min.y + h_third * 2.0), pos2(screen_rect.max.x, screen_rect.min.y + h_third * 2.0)], stroke);
             }
 
             // 4. Центральное перекрестие (Crosshair)
             if self.show_center_cross {
-                let c = rect.center();
+                let c = screen_rect.center();
                 let stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(232, 124, 36, 160));
                 painter.line_segment([pos2(c.x - 15.0, c.y), pos2(c.x + 15.0, c.y)], stroke);
                 painter.line_segment([pos2(c.x, c.y - 15.0), pos2(c.x, c.y + 15.0)], stroke);
@@ -876,7 +979,19 @@ impl ViewerState {
 
     fn render_transport_bar(&mut self, ui: &mut Ui, timeline: &mut TimelineState) {
         ui.horizontal(|ui| {
-            ui.add_space(ui.available_width() * 0.12);
+            // OSC (On-Screen Control) Transform Toggle в левом нижнем углу как в DaVinci Resolve
+            let osc_active = self.show_transform_overlay;
+            let osc_btn = egui::Button::new(
+                egui::RichText::new("⛶ Transform")
+                    .size(11.0)
+                    .color(if osc_active { Color32::WHITE } else { ResolveColors::TEXT_MUTED }),
+            )
+            .fill(if osc_active { ResolveColors::ACCENT_ORANGE } else { ResolveColors::BG_HEADER });
+            if ui.add(osc_btn).on_hover_text("Интерактивная рамка трансформации клипа на экране (On-Screen Control)").clicked() {
+                self.show_transform_overlay = !self.show_transform_overlay;
+            }
+
+            ui.add_space(ui.available_width() * 0.08);
 
             // Prev Cut
             if ui.button(egui::RichText::new("⏮").size(13.0)).on_hover_text("К началу [Home]").clicked() {

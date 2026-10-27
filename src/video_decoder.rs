@@ -744,8 +744,8 @@ impl VideoPlayer {
                     // Дубликат / уже показанный кадр не считается пропуском воспроизведения
                     continue;
                 }
-                // Кадр реально отстал от живого воспроизведения минимум на 4 кадра (>66 мс)
-                let really_late = target_frame - f >= 4;
+                // Кадр реально отстал от живого воспроизведения минимум на 8 кадров (>133 мс)
+                let really_late = target_frame - f >= 8;
                 if self.drop_frames_enabled
                     && is_continuous_playback
                     && really_late
@@ -1264,7 +1264,7 @@ impl VideoPlayer {
         struct SendVideoFrame(ffmpeg_next::util::frame::Video);
         unsafe impl Send for SendVideoFrame {}
 
-        let (scale_tx, scale_rx) = std::sync::mpsc::sync_channel::<(u64, i64, SendVideoFrame)>(4);
+        let (scale_tx, scale_rx) = std::sync::mpsc::sync_channel::<(u64, i64, SendVideoFrame)>(8);
         let (recycle_tx, recycle_rx) = std::sync::mpsc::channel::<SendVideoFrame>();
         let cancel_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let cancel_epoch_b = cancel_epoch.clone();
