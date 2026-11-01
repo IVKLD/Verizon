@@ -78,6 +78,8 @@ impl RenderCacheManager {
         // Включаем активные видеоклипы на таймлайне под этим кадром
         for c in &timeline.clips {
             if !c.is_audio && c.contains_frame(frame) {
+                let track_muted = timeline.tracks.get(c.track_index).map(|t| t.is_muted).unwrap_or(false);
+                track_muted.hash(&mut hasher);
                 c.id.hash(&mut hasher);
                 c.track_index.hash(&mut hasher);
                 c.start_frame.hash(&mut hasher);

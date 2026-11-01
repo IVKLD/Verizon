@@ -248,12 +248,9 @@ impl AudioPlayer {
         .or_else(|| device.default_output_config().ok())?;
 
         let sample_format = config.sample_format();
-        let err_fn = |err: cpal::Error| {
-            let msg = err.to_string();
+        let err_fn = |_err: cpal::Error| {
             // Underrun/overrun в ALSA/PipeWire являются нефатальными предупреждениями тайминга буфера
-            if !msg.to_lowercase().contains("underrun") && !msg.to_lowercase().contains("overrun") {
-                eprintln!("Audio stream error: {}", msg);
-            }
+            // Никаких блокирующих I/O (eprintln! / println!) в real-time аудио-потоке согласно Senior Rust правилам
         };
 
         let stream = match sample_format {
@@ -274,15 +271,17 @@ impl AudioPlayer {
                 let engine_clone = engine.clone();
                 let vu_l_clone = vu_l.clone();
                 let vu_r_clone = vu_r.clone();
-                let mut temp: Vec<f32> = Vec::new();
+                let mut temp = vec![0.0f32; 8192];
                 device.build_output_stream(
                     config.into(),
                     move |data: &mut [i16], _| {
-                        if temp.len() != data.len() {
-                            temp.resize(data.len(), 0.0);
+                        let needed = data.len();
+                        if temp.len() < needed {
+                            temp.resize(needed, 0.0);
                         }
-                        Self::write_audio_data(&mut temp, &engine_clone, &vu_l_clone, &vu_r_clone);
-                        for (dst, src) in data.iter_mut().zip(temp.iter()) {
+                        let slice = &mut temp[..needed];
+                        Self::write_audio_data(slice, &engine_clone, &vu_l_clone, &vu_r_clone);
+                        for (dst, src) in data.iter_mut().zip(slice.iter()) {
                             *dst = (src * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                         }
                     },
@@ -294,15 +293,17 @@ impl AudioPlayer {
                 let engine_clone = engine.clone();
                 let vu_l_clone = vu_l.clone();
                 let vu_r_clone = vu_r.clone();
-                let mut temp: Vec<f32> = Vec::new();
+                let mut temp = vec![0.0f32; 8192];
                 device.build_output_stream(
                     config.into(),
                     move |data: &mut [i32], _| {
-                        if temp.len() != data.len() {
-                            temp.resize(data.len(), 0.0);
+                        let needed = data.len();
+                        if temp.len() < needed {
+                            temp.resize(needed, 0.0);
                         }
-                        Self::write_audio_data(&mut temp, &engine_clone, &vu_l_clone, &vu_r_clone);
-                        for (dst, src) in data.iter_mut().zip(temp.iter()) {
+                        let slice = &mut temp[..needed];
+                        Self::write_audio_data(slice, &engine_clone, &vu_l_clone, &vu_r_clone);
+                        for (dst, src) in data.iter_mut().zip(slice.iter()) {
                             *dst = (src * i32::MAX as f32).clamp(i32::MIN as f32, i32::MAX as f32) as i32;
                         }
                     },
@@ -314,15 +315,17 @@ impl AudioPlayer {
                 let engine_clone = engine.clone();
                 let vu_l_clone = vu_l.clone();
                 let vu_r_clone = vu_r.clone();
-                let mut temp: Vec<f32> = Vec::new();
+                let mut temp = vec![0.0f32; 8192];
                 device.build_output_stream(
                     config.into(),
                     move |data: &mut [u8], _| {
-                        if temp.len() != data.len() {
-                            temp.resize(data.len(), 0.0);
+                        let needed = data.len();
+                        if temp.len() < needed {
+                            temp.resize(needed, 0.0);
                         }
-                        Self::write_audio_data(&mut temp, &engine_clone, &vu_l_clone, &vu_r_clone);
-                        for (dst, src) in data.iter_mut().zip(temp.iter()) {
+                        let slice = &mut temp[..needed];
+                        Self::write_audio_data(slice, &engine_clone, &vu_l_clone, &vu_r_clone);
+                        for (dst, src) in data.iter_mut().zip(slice.iter()) {
                             *dst = ((src * 127.0) + 128.0).clamp(0.0, 255.0) as u8;
                         }
                     },

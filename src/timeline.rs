@@ -359,12 +359,17 @@ pub struct TimelineState {
 }
 
 impl TimelineState {
-    /// Получить активный видеоклип под кадром с учетом приоритета дорожек V2 > V1, отключения и выделения
+    /// Получить активный видеоклип под кадром с учетом приоритета дорожек V2 > V1, отключения, мутирования дорожек и выделения
     #[inline]
     pub fn active_video_clip_at(&self, frame: i64) -> Option<&Clip> {
         self.clips
             .iter()
-            .filter(|c| !c.is_audio && !c.is_disabled && c.contains_frame(frame))
+            .filter(|c| {
+                !c.is_audio
+                    && !c.is_disabled
+                    && !self.tracks.get(c.track_index).map(|t| t.is_muted).unwrap_or(false)
+                    && c.contains_frame(frame)
+            })
             .min_by_key(|c| (if self.selected_clip_id == Some(c.id) { 0usize } else { 1usize }, c.track_index))
     }
 
@@ -557,14 +562,13 @@ impl TimelineState {
             is_solo: false,
             height: self.track_height,
         };
-        let first_audio = self.tracks.iter().position(|t| !t.is_video).unwrap_or(self.tracks.len());
-        self.tracks.insert(first_audio, new_track);
+        // В DaVinci Resolve верхние видеодорожки (V3, V4...) располагаются ВЫШЕ V2 и V1 (на нулевом индексе вверху)
+        self.tracks.insert(0, new_track);
         for c in &mut self.clips {
-            if c.track_index >= first_audio {
-                c.track_index += 1;
-            }
+            c.track_index += 1;
         }
         self.audio_dirty = true;
+        self.structure_dirty = true;
     }
 
     /// Добавить новую аудиодорожку (A2, A3...)
@@ -579,6 +583,7 @@ impl TimelineState {
             height: self.track_height,
         });
         self.audio_dirty = true;
+        self.structure_dirty = true;
     }
 
     /// Максимальный конечный кадр всех клипов на таймлайне
@@ -619,11 +624,21 @@ impl TimelineState {
             None => return false,
         };
 
-        // Если включена связность клипов, находим все клипы в группе (Video + Audio)
+        // Заблокированные дорожки нельзя разрезать
+        if self.tracks.get(clip.track_index).map(|t| t.is_locked).unwrap_or(false) {
+            return false;
+        }
+
+        // Если включена связность клипов, находим все клипы в группе (Video + Audio), исключая заблокированные дорожки
         let target_ids: Vec<u64> = if self.linked_selection && clip.link_group.is_some() {
             self.clips
                 .iter()
-                .filter(|c| c.link_group == clip.link_group && cut_frame > c.start_frame && cut_frame < c.end_frame())
+                .filter(|c| {
+                    c.link_group == clip.link_group
+                        && cut_frame > c.start_frame
+                        && cut_frame < c.end_frame()
+                        && !self.tracks.get(c.track_index).map(|t| t.is_locked).unwrap_or(false)
+                })
                 .map(|c| c.id)
                 .collect()
         } else if cut_frame > clip.start_frame && cut_frame < clip.end_frame() {
@@ -704,10 +719,22 @@ impl TimelineState {
     /// Удалить выделенный клип (Delete / Backspace) с учетом связности
     pub fn delete_selected_clip(&mut self) {
         if let Some(selected_id) = self.selected_clip_id {
+            let is_sel_locked = self
+                .clips
+                .iter()
+                .find(|c| c.id == selected_id)
+                .map(|c| self.tracks.get(c.track_index).map(|t| t.is_locked).unwrap_or(false))
+                .unwrap_or(false);
+            if is_sel_locked {
+                return;
+            }
+
             self.push_history();
             let link_grp = self.clips.iter().find(|c| c.id == selected_id).and_then(|c| c.link_group);
             if self.linked_selection && link_grp.is_some() {
-                self.clips.retain(|c| c.link_group != link_grp);
+                self.clips.retain(|c| {
+                    !(c.link_group == link_grp && !self.tracks.get(c.track_index).map(|t| t.is_locked).unwrap_or(false))
+                });
             } else {
                 self.clips.retain(|c| c.id != selected_id);
             }
@@ -720,14 +747,32 @@ impl TimelineState {
     /// Удаление со сдвигом последующих клипов (DaVinci Resolve Ripple Delete [Shift+Delete / Shift+Backspace])
     pub fn ripple_delete_selected_clip(&mut self) {
         if let Some(selected_id) = self.selected_clip_id {
+            let is_sel_locked = self
+                .clips
+                .iter()
+                .find(|c| c.id == selected_id)
+                .map(|c| self.tracks.get(c.track_index).map(|t| t.is_locked).unwrap_or(false))
+                .unwrap_or(false);
+            if is_sel_locked {
+                return;
+            }
+
             self.push_history();
 
-            // Определяем все удаляемые клипы (с учетом связи A/V)
+            // Определяем все удаляемые клипы (с учетом связи A/V, пропуская заблокированные дорожки)
             let link_grp = self.clips.iter().find(|c| c.id == selected_id).and_then(|c| c.link_group);
             let to_delete: Vec<Clip> = if self.linked_selection && link_grp.is_some() {
-                self.clips.iter().filter(|c| c.link_group == link_grp).cloned().collect()
+                self.clips
+                    .iter()
+                    .filter(|c| c.link_group == link_grp && !self.tracks.get(c.track_index).map(|t| t.is_locked).unwrap_or(false))
+                    .cloned()
+                    .collect()
             } else {
-                self.clips.iter().filter(|c| c.id == selected_id).cloned().collect()
+                self.clips
+                    .iter()
+                    .filter(|c| c.id == selected_id && !self.tracks.get(c.track_index).map(|t| t.is_locked).unwrap_or(false))
+                    .cloned()
+                    .collect()
             };
 
             if to_delete.is_empty() {
@@ -739,16 +784,13 @@ impl TimelineState {
             let gap_duration = max_end - min_start;
 
             if gap_duration > 0 {
-                // Удаляем клипы
-                if self.linked_selection && link_grp.is_some() {
-                    self.clips.retain(|c| c.link_group != link_grp);
-                } else {
-                    self.clips.retain(|c| c.id != selected_id);
-                }
+                // Удаляем незаблокированные клипы
+                let del_ids: Vec<u64> = to_delete.iter().map(|c| c.id).collect();
+                self.clips.retain(|c| !del_ids.contains(&c.id));
 
-                // Сдвигаем все последующие клипы влево на ширину удаленного интервала
+                // Сдвигаем все последующие клипы влево на ширину удаленного интервала (кроме заблокированных дорожек)
                 for clip in &mut self.clips {
-                    if clip.start_frame >= max_end {
+                    if clip.start_frame >= max_end && !self.tracks.get(clip.track_index).map(|t| t.is_locked).unwrap_or(false) {
                         clip.start_frame -= gap_duration;
                     }
                 }
@@ -779,6 +821,11 @@ impl TimelineState {
             Some(idx) => idx,
             None => return,
         };
+
+        // Заблокированные дорожки нельзя перемещать
+        if self.tracks.get(self.clips[clip_idx].track_index).map(|t| t.is_locked).unwrap_or(false) {
+            return;
+        }
 
         let old_start = self.clips[clip_idx].start_frame;
         let mut target_frame = raw_start.max(0);
@@ -811,12 +858,13 @@ impl TimelineState {
         let delta_frames = target_frame - old_start;
         let link_grp = self.clips[clip_idx].link_group;
 
-        // Перемещение по дорожкам (Track Index) с проверкой типа (видео на видео, аудио на аудио)
+        // Перемещение по дорожкам (Track Index) с проверкой типа (видео на видео, аудио на аудио) и блокировки
         if let Some(target_t) = new_track {
             if target_t < self.tracks.len() {
                 let is_vid = !self.clips[clip_idx].is_audio;
                 let track_is_vid = self.tracks[target_t].is_video;
-                if is_vid == track_is_vid {
+                let is_target_locked = self.tracks[target_t].is_locked;
+                if is_vid == track_is_vid && !is_target_locked {
                     self.clips[clip_idx].track_index = target_t;
                 }
             }
@@ -824,10 +872,15 @@ impl TimelineState {
 
         if delta_frames != 0 {
             if self.linked_selection && link_grp.is_some() {
-                // Перемещаем ВСЕ связанные клипы (Видео + Аудио) синхронно!
-                for clip in &mut self.clips {
-                    if clip.link_group == link_grp {
-                        clip.start_frame = (clip.start_frame + delta_frames).max(0);
+                // Перемещаем ВСЕ связанные клипы (Видео + Аудио) синхронно, если ни один из них не на заблокированной дорожке
+                let any_locked = self.clips.iter().any(|c| {
+                    c.link_group == link_grp && self.tracks.get(c.track_index).map(|t| t.is_locked).unwrap_or(false)
+                });
+                if !any_locked {
+                    for clip in &mut self.clips {
+                        if clip.link_group == link_grp {
+                            clip.start_frame = (clip.start_frame + delta_frames).max(0);
+                        }
                     }
                 }
             } else {
@@ -844,6 +897,10 @@ impl TimelineState {
             Some(idx) => idx,
             None => return,
         };
+
+        if self.tracks.get(self.clips[clip_idx].track_index).map(|t| t.is_locked).unwrap_or(false) {
+            return;
+        }
 
         let link_grp = self.clips[clip_idx].link_group;
         // Нельзя подрезать левее начала исходного файла медиа
@@ -862,7 +919,7 @@ impl TimelineState {
 
         if self.linked_selection && link_grp.is_some() {
             for clip in &mut self.clips {
-                if clip.link_group == link_grp {
+                if clip.link_group == link_grp && !self.tracks.get(clip.track_index).map(|t| t.is_locked).unwrap_or(false) {
                     apply_trim(clip);
                 }
             }
@@ -881,6 +938,10 @@ impl TimelineState {
             None => return,
         };
 
+        if self.tracks.get(self.clips[clip_idx].track_index).map(|t| t.is_locked).unwrap_or(false) {
+            return;
+        }
+
         let link_grp = self.clips[clip_idx].link_group;
         let min_end = session.init_start_frame + 1;
         let clamped_end = target_end.max(min_end);
@@ -888,7 +949,7 @@ impl TimelineState {
 
         if self.linked_selection && link_grp.is_some() {
             for clip in &mut self.clips {
-                if clip.link_group == link_grp {
+                if clip.link_group == link_grp && !self.tracks.get(clip.track_index).map(|t| t.is_locked).unwrap_or(false) {
                     clip.duration_frames = new_duration;
                 }
             }

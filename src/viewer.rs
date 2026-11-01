@@ -442,72 +442,78 @@ impl ViewerState {
             }
 
             // 6. Статус аппаратного ускорения GPU и индикатор Drop Frame (DaVinci Resolve)
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let (badge_text, badge_color) = if video_player.gpu_accelerated {
-                    (video_player.gpu_badge.as_str(), ResolveColors::ACCENT_ORANGE)
-                } else {
-                    ("⚡ GPU: Idle / CPU", ResolveColors::TEXT_MUTED)
-                };
-                ui.label(egui::RichText::new(badge_text).size(10.0).strong().color(badge_color))
-                    .on_hover_text("Аппаратное ускорение видеодекодирования на GPU (VA-API / CUDA)");
+            if ui.available_width() > 140.0 {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.available_width() > 180.0 {
+                        let (badge_text, badge_color) = if video_player.gpu_accelerated {
+                            (video_player.gpu_badge.as_str(), ResolveColors::ACCENT_ORANGE)
+                        } else {
+                            ("⚡ GPU: Idle / CPU", ResolveColors::TEXT_MUTED)
+                        };
+                        ui.label(egui::RichText::new(badge_text).size(10.0).strong().color(badge_color))
+                            .on_hover_text("Аппаратное ускорение видеодекодирования на GPU (VA-API / CUDA)");
 
-                ui.separator();
-
-                // Индикатор частоты кадров и Drop Frame в стиле DaVinci Resolve
-                let is_active_playback = video_player.is_playing_mode;
-                let (fps_color, fps_val) = if is_active_playback {
-                    let cur_fps = if video_player.real_playback_fps > 0.0 {
-                        video_player.real_playback_fps
-                    } else {
-                        video_player.fps as f32
-                    };
-                    if video_player.is_dropping_frames {
-                        (Color32::from_rgb(255, 69, 58), cur_fps) // Красный (Drop Frame)
-                    } else {
-                        (Color32::from_rgb(48, 209, 88), cur_fps) // Зеленый (Nominal Real-time)
+                        ui.separator();
                     }
-                } else {
-                    (ResolveColors::TEXT_MUTED, video_player.fps as f32)
-                };
 
-                let drop_info = if is_active_playback && video_player.dropped_frames_count > 0 {
-                    format!("● {:.1} fps (Drop: {})", fps_val, video_player.dropped_frames_count)
-                } else {
-                    format!("● {:.1} fps", fps_val)
-                };
+                    // Индикатор частоты кадров и Drop Frame в стиле DaVinci Resolve
+                    let is_active_playback = video_player.is_playing_mode;
+                    let (fps_color, fps_val) = if is_active_playback {
+                        let cur_fps = if video_player.real_playback_fps > 0.0 {
+                            video_player.real_playback_fps
+                        } else {
+                            video_player.fps as f32
+                        };
+                        if video_player.is_dropping_frames {
+                            (Color32::from_rgb(255, 69, 58), cur_fps) // Красный (Drop Frame)
+                        } else {
+                            (Color32::from_rgb(48, 209, 88), cur_fps) // Зеленый (Nominal Real-time)
+                        }
+                    } else {
+                        (ResolveColors::TEXT_MUTED, video_player.fps as f32)
+                    };
 
-                ui.label(egui::RichText::new(drop_info).size(10.0).strong().color(fps_color))
-                    .on_hover_text("Реальный FPS предпросмотра и индикатор пропуска кадров (DaVinci Resolve Drop Frame Indicator)");
+                    let drop_info = if is_active_playback && video_player.dropped_frames_count > 0 {
+                        format!("● {:.1} fps (Drop: {})", fps_val, video_player.dropped_frames_count)
+                    } else {
+                        format!("● {:.1} fps", fps_val)
+                    };
 
-                // Кнопка режима воспроизведения: Real-Time Drop Frame vs Show All Frames
-                let mode_text = if video_player.drop_frames_enabled {
-                    "⏱ Real-Time (Drop)"
-                } else {
-                    "🐢 All Frames (Slow-Mo)"
-                };
-                let mode_btn = egui::Button::new(
-                    egui::RichText::new(mode_text)
-                        .size(10.0)
-                        .color(if video_player.drop_frames_enabled { Color32::WHITE } else { ResolveColors::ACCENT_ORANGE }),
-                )
-                .fill(if video_player.drop_frames_enabled { ResolveColors::BG_HEADER } else { ResolveColors::BG_MAIN });
+                    ui.label(egui::RichText::new(drop_info).size(10.0).strong().color(fps_color))
+                        .on_hover_text("Реальный FPS предпросмотра и индикатор пропуска кадров (DaVinci Resolve Drop Frame Indicator)");
 
-                if ui.add(mode_btn)
-                    .on_hover_text("Переключение режима: Real-Time Sync (пропуск кадров для сохранения 1.0x скорости звука, как в DaVinci) или Show All Frames (slow-mo)")
-                    .clicked()
-                {
-                    video_player.drop_frames_enabled = !video_player.drop_frames_enabled;
-                }
-            });
+                    // Кнопка режима воспроизведения: Real-Time Drop Frame vs Show All Frames
+                    if ui.available_width() > 120.0 {
+                        let mode_text = if video_player.drop_frames_enabled {
+                            "⏱ Real-Time (Drop)"
+                        } else {
+                            "🐢 All Frames (Slow-Mo)"
+                        };
+                        let mode_btn = egui::Button::new(
+                            egui::RichText::new(mode_text)
+                                .size(10.0)
+                                .color(if video_player.drop_frames_enabled { Color32::WHITE } else { ResolveColors::ACCENT_ORANGE }),
+                        )
+                        .fill(if video_player.drop_frames_enabled { ResolveColors::BG_HEADER } else { ResolveColors::BG_MAIN });
+
+                        if ui.add(mode_btn)
+                            .on_hover_text("Переключение режима: Real-Time Sync (пропуск кадров для сохранения 1.0x скорости звука, как в DaVinci) или Show All Frames (slow-mo)")
+                            .clicked()
+                        {
+                            video_player.drop_frames_enabled = !video_player.drop_frames_enabled;
+                        }
+                    }
+                });
+            }
         });
     }
 
     fn render_source_viewer(&mut self, ui: &mut Ui, video_player: &VideoPlayer) {
         ui.horizontal(|ui| {
             let label = if let Some(p) = &video_player.current_path {
-                p.file_name().and_then(|n| n.to_str()).unwrap_or("A001_C001_0422.MOV")
+                p.file_name().and_then(|n| n.to_str()).unwrap_or("No Media Loaded")
             } else {
-                "A001_C001_0422.MOV"
+                "No Media Loaded"
             };
             ui.label(
                 egui::RichText::new("SOURCE: ")
@@ -522,8 +528,9 @@ impl ViewerState {
                     .color(ResolveColors::TEXT_PRIMARY),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let duration_tc = Timecode::new(video_player.total_frames, (video_player.fps.round() as u32).max(1)).to_smpte();
                 ui.label(
-                    egui::RichText::new("00:00:02:14")
+                    egui::RichText::new(duration_tc)
                         .size(11.0)
                         .color(ResolveColors::TEXT_TIMECODE)
                         .monospace(),
@@ -565,9 +572,10 @@ impl ViewerState {
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
+            let out_tc = Timecode::new(video_player.total_frames, (video_player.fps.round() as u32).max(1)).to_smpte();
             ui.label(egui::RichText::new("In: 00:00:00:00").size(10.0).color(ResolveColors::TEXT_MUTED));
             ui.separator();
-            ui.label(egui::RichText::new("Out: 00:00:05:00").size(10.0).color(ResolveColors::TEXT_MUTED));
+            ui.label(egui::RichText::new(format!("Out: {}", out_tc)).size(10.0).color(ResolveColors::TEXT_MUTED));
         });
     }
 

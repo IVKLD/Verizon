@@ -57,7 +57,7 @@ pub struct VideoPlayer {
     pub rendered_frames_in_sample: u32,
 
     /// Грубый отпечаток последнего показанного кадра (сетка 16x9, яркость) — для проверки точности кадра в тестах
-    pub last_fingerprint: Vec<u8>,
+    pub last_fingerprint: [u8; 144],
     /// Последнее фактически отображенное изображение кадра (для интеграции с Render Cache)
     pub last_displayed_image: Option<Arc<ColorImage>>,
     /// Очередь свежедекодированных кадров для прямой регистрации в Render Cache
@@ -65,6 +65,8 @@ pub struct VideoPlayer {
 
     // Фоновый канал для безынерционной асинхронной очистки кадров (исключает вызовы thread::spawn и mmap_lock в UI)
     gc_tx: std::sync::mpsc::Sender<Vec<ColorImage>>,
+    // Пул переиспользуемых пиксельных буферов (исключает ~220 МБ/с аллокаций в scale_worker)
+    pixel_pool_tx: Option<std::sync::mpsc::SyncSender<Vec<egui::Color32>>>,
 }
 
 
@@ -102,13 +104,14 @@ const SCRUB_MIN_REQUEST_INTERVAL_MS: u128 = 80;
 /// Через сколько мс без доставки кадра запрос считается потерянным и отправляется заново
 const SCRUB_STALL_TIMEOUT_MS: u128 = 200;
 
-/// Грубый отпечаток кадра: средняя яркость в сетке 16x9 (по 3x3 выборкам на ячейку). Дёшево (~400 пикселей).
-pub fn image_fingerprint(img: &ColorImage) -> Vec<u8> {
+/// Грубый отпечаток кадра: средняя яркость в сетке 16x9 (по 3x3 выборкам на ячейку). Дёшево (~400 пикселей, без аллокаций).
+pub fn image_fingerprint(img: &ColorImage) -> [u8; 144] {
     let [w, h] = img.size;
-    let mut out = Vec::with_capacity(144);
+    let mut out = [0u8; 144];
     if w == 0 || h == 0 {
         return out;
     }
+    let mut idx = 0;
     for gy in 0..9usize {
         for gx in 0..16usize {
             let mut acc = 0u32;
@@ -120,7 +123,8 @@ pub fn image_fingerprint(img: &ColorImage) -> Vec<u8> {
                     acc += (c.r() as u32 * 77 + c.g() as u32 * 150 + c.b() as u32 * 29) >> 8;
                 }
             }
-            out.push((acc / 9) as u8);
+            out[idx] = (acc / 9) as u8;
+            idx += 1;
         }
     }
     out
@@ -130,6 +134,7 @@ impl Drop for VideoPlayer {
         // Корректно завершаем и дожидаемся фонового рабочего потока для мгновенного освобождения GPU VAAPI контекста
         self.command_tx = None;
         self.frame_rx = None;
+        self.pixel_pool_tx = None;
         if let Some(handle) = self.worker_handle.take() {
             let _ = handle.join();
         }
@@ -173,7 +178,7 @@ impl VideoPlayer {
             drop_frames_enabled: true,
             fps_sample_time: std::time::Instant::now(),
             rendered_frames_in_sample: 0,
-            last_fingerprint: Vec::new(),
+            last_fingerprint: [0u8; 144],
             last_displayed_image: None,
             newly_cached_frames: Vec::with_capacity(64),
             gc_tx: {
@@ -188,14 +193,33 @@ impl VideoPlayer {
                     .expect("Failed to spawn GC worker");
                 tx
             },
+            pixel_pool_tx: None,
         }
     }
 
     /// Безопасная фоновая утилизация буферов изображений без системных вызовов в UI-потоке
+    /// с неблокирующим возвратом аллоцированных буферов в пул декодера
     #[inline]
     pub fn recycle_images(&self, images: Vec<ColorImage>) {
         if !images.is_empty() {
-            let _ = self.gc_tx.send(images);
+            let mut remaining = Vec::new();
+            if let Some(pool) = &self.pixel_pool_tx {
+                for mut img in images {
+                    let mut pixels = std::mem::take(&mut img.pixels);
+                    pixels.clear();
+                    if let Err(e) = pool.try_send(pixels) {
+                        img.pixels = match e {
+                            std::sync::mpsc::TrySendError::Full(p) | std::sync::mpsc::TrySendError::Disconnected(p) => p,
+                        };
+                        remaining.push(img);
+                    }
+                }
+            } else {
+                remaining = images;
+            }
+            if !remaining.is_empty() {
+                let _ = self.gc_tx.send(remaining);
+            }
         }
     }
 
@@ -215,6 +239,7 @@ impl VideoPlayer {
         // Завершаем предыдущий фоновый воркер если был открыт другой файл
         self.command_tx = None;
         self.frame_rx = None;
+        self.pixel_pool_tx = None;
         if let Some(handle) = self.worker_handle.take() {
             let _ = handle.join();
         }
@@ -282,6 +307,7 @@ impl VideoPlayer {
         // Сбрасываем и корректно завершаем предыдущий фоновый воркер (если файл уже был открыт)
         self.command_tx = None;
         self.frame_rx = None;
+        self.pixel_pool_tx = None;
         if let Some(handle) = self.worker_handle.take() {
             let _ = handle.join();
         }
@@ -310,6 +336,7 @@ impl VideoPlayer {
         // Создаем каналы для фонового воркера декодирования
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<DecoderCommand>();
         let (frame_tx, frame_rx) = std::sync::mpsc::channel::<(u64, i64, ColorImage)>();
+        let (pixel_pool_tx, pixel_pool_rx) = std::sync::mpsc::sync_channel::<Vec<egui::Color32>>(24);
         let egui_ctx = ctx.clone();
         let file_path = path.to_path_buf();
 
@@ -321,10 +348,12 @@ impl VideoPlayer {
                 fps,
                 cmd_rx,
                 frame_tx,
+                pixel_pool_rx,
                 egui_ctx,
             );
         });
         self.worker_handle = Some(handle);
+        self.pixel_pool_tx = Some(pixel_pool_tx);
 
         // Запрашиваем начальный 0-й кадр
         let _ = cmd_tx.send(DecoderCommand::Seek {
@@ -1107,6 +1136,7 @@ impl VideoPlayer {
         fps: f64,
         cmd_rx: std::sync::mpsc::Receiver<DecoderCommand>,
         frame_tx: std::sync::mpsc::Sender<(u64, i64, ColorImage)>,
+        pixel_pool_rx: std::sync::mpsc::Receiver<Vec<egui::Color32>>,
         egui_ctx: Context,
     ) {
         unsafe extern "C" fn get_vaapi_format(
@@ -1253,7 +1283,7 @@ impl VideoPlayer {
         let h = scaled_h as usize;
         let mut current_pts: i64 = -1;
         let mut current_decoded_frame: i64 = -1;
-        let mut rgba_buffer = vec![0u8; w * h * 4];
+        let mut seek_pixel_buf: Vec<egui::Color32> = Vec::with_capacity(w * h);
         let mut decoded_frame = ffmpeg_next::util::frame::Video::empty();
         let mut sw_frame = ffmpeg_next::util::frame::Video::empty();
         let mut rgba_frame = ffmpeg_next::util::frame::Video::empty();
@@ -1284,10 +1314,13 @@ impl VideoPlayer {
                 return;
             };
             let mut rgba_frame_b = ffmpeg_next::util::frame::Video::empty();
-            let mut dummy_buf = Vec::new();
+            let mut dummy_buf = pixel_pool_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(w * h));
             let mut ignored_sw = ffmpeg_next::util::frame::Video::empty();
             while let Ok((ep, f_num, SendVideoFrame(sw_f))) = scale_rx.recv() {
                 if ep >= cancel_epoch_b.load(std::sync::atomic::Ordering::Acquire) {
+                    if dummy_buf.capacity() < w * h {
+                        dummy_buf = pixel_pool_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(w * h));
+                    }
                     if let Some(img) = Self::scale_and_copy_frame(
                         &mut scaler_b,
                         &sw_f,
@@ -1422,6 +1455,9 @@ impl VideoPlayer {
                     let mut found_image: Option<ColorImage> = None;
                     let mut keyframe_sent = false;
                     let mut aborted_seek = false;
+                    if seek_pixel_buf.capacity() < w * h {
+                        seek_pixel_buf = Vec::with_capacity(w * h);
+                    }
 
                     if !waiting_for_keyframe {
                         while video_decoder.receive_frame(&mut decoded_frame).is_ok() {
@@ -1430,6 +1466,9 @@ impl VideoPlayer {
                             let f_num = (pts as f64 * time_base_f * fps).round() as i64;
                             current_decoded_frame = f_num;
                             if pts >= target_pts - tolerance {
+                                if seek_pixel_buf.capacity() < w * h {
+                                    seek_pixel_buf = Vec::with_capacity(w * h);
+                                }
                                 found_image = Self::scale_and_copy_frame(
                                     &mut scaler,
                                     &decoded_frame,
@@ -1437,7 +1476,7 @@ impl VideoPlayer {
                                     &mut rgba_frame,
                                     w,
                                     h,
-                                    &mut rgba_buffer,
+                                    &mut seek_pixel_buf,
                                 );
                                 break;
                             }
@@ -1530,6 +1569,9 @@ impl VideoPlayer {
                                         current_decoded_frame = f_num;
 
                                         if pts >= target_pts - tolerance {
+                                            if seek_pixel_buf.capacity() < w * h {
+                                                seek_pixel_buf = Vec::with_capacity(w * h);
+                                            }
                                             found_image = Self::scale_and_copy_frame(
                                                 &mut scaler,
                                                 &decoded_frame,
@@ -1537,12 +1579,15 @@ impl VideoPlayer {
                                                 &mut rgba_frame,
                                                 w,
                                                 h,
-                                                &mut rgba_buffer,
+                                                &mut seek_pixel_buf,
                                             );
                                             break;
                                         }
 
                                         if !keyframe_sent {
+                                            if seek_pixel_buf.capacity() < w * h {
+                                                seek_pixel_buf = Vec::with_capacity(w * h);
+                                            }
                                             if let Some(kf_img) = Self::scale_and_copy_frame(
                                                 &mut scaler,
                                                 &decoded_frame,
@@ -1550,7 +1595,7 @@ impl VideoPlayer {
                                                 &mut rgba_frame,
                                                 w,
                                                 h,
-                                                &mut rgba_buffer,
+                                                &mut seek_pixel_buf,
                                             ) {
                                                 if frame_tx.send((epoch, -(f_num + 1), kf_img)).is_err() {
                                                     break 'worker_loop;
@@ -1577,6 +1622,9 @@ impl VideoPlayer {
                                 current_pts = pts;
                                 last_drain_frame_ok = true;
                                 if pts >= target_pts - tolerance {
+                                    if seek_pixel_buf.capacity() < w * h {
+                                        seek_pixel_buf = Vec::with_capacity(w * h);
+                                    }
                                     found_image = Self::scale_and_copy_frame(
                                         &mut scaler,
                                         &decoded_frame,
@@ -1584,12 +1632,15 @@ impl VideoPlayer {
                                         &mut rgba_frame,
                                         w,
                                         h,
-                                        &mut rgba_buffer,
+                                        &mut seek_pixel_buf,
                                     );
                                     break;
                                 }
                             }
                             if found_image.is_none() && last_drain_frame_ok {
+                                if seek_pixel_buf.capacity() < w * h {
+                                    seek_pixel_buf = Vec::with_capacity(w * h);
+                                }
                                 found_image = Self::scale_and_copy_frame(
                                     &mut scaler,
                                     &decoded_frame,
@@ -1597,7 +1648,7 @@ impl VideoPlayer {
                                     &mut rgba_frame,
                                     w,
                                     h,
-                                    &mut rgba_buffer,
+                                    &mut seek_pixel_buf,
                                 );
                             }
                             if found_image.is_none() && !last_drain_frame_ok && target_pts > 0 {
@@ -1624,6 +1675,9 @@ impl VideoPlayer {
                                     last_drain_frame_ok = true;
                                 }
                                 if last_drain_frame_ok {
+                                    if seek_pixel_buf.capacity() < w * h {
+                                        seek_pixel_buf = Vec::with_capacity(w * h);
+                                    }
                                     found_image = Self::scale_and_copy_frame(
                                         &mut scaler,
                                         &decoded_frame,
@@ -1631,7 +1685,7 @@ impl VideoPlayer {
                                         &mut rgba_frame,
                                         w,
                                         h,
-                                        &mut rgba_buffer,
+                                        &mut seek_pixel_buf,
                                     );
                                 }
                             }
@@ -1962,7 +2016,7 @@ impl VideoPlayer {
         rgba_frame: &mut ffmpeg_next::util::frame::Video,
         w: usize,
         h: usize,
-        _rgba_buffer: &mut Vec<u8>,
+        pixel_buf: &mut Vec<egui::Color32>,
     ) -> Option<ColorImage> {
         let frame_to_scale = unsafe {
             let fmt = (*decoded_frame.as_ptr()).format;
@@ -2006,21 +2060,21 @@ impl VideoPlayer {
             let data = rgba_frame.data(0);
             let stride = rgba_frame.stride(0);
 
-            // Безопасная однопроходная конвертация RGBA8 -> Color32 (один memcpy, без unsafe и без промежуточного клона)
-            let pixels: Vec<egui::Color32> = if stride == w * 4 && data.len() >= w * h * 4 {
-                bytemuck::pod_collect_to_vec::<u8, egui::Color32>(&data[..w * h * 4])
+            // Безопасное zero-allocation заполнение переиспользуемого буфера кадров (один memcpy)
+            pixel_buf.clear();
+            if stride == w * 4 && data.len() >= w * h * 4 {
+                pixel_buf.extend_from_slice(bytemuck::cast_slice::<u8, egui::Color32>(&data[..w * h * 4]));
             } else {
-                let mut px: Vec<egui::Color32> = Vec::with_capacity(w * h);
                 for y in 0..h {
                     let src_start = y * stride;
                     if src_start + w * 4 > data.len() {
                         return None;
                     }
-                    px.extend_from_slice(bytemuck::cast_slice::<u8, egui::Color32>(&data[src_start..src_start + w * 4]));
+                    pixel_buf.extend_from_slice(bytemuck::cast_slice::<u8, egui::Color32>(&data[src_start..src_start + w * 4]));
                 }
-                px
-            };
+            }
 
+            let pixels = std::mem::take(pixel_buf);
             Some(ColorImage { size: [w, h], source_size: egui::vec2(w as f32, h as f32), pixels })
         } else {
             None

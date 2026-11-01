@@ -35,7 +35,12 @@ impl InspectorState {
 
         let selected_id = timeline.selected_clip_id;
         if let Some(clip_id) = selected_id {
-            if let Some(clip) = timeline.clips.iter_mut().find(|c| c.id == clip_id) {
+            if let Some(clip_idx) = timeline.clips.iter().position(|c| c.id == clip_id) {
+                let mut clip = timeline.clips[clip_idx].clone();
+                let mut needs_history = false;
+                let mut video_changed = false;
+                let mut audio_changed = false;
+
                 // Заголовок клипа
                 ui.horizontal(|ui| {
                     let icon = if clip.is_audio { "🎵" } else { "🎬" };
@@ -96,49 +101,85 @@ impl InspectorState {
                                         // Zoom X / Y
                                         ui.label(egui::RichText::new("Zoom X").size(11.0).color(ResolveColors::TEXT_MUTED));
                                         let mut zx = clip.zoom_x;
-                                        if ui.add(DragValue::new(&mut zx).speed(0.01).range(0.1..=10.0)).changed() {
+                                        let zx_resp = ui.add(DragValue::new(&mut zx).speed(0.01).range(0.1..=10.0));
+                                        if zx_resp.drag_started() {
+                                            needs_history = true;
+                                        }
+                                        if zx_resp.changed() {
                                             clip.zoom_x = zx;
                                             if self.zoom_linked {
                                                 clip.zoom_y = zx;
                                             }
+                                            video_changed = true;
                                         }
                                         if ui.button("⟲").on_hover_text("Сбросить зум").clicked() {
+                                            needs_history = true;
                                             clip.zoom_x = 1.0;
                                             clip.zoom_y = 1.0;
+                                            video_changed = true;
                                         }
                                         ui.end_row();
 
                                         ui.label(egui::RichText::new("Zoom Y").size(11.0).color(ResolveColors::TEXT_MUTED));
                                         let mut zy = clip.zoom_y;
-                                        if ui.add(DragValue::new(&mut zy).speed(0.01).range(0.1..=10.0)).changed() {
+                                        let zy_resp = ui.add(DragValue::new(&mut zy).speed(0.01).range(0.1..=10.0));
+                                        if zy_resp.drag_started() {
+                                            needs_history = true;
+                                        }
+                                        if zy_resp.changed() {
                                             clip.zoom_y = zy;
                                             if self.zoom_linked {
                                                 clip.zoom_x = zy;
                                             }
+                                            video_changed = true;
                                         }
                                         ui.checkbox(&mut self.zoom_linked, "🔗");
                                         ui.end_row();
 
                                         // Position X / Y
                                         ui.label(egui::RichText::new("Position X").size(11.0).color(ResolveColors::TEXT_MUTED));
-                                        ui.add(DragValue::new(&mut clip.position_x).speed(1.0));
+                                        let px_resp = ui.add(DragValue::new(&mut clip.position_x).speed(1.0));
+                                        if px_resp.drag_started() {
+                                            needs_history = true;
+                                        }
+                                        if px_resp.changed() {
+                                            video_changed = true;
+                                        }
                                         if ui.button("⟲").on_hover_text("Сбросить позицию X").clicked() {
+                                            needs_history = true;
                                             clip.position_x = 0.0;
+                                            video_changed = true;
                                         }
                                         ui.end_row();
 
                                         ui.label(egui::RichText::new("Position Y").size(11.0).color(ResolveColors::TEXT_MUTED));
-                                        ui.add(DragValue::new(&mut clip.position_y).speed(1.0));
+                                        let py_resp = ui.add(DragValue::new(&mut clip.position_y).speed(1.0));
+                                        if py_resp.drag_started() {
+                                            needs_history = true;
+                                        }
+                                        if py_resp.changed() {
+                                            video_changed = true;
+                                        }
                                         if ui.button("⟲").on_hover_text("Сбросить позицию Y").clicked() {
+                                            needs_history = true;
                                             clip.position_y = 0.0;
+                                            video_changed = true;
                                         }
                                         ui.end_row();
 
                                         // Rotation
                                         ui.label(egui::RichText::new("Rotation").size(11.0).color(ResolveColors::TEXT_MUTED));
-                                        ui.add(DragValue::new(&mut clip.rotation).speed(0.5).range(-180.0..=180.0).suffix("°"));
+                                        let rot_resp = ui.add(DragValue::new(&mut clip.rotation).speed(0.5).range(-180.0..=180.0).suffix("°"));
+                                        if rot_resp.drag_started() {
+                                            needs_history = true;
+                                        }
+                                        if rot_resp.changed() {
+                                            video_changed = true;
+                                        }
                                         if ui.button("⟲").on_hover_text("Сбросить вращение").clicked() {
+                                            needs_history = true;
                                             clip.rotation = 0.0;
+                                            video_changed = true;
                                         }
                                         ui.end_row();
 
@@ -152,7 +193,9 @@ impl InspectorState {
                                             )
                                             .fill(if clip.flip_h { ResolveColors::ACCENT_ORANGE } else { ResolveColors::BG_HEADER });
                                             if ui.add(h_btn).on_hover_text("Отразить по горизонтали (Flip Horizontal)").clicked() {
+                                                needs_history = true;
                                                 clip.flip_h = !clip.flip_h;
+                                                video_changed = true;
                                             }
 
                                             let v_btn = egui::Button::new(
@@ -162,12 +205,16 @@ impl InspectorState {
                                             )
                                             .fill(if clip.flip_v { ResolveColors::ACCENT_ORANGE } else { ResolveColors::BG_HEADER });
                                             if ui.add(v_btn).on_hover_text("Отразить по вертикали (Flip Vertical)").clicked() {
+                                                needs_history = true;
                                                 clip.flip_v = !clip.flip_v;
+                                                video_changed = true;
                                             }
                                         });
                                         if ui.button("⟲").on_hover_text("Сбросить отражение").clicked() {
+                                            needs_history = true;
                                             clip.flip_h = false;
                                             clip.flip_v = false;
+                                            video_changed = true;
                                         }
                                         ui.end_row();
                                     });
@@ -189,30 +236,62 @@ impl InspectorState {
                                     .spacing([8.0, 6.0])
                                     .show(ui, |ui| {
                                         ui.label(egui::RichText::new("Crop Left").size(11.0).color(ResolveColors::TEXT_MUTED));
-                                        ui.add(Slider::new(&mut clip.crop_left, 0.0..=50.0).suffix("%"));
+                                        let cl_resp = ui.add(Slider::new(&mut clip.crop_left, 0.0..=50.0).suffix("%"));
+                                        if cl_resp.drag_started() {
+                                            needs_history = true;
+                                        }
+                                        if cl_resp.changed() {
+                                            video_changed = true;
+                                        }
                                         if ui.button("⟲").on_hover_text("Сбросить Crop Left").clicked() {
+                                            needs_history = true;
                                             clip.crop_left = 0.0;
+                                            video_changed = true;
                                         }
                                         ui.end_row();
 
                                         ui.label(egui::RichText::new("Crop Right").size(11.0).color(ResolveColors::TEXT_MUTED));
-                                        ui.add(Slider::new(&mut clip.crop_right, 0.0..=50.0).suffix("%"));
+                                        let cr_resp = ui.add(Slider::new(&mut clip.crop_right, 0.0..=50.0).suffix("%"));
+                                        if cr_resp.drag_started() {
+                                            needs_history = true;
+                                        }
+                                        if cr_resp.changed() {
+                                            video_changed = true;
+                                        }
                                         if ui.button("⟲").on_hover_text("Сбросить Crop Right").clicked() {
+                                            needs_history = true;
                                             clip.crop_right = 0.0;
+                                            video_changed = true;
                                         }
                                         ui.end_row();
 
                                         ui.label(egui::RichText::new("Crop Top").size(11.0).color(ResolveColors::TEXT_MUTED));
-                                        ui.add(Slider::new(&mut clip.crop_top, 0.0..=50.0).suffix("%"));
+                                        let ct_resp = ui.add(Slider::new(&mut clip.crop_top, 0.0..=50.0).suffix("%"));
+                                        if ct_resp.drag_started() {
+                                            needs_history = true;
+                                        }
+                                        if ct_resp.changed() {
+                                            video_changed = true;
+                                        }
                                         if ui.button("⟲").on_hover_text("Сбросить Crop Top").clicked() {
+                                            needs_history = true;
                                             clip.crop_top = 0.0;
+                                            video_changed = true;
                                         }
                                         ui.end_row();
 
                                         ui.label(egui::RichText::new("Crop Bottom").size(11.0).color(ResolveColors::TEXT_MUTED));
-                                        ui.add(Slider::new(&mut clip.crop_bottom, 0.0..=50.0).suffix("%"));
+                                        let cb_resp = ui.add(Slider::new(&mut clip.crop_bottom, 0.0..=50.0).suffix("%"));
+                                        if cb_resp.drag_started() {
+                                            needs_history = true;
+                                        }
+                                        if cb_resp.changed() {
+                                            video_changed = true;
+                                        }
                                         if ui.button("⟲").on_hover_text("Сбросить Crop Bottom").clicked() {
+                                            needs_history = true;
                                             clip.crop_bottom = 0.0;
+                                            video_changed = true;
                                         }
                                         ui.end_row();
                                     });
@@ -234,7 +313,13 @@ impl InspectorState {
                                     .spacing([8.0, 6.0])
                                     .show(ui, |ui| {
                                         ui.label(egui::RichText::new("Opacity").size(11.0).color(ResolveColors::TEXT_MUTED));
-                                        ui.add(Slider::new(&mut clip.opacity, 0.0..=100.0).suffix("%"));
+                                        let op_resp = ui.add(Slider::new(&mut clip.opacity, 0.0..=100.0).suffix("%"));
+                                        if op_resp.drag_started() {
+                                            needs_history = true;
+                                        }
+                                        if op_resp.changed() {
+                                            video_changed = true;
+                                        }
                                         ui.end_row();
                                     });
                             });
@@ -254,29 +339,53 @@ impl InspectorState {
                                     .spacing([8.0, 6.0])
                                     .show(ui, |ui| {
                                         ui.label(egui::RichText::new("Volume").size(11.0).color(ResolveColors::TEXT_MUTED));
-                                        let v_ch = ui.add(Slider::new(&mut clip.volume_db, -48.0..=12.0).suffix(" dB")).changed();
+                                        let v_resp = ui.add(Slider::new(&mut clip.volume_db, -48.0..=12.0).suffix(" dB"));
+                                        if v_resp.drag_started() {
+                                            needs_history = true;
+                                        }
+                                        let v_ch = v_resp.changed();
                                         let v_rst = ui.button("⟲").clicked();
                                         if v_rst {
+                                            needs_history = true;
                                             clip.volume_db = 0.0;
                                         }
                                         ui.end_row();
 
                                         ui.label(egui::RichText::new("Pan").size(11.0).color(ResolveColors::TEXT_MUTED));
-                                        let p_ch = ui.add(Slider::new(&mut clip.pan, -100.0..=100.0).suffix("%")).changed();
+                                        let p_resp = ui.add(Slider::new(&mut clip.pan, -100.0..=100.0).suffix("%"));
+                                        if p_resp.drag_started() {
+                                            needs_history = true;
+                                        }
+                                        let p_ch = p_resp.changed();
                                         let p_rst = ui.button("⟲").clicked();
                                         if p_rst {
+                                            needs_history = true;
                                             clip.pan = 0.0;
                                         }
                                         ui.end_row();
 
                                         if v_ch || v_rst || p_ch || p_rst {
-                                            timeline.audio_dirty = true;
+                                            audio_changed = true;
                                         }
                                     });
                             });
                         }
                     }
                 });
+
+                if needs_history {
+                    timeline.push_history();
+                }
+                if video_changed || audio_changed {
+                    timeline.clips[clip_idx] = clip;
+                }
+                if video_changed {
+                    timeline.structure_dirty = true;
+                }
+                if audio_changed {
+                    timeline.audio_dirty = true;
+                    timeline.structure_dirty = true;
+                }
             }
         } else {
             ui.vertical_centered(|ui| {

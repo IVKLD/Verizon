@@ -1028,7 +1028,7 @@ fn test_real_clip_tail_is_not_truncated() {
 }
 
 /// Эталонный кадр: программный декодер FFmpeg (CPU) с полным drain на EOF, тот же swscale, тот же отпечаток
-fn ground_truth_fingerprint(path: &std::path::Path, frame: i64, w: u32, h: u32) -> Option<Vec<u8>> {
+fn ground_truth_fingerprint(path: &std::path::Path, frame: i64, w: u32, h: u32) -> Option<[u8; 144]> {
     let mut ictx = ffmpeg_next::format::input(path).ok()?;
     let (idx, tb, fps, params) = {
         let s = ictx.streams().best(ffmpeg_next::media::Type::Video)?;
@@ -1042,9 +1042,9 @@ fn ground_truth_fingerprint(path: &std::path::Path, frame: i64, w: u32, h: u32) 
     let mut scaler: Option<ffmpeg_next::software::scaling::Context> = None;
     let mut decoded = ffmpeg_next::util::frame::Video::empty();
     let mut rgba = ffmpeg_next::util::frame::Video::empty();
-    let mut result: Option<Vec<u8>> = None;
+    let mut result: Option<[u8; 144]> = None;
 
-    let handle = |decoded: &ffmpeg_next::util::frame::Video, scaler: &mut Option<ffmpeg_next::software::scaling::Context>, rgba: &mut ffmpeg_next::util::frame::Video| -> Option<Vec<u8>> {
+    let handle = |decoded: &ffmpeg_next::util::frame::Video, scaler: &mut Option<ffmpeg_next::software::scaling::Context>, rgba: &mut ffmpeg_next::util::frame::Video| -> Option<[u8; 144]> {
         let pts = decoded.pts().unwrap_or(0);
         let f_num = (pts as f64 * tb * fps).round() as i64;
         if f_num != frame {

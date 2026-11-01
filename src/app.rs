@@ -856,8 +856,12 @@ impl NleApp {
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    // Центрированные кнопки рабочих пространств DaVinci Resolve 21
-                    ui.add_space((ui.available_width() * 0.32).max(0.0));
+                    // Адаптивное центрирование кнопок рабочих пространств DaVinci Resolve 21
+                    let total_w = ui.available_width();
+                    let buttons_w = 320.0;
+                    let right_widgets_w = 140.0;
+                    let center_pad = ((total_w - buttons_w - right_widgets_w) * 0.5).max(0.0);
+                    ui.add_space(center_pad);
 
                     let pages = [
                         (Page::Media, "📁 Media"),

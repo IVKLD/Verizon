@@ -314,7 +314,10 @@ impl MediaPoolState {
                         timeline.clips.push(a_clip);
                     }
                 }
+                let max_inserted_dur = if asset.has_video { v_dur } else { a_dur };
+                timeline.playhead_frame = start + max_inserted_dur;
                 timeline.audio_dirty = true;
+                timeline.structure_dirty = true;
             }
         }
     }
