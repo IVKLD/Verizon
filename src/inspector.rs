@@ -314,7 +314,7 @@ impl InspectorState {
                             .default_open(true)
                             .show(ui, |ui| {
                                 egui::Grid::new("composite_grid")
-                                    .num_columns(2)
+                                    .num_columns(3)
                                     .spacing([8.0, 6.0])
                                     .show(ui, |ui| {
                                         ui.label(egui::RichText::new("Opacity").size(11.0).color(ResolveColors::TEXT_MUTED));
@@ -323,6 +323,43 @@ impl InspectorState {
                                             needs_history = true;
                                         }
                                         if op_resp.changed() {
+                                            video_changed = true;
+                                        }
+                                        if ui.button("⟲").on_hover_text("Сбросить Opacity к 100%").clicked() {
+                                            needs_history = true;
+                                            clip.opacity = 100.0;
+                                            video_changed = true;
+                                        }
+                                        ui.end_row();
+
+                                        let max_in = (clip.duration_frames - clip.fade_out_frames.max(0)).max(0);
+                                        ui.label(egui::RichText::new("Fade In").size(11.0).color(ResolveColors::TEXT_MUTED));
+                                        let fi_resp = ui.add(Slider::new(&mut clip.fade_in_frames, 0..=max_in).suffix(" f"));
+                                        if fi_resp.drag_started() {
+                                            needs_history = true;
+                                        }
+                                        if fi_resp.changed() {
+                                            video_changed = true;
+                                        }
+                                        if ui.button("⟲").on_hover_text("Сбросить Fade In").clicked() {
+                                            needs_history = true;
+                                            clip.fade_in_frames = 0;
+                                            video_changed = true;
+                                        }
+                                        ui.end_row();
+
+                                        let max_out = (clip.duration_frames - clip.fade_in_frames.max(0)).max(0);
+                                        ui.label(egui::RichText::new("Fade Out").size(11.0).color(ResolveColors::TEXT_MUTED));
+                                        let fo_resp = ui.add(Slider::new(&mut clip.fade_out_frames, 0..=max_out).suffix(" f"));
+                                        if fo_resp.drag_started() {
+                                            needs_history = true;
+                                        }
+                                        if fo_resp.changed() {
+                                            video_changed = true;
+                                        }
+                                        if ui.button("⟲").on_hover_text("Сбросить Fade Out").clicked() {
+                                            needs_history = true;
+                                            clip.fade_out_frames = 0;
                                             video_changed = true;
                                         }
                                         ui.end_row();
@@ -432,7 +469,35 @@ impl InspectorState {
                                         }
                                         ui.end_row();
 
-                                        if v_ch || v_rst || p_ch || p_rst {
+                                        let max_in = (clip.duration_frames - clip.fade_out_frames.max(0)).max(0);
+                                        ui.label(egui::RichText::new("Fade In").size(11.0).color(ResolveColors::TEXT_MUTED));
+                                        let fi_resp = ui.add(Slider::new(&mut clip.fade_in_frames, 0..=max_in).suffix(" f"));
+                                        if fi_resp.drag_started() {
+                                            needs_history = true;
+                                        }
+                                        let fi_ch = fi_resp.changed();
+                                        let fi_rst = ui.button("⟲").on_hover_text("Сбросить Fade In").clicked();
+                                        if fi_rst {
+                                            needs_history = true;
+                                            clip.fade_in_frames = 0;
+                                        }
+                                        ui.end_row();
+
+                                        let max_out = (clip.duration_frames - clip.fade_in_frames.max(0)).max(0);
+                                        ui.label(egui::RichText::new("Fade Out").size(11.0).color(ResolveColors::TEXT_MUTED));
+                                        let fo_resp = ui.add(Slider::new(&mut clip.fade_out_frames, 0..=max_out).suffix(" f"));
+                                        if fo_resp.drag_started() {
+                                            needs_history = true;
+                                        }
+                                        let fo_ch = fo_resp.changed();
+                                        let fo_rst = ui.button("⟲").on_hover_text("Сбросить Fade Out").clicked();
+                                        if fo_rst {
+                                            needs_history = true;
+                                            clip.fade_out_frames = 0;
+                                        }
+                                        ui.end_row();
+
+                                        if v_ch || v_rst || p_ch || p_rst || fi_ch || fi_rst || fo_ch || fo_rst {
                                             audio_changed = true;
                                         }
                                     });

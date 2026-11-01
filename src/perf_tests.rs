@@ -2424,6 +2424,91 @@ fn test_playback_focus_loss_does_not_restart_decoder_or_yank_audio() {
     assert_eq!(cur_pos, audio_sample_initial, "Аудио поток не должен дергаться при небольших лагах интерфейса!");
 }
 
+#[test]
+fn test_render_cache_blue_zone_sustained_under_layers_and_transform_modifications() {
+    use crate::timeline::{Clip, TimelineState};
+    use crate::render_cache::{RenderCacheManager, RenderCacheMode};
+
+    let mut tl = TimelineState::new_empty();
+    tl.fps = 60;
+
+    // V1 (нижний слой, track_index: 1)
+    let clip_v1 = Clip {
+        id: 10,
+        name: "Layer_V1".to_string(),
+        track_index: 1,
+        start_frame: 0,
+        duration_frames: 100,
+        is_audio: false,
+        source_path: Some(std::path::PathBuf::from("/tmp/layer_v1.mp4")),
+        source_in_secs: 0.0,
+        source_fps: 60.0,
+        speed: 1.0,
+        opacity: 100.0,
+        ..Default::default()
+    };
+
+    // V2 (верхний слой, track_index: 0, перекрывает V1 на кадрах 30..70)
+    let clip_v2 = Clip {
+        id: 20,
+        name: "Layer_V2".to_string(),
+        track_index: 0,
+        start_frame: 30,
+        duration_frames: 40,
+        is_audio: false,
+        source_path: Some(std::path::PathBuf::from("/tmp/layer_v2.mp4")),
+        source_in_secs: 0.0,
+        source_fps: 60.0,
+        speed: 1.0,
+        opacity: 100.0,
+        ..Default::default()
+    };
+
+    tl.clips.push(clip_v1);
+    tl.clips.push(clip_v2);
+
+    let cache = RenderCacheManager::new(RenderCacheMode::Smart, 300);
+    let img_v1 = std::sync::Arc::new(egui::ColorImage::new([8, 8], vec![egui::Color32::RED; 64]));
+    let img_v2 = std::sync::Arc::new(egui::ColorImage::new([8, 8], vec![egui::Color32::GREEN; 64]));
+
+    // Заполняем кэш для всех 100 кадров с учетом приоритета дорожек
+    for f in 0..100 {
+        let active = tl.active_video_clip_at(f).unwrap();
+        let sig = RenderCacheManager::compute_decode_signature(&tl, f);
+        let img = if active.id == 20 { std::sync::Arc::clone(&img_v2) } else { std::sync::Arc::clone(&img_v1) };
+        cache.insert(f, img, sig);
+    }
+
+    assert_eq!(cache.stats().cached_frames, 100);
+    assert_eq!(cache.cached_intervals(), vec![(0, 99)], "Зона 0..99 должна быть полностью синей");
+
+    // 1. Проверяем, что изменение GPU-свойств (Transform, Opacity, Fade) НЕ инвалидирует Render Cache!
+    tl.clips[1].position_x = 120.0;
+    tl.clips[1].zoom_x = 1.5;
+    tl.clips[1].opacity = 80.0;
+    tl.clips[1].fade_in_frames = 10;
+    tl.clips[1].fade_out_frames = 10;
+
+    for f in 0..100 {
+        let sig = RenderCacheManager::compute_decode_signature(&tl, f);
+        let cached = cache.get(f, sig);
+        assert!(cached.is_some(), "Кадр {} обязан мгновенно считываться из синей зоны кэша без инвалидации!", f);
+        assert!(cache.is_cached(f), "Синяя полоса над кадром {} не должна пропадать!", f);
+    }
+
+    // 2. Проверяем защиту от отравления кэша: кадры от V1 не должны перезаписывать V2 на кадрах 30..70
+    for tl_f in 30..70 {
+        let is_v1_top = tl.active_video_clip_at(tl_f).map(|ac| ac.id) == Some(10);
+        assert!(!is_v1_top, "На кадрах 30..70 слой V1 не является активным");
+    }
+
+    // 3. Убеждаемся, что кадр 50 возвращает именно текстуру верхнего слоя V2 (зеленый), а не нижнего слоя V1 (красный)
+    let sig_50 = RenderCacheManager::compute_decode_signature(&tl, 50);
+    let frame_50 = cache.get(50, sig_50).unwrap();
+    assert_eq!(frame_50.pixels[0], egui::Color32::GREEN, "Кадр 50 обязан быть кадром верхнего слоя V2!");
+}
+
+
 
 
 

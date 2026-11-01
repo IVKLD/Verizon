@@ -187,12 +187,14 @@ impl TimelineView {
             );
         }
 
-        // 5. Отрисовка и высокоточная интерактивность клипов на дорожках (Trimming и Moving)
+        // 5. Отрисовка и высокоточная интерактивность клипов на дорожках (Trimming, Moving, Opacity/Volume & Fade Handles)
         let mut hovered_clip_id = None;
+        let mut hovered_on_special_handle = false;
         let mut clicked_clip_id = None;
         let mut start_drag_request = None;
         let mut start_trim_request = None;
         let mut start_retime_session = None;
+        let mut start_envelope_session = None;
 
         // Предварительное вычисление link_group выделенного клипа: O(N) один раз вместо O(N^2) сканирования
         let selected_link_group = if timeline.linked_selection {
@@ -229,30 +231,88 @@ impl TimelineView {
             let is_selected = timeline.selected_clip_id == Some(clip.id)
                 || (selected_link_group.is_some() && clip.link_group == selected_link_group);
 
+            let interact_rect = clip_rect.intersect(tracks_canvas_rect);
+            let is_hovered = mouse_pos.map(|m| interact_rect.is_positive() && interact_rect.contains(m)).unwrap_or(false)
+                || timeline.envelope_session.map(|s| s.clip_id == clip.id).unwrap_or(false);
+
             // Отрисовка с tracks_painter (изоляция от левой панели треков)
-            Self::draw_clip(&tracks_painter, clip_rect, canvas_rect, clip, is_selected, timeline, waveform_mgr, ui.ctx());
+            Self::draw_clip(
+                &tracks_painter,
+                clip_rect,
+                canvas_rect,
+                clip,
+                is_selected,
+                is_hovered,
+                timeline,
+                waveform_mgr,
+                ui.ctx(),
+            );
 
             // Интерактивность клипа: строго ограничена видимой областью холста
             if timeline.active_tool == Tool::Selection || timeline.active_tool == Tool::Trim {
-                let interact_rect = clip_rect.intersect(tracks_canvas_rect);
                 if interact_rect.is_positive() {
+                    // Ручки Fade In / Fade Out в верхних углах клипа (как в DaVinci Resolve при наведении на края клипа)
+                    let allow_fade_handles = timeline.active_tool == Tool::Selection && clip_rect.width() >= 24.0;
+                    let fade_zone_h = (clip_rect.height() * 0.45).clamp(10.0, 20.0);
+                    let fade_in_px = (clip.fade_in_frames.max(0) as f32 * timeline.zoom_factor).clamp(0.0, clip_rect.width());
+                    let fade_out_px = (clip.fade_out_frames.max(0) as f32 * timeline.zoom_factor)
+                        .clamp(0.0, (clip_rect.width() - fade_in_px).max(0.0));
+                    let fade_in_x = clip_rect.min.x + fade_in_px;
+                    let fade_out_x = clip_rect.max.x - fade_out_px;
+
+                    let fade_in_handle = if allow_fade_handles {
+                        Rect::from_min_max(
+                            pos2((fade_in_x - 8.0).max(clip_rect.min.x), clip_rect.min.y),
+                            pos2((fade_in_x + 10.0).min(clip_rect.max.x), (clip_rect.min.y + fade_zone_h).min(clip_rect.max.y)),
+                        )
+                        .intersect(tracks_canvas_rect)
+                    } else {
+                        Rect::NOTHING
+                    };
+
+                    let fade_out_handle = if allow_fade_handles && !clip.retime_controls_open {
+                        Rect::from_min_max(
+                            pos2((fade_out_x - 10.0).max(clip_rect.min.x), clip_rect.min.y),
+                            pos2((fade_out_x + 8.0).min(clip_rect.max.x), (clip_rect.min.y + fade_zone_h).min(clip_rect.max.y)),
+                        )
+                        .intersect(tracks_canvas_rect)
+                    } else {
+                        Rect::NOTHING
+                    };
+
+                    // Горизонтальная линия Opacity (0..100%) / Volume (-60..+12 dB) вдоль тела клипа
+                    let env_line_y = Self::clip_envelope_line_y(clip_rect, clip);
+                    let level_line_rect = if timeline.active_tool == Tool::Selection && clip_rect.width() >= 28.0 {
+                        Rect::from_min_max(
+                            pos2(clip_rect.min.x + 8.0, (env_line_y - 5.0).max(clip_rect.min.y + 2.0)),
+                            pos2(clip_rect.max.x - 8.0, (env_line_y + 5.0).min(clip_rect.max.y - 2.0)),
+                        )
+                        .intersect(tracks_canvas_rect)
+                    } else {
+                        Rect::NOTHING
+                    };
+
                     // Ручки Trim привязываются СТРОГО к истинным краям клипа (clip_rect.min.x / clip_rect.max.x),
-                    // а НЕ к обрезанному окном interact_rect! Иначе при выходе правого края клипа за правую границу
-                    // экрана попытка передвинуть клип возле правого края окна случайно обрезает конец клипа!
+                    // а НЕ к обрезанному окном interact_rect! В режиме Selection верхние углы отданы под Fade In/Out.
                     let allow_trim_handles = timeline.active_tool == Tool::Trim || clip_rect.width() >= 36.0;
                     let trim_handle_w = if allow_trim_handles {
                         8.0_f32.min(clip_rect.width() * 0.22)
                     } else {
                         0.0
                     };
-                    let left_handle = Rect::from_min_size(
-                        pos2(clip_rect.min.x, interact_rect.min.y),
-                        vec2(trim_handle_w, interact_rect.height()),
+                    let trim_top_y = if allow_fade_handles {
+                        (clip_rect.min.y + fade_zone_h).min(interact_rect.max.y)
+                    } else {
+                        interact_rect.min.y
+                    };
+                    let left_handle = Rect::from_min_max(
+                        pos2(clip_rect.min.x, trim_top_y),
+                        pos2(clip_rect.min.x + trim_handle_w, interact_rect.max.y),
                     )
                     .intersect(tracks_canvas_rect);
-                    let right_handle = Rect::from_min_size(
-                        pos2(clip_rect.max.x - trim_handle_w, interact_rect.min.y),
-                        vec2(trim_handle_w, interact_rect.height()),
+                    let right_handle = Rect::from_min_max(
+                        pos2(clip_rect.max.x - trim_handle_w, trim_top_y),
+                        pos2(clip_rect.max.x, interact_rect.max.y),
                     )
                     .intersect(tracks_canvas_rect);
 
@@ -269,17 +329,28 @@ impl TimelineView {
                     };
 
                     let is_track_locked = timeline.tracks.get(clip.track_index).map(|t| t.is_locked).unwrap_or(false);
-                    let is_hovered = mouse_pos.map(|m| interact_rect.contains(m)).unwrap_or(false);
                     if is_hovered {
                         hovered_clip_id = Some(clip.id);
                         if !is_track_locked {
                             if let Some(m_pos) = mouse_pos {
                                 if retime_handle.is_positive() && retime_handle.contains(m_pos) {
+                                    hovered_on_special_handle = true;
+                                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
+                                } else if fade_in_handle.is_positive() && fade_in_handle.contains(m_pos) {
+                                    hovered_on_special_handle = true;
+                                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
+                                } else if fade_out_handle.is_positive() && fade_out_handle.contains(m_pos) {
+                                    hovered_on_special_handle = true;
                                     ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
                                 } else if left_handle.is_positive() && left_handle.contains(m_pos) {
+                                    hovered_on_special_handle = true;
                                     ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeEast);
                                 } else if right_handle.is_positive() && right_handle.contains(m_pos) {
+                                    hovered_on_special_handle = true;
                                     ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeWest);
+                                } else if level_line_rect.is_positive() && level_line_rect.contains(m_pos) {
+                                    hovered_on_special_handle = true;
+                                    ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeVertical);
                                 }
                             }
                         }
@@ -295,16 +366,39 @@ impl TimelineView {
                         clicked_clip_id = Some(clip.id);
                     }
 
-                    // Начало действия: Retime Stretch, Trimming или Moving клипа (только если дорожка не заблокирована)
+                    // Начало действия: Retime, Fade In/Out, Opacity/Volume Line, Trimming или Moving клипа
                     if !is_track_locked
                         && clip_resp.drag_started()
                         && timeline.moving_clip.is_none()
                         && timeline.trim_session.is_none()
                         && timeline.retime_session.is_none()
+                        && timeline.envelope_session.is_none()
                     {
                         if let Some(m_pos) = mouse_pos {
                             if retime_handle.is_positive() && retime_handle.contains(m_pos) {
                                 start_retime_session = Some((clip.id, m_pos.x, clip.duration_frames, clip.speed));
+                            } else if fade_in_handle.is_positive() && fade_in_handle.contains(m_pos) {
+                                start_envelope_session = Some(crate::timeline::EnvelopeDragSession {
+                                    clip_id: clip.id,
+                                    kind: crate::timeline::EnvelopeDragKind::FadeIn,
+                                    mouse_start_x: m_pos.x,
+                                    mouse_start_y: m_pos.y,
+                                    init_opacity: clip.opacity,
+                                    init_volume_db: clip.volume_db,
+                                    init_fade_in: clip.fade_in_frames,
+                                    init_fade_out: clip.fade_out_frames,
+                                });
+                            } else if fade_out_handle.is_positive() && fade_out_handle.contains(m_pos) {
+                                start_envelope_session = Some(crate::timeline::EnvelopeDragSession {
+                                    clip_id: clip.id,
+                                    kind: crate::timeline::EnvelopeDragKind::FadeOut,
+                                    mouse_start_x: m_pos.x,
+                                    mouse_start_y: m_pos.y,
+                                    init_opacity: clip.opacity,
+                                    init_volume_db: clip.volume_db,
+                                    init_fade_in: clip.fade_in_frames,
+                                    init_fade_out: clip.fade_out_frames,
+                                });
                             } else if left_handle.is_positive() && left_handle.contains(m_pos) {
                                 start_trim_request = Some(crate::timeline::TrimSession {
                                     clip_id: clip.id,
@@ -325,6 +419,17 @@ impl TimelineView {
                                     init_source_in_frame: clip.source_in_frame,
                                     init_source_in_secs: clip.source_in_secs,
                                 });
+                            } else if level_line_rect.is_positive() && level_line_rect.contains(m_pos) {
+                                start_envelope_session = Some(crate::timeline::EnvelopeDragSession {
+                                    clip_id: clip.id,
+                                    kind: crate::timeline::EnvelopeDragKind::Level,
+                                    mouse_start_x: m_pos.x,
+                                    mouse_start_y: m_pos.y,
+                                    init_opacity: clip.opacity,
+                                    init_volume_db: clip.volume_db,
+                                    init_fade_in: clip.fade_in_frames,
+                                    init_fade_out: clip.fade_out_frames,
+                                });
                             } else {
                                 start_drag_request = Some((clip.id, m_pos.x, m_pos.y, clip.start_frame, clip.track_index));
                             }
@@ -338,6 +443,11 @@ impl TimelineView {
             timeline.push_history();
             timeline.retime_session = Some(retime);
         }
+        if let Some(env_sess) = start_envelope_session {
+            timeline.push_history();
+            timeline.selected_clip_id = Some(env_sess.clip_id);
+            timeline.envelope_session = Some(env_sess);
+        }
         if let Some(trim) = start_trim_request {
             timeline.push_history();
             timeline.trim_session = Some(trim);
@@ -345,6 +455,57 @@ impl TimelineView {
         if let Some(req) = start_drag_request {
             timeline.push_history();
             timeline.moving_clip = Some(req);
+        }
+
+        // Обновление сессии интерактивных кривых Opacity / Volume / Fade In / Fade Out на клипе (DaVinci Resolve)
+        if let Some(env) = timeline.envelope_session {
+            if let Some(m_pos) = mouse_pos {
+                if let Some(clip) = timeline.clips.iter_mut().find(|c| c.id == env.clip_id) {
+                    let track_h = timeline.tracks.get(clip.track_index).map(|t| t.height).unwrap_or(timeline.track_height);
+                    let usable_h = (track_h - 12.0).max(16.0);
+                    match env.kind {
+                        crate::timeline::EnvelopeDragKind::Level => {
+                            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeVertical);
+                            let dy = env.mouse_start_y - m_pos.y; // Вверх — увеличение, вниз — уменьшение
+                            if clip.is_audio {
+                                let delta_db = (dy / usable_h) * 72.0;
+                                let mut new_db = (env.init_volume_db + delta_db).clamp(-60.0, 12.0);
+                                if !ui.input(|i| i.modifiers.alt) && new_db.abs() <= 0.6 {
+                                    new_db = 0.0; // Магнитная фиксация на 0.0 dB
+                                }
+                                clip.volume_db = (new_db * 10.0).round() / 10.0;
+                                timeline.audio_dirty = true;
+                            } else {
+                                let delta_op = (dy / usable_h) * 100.0;
+                                clip.opacity = (env.init_opacity + delta_op).round().clamp(0.0, 100.0);
+                            }
+                        }
+                        crate::timeline::EnvelopeDragKind::FadeIn => {
+                            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
+                            let dx = m_pos.x - env.mouse_start_x;
+                            let delta_frames = (dx / timeline.zoom_factor).round() as i64;
+                            let max_fade_in = (clip.duration_frames - clip.fade_out_frames.max(0)).max(0);
+                            clip.fade_in_frames = (env.init_fade_in + delta_frames).clamp(0, max_fade_in);
+                            if clip.is_audio {
+                                timeline.audio_dirty = true;
+                            }
+                        }
+                        crate::timeline::EnvelopeDragKind::FadeOut => {
+                            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
+                            let dx = env.mouse_start_x - m_pos.x; // Перетаскивание влево от правого края увеличивает Fade Out
+                            let delta_frames = (dx / timeline.zoom_factor).round() as i64;
+                            let max_fade_out = (clip.duration_frames - clip.fade_in_frames.max(0)).max(0);
+                            clip.fade_out_frames = (env.init_fade_out + delta_frames).clamp(0, max_fade_out);
+                            if clip.is_audio {
+                                timeline.audio_dirty = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if ui.input(|i| i.pointer.any_released() || !i.pointer.primary_down()) {
+                timeline.envelope_session = None;
+            }
         }
 
         // Обновление сессии растяжения Retime Control
@@ -543,7 +704,12 @@ impl TimelineView {
             .unwrap_or(false);
         if timeline.moving_clip.is_some() {
             ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
-        } else if hovered_clip_id.is_some() && !is_hovered_locked && (timeline.active_tool == Tool::Selection || timeline.active_tool == Tool::Trim) {
+        } else if hovered_clip_id.is_some()
+            && !is_hovered_locked
+            && !hovered_on_special_handle
+            && timeline.envelope_session.is_none()
+            && (timeline.active_tool == Tool::Selection || timeline.active_tool == Tool::Trim)
+        {
             ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
         }
 
@@ -1315,12 +1481,30 @@ impl TimelineView {
         (audio_changed, structure_changed, resize_drag)
     }
 
+    /// Вычисление экранной Y-координаты горизонтальной линии Opacity (0..100%) или Volume (-60..+12 dB) внутри клипа
+    pub fn clip_envelope_line_y(rect: Rect, clip: &Clip) -> f32 {
+        let top_pad = if clip.retime_controls_open {
+            18.0_f32.min(rect.height() * 0.45)
+        } else {
+            6.0
+        };
+        let bot_pad = 3.0;
+        let usable_h = (rect.height() - top_pad - bot_pad).max(6.0);
+        let norm = if clip.is_audio {
+            ((clip.volume_db + 60.0) / 72.0).clamp(0.0, 1.0)
+        } else {
+            (clip.opacity / 100.0).clamp(0.0, 1.0)
+        };
+        rect.max.y - bot_pad - norm * usable_h
+    }
+
     fn draw_clip(
         painter: &egui::Painter,
         rect: Rect,
         canvas_rect: Rect,
         clip: &Clip,
         is_selected: bool,
+        is_hovered: bool,
         timeline: &TimelineState,
         waveform_mgr: &crate::waveform::WaveformManager,
         ctx: &egui::Context,
@@ -1525,7 +1709,9 @@ impl TimelineView {
                                 max_val
                             };
 
-                            let amp = (base_amp * gain).clamp(0.0, 1.0);
+                            let offset_f = ((x - rect.min.x) / timeline.zoom_factor.max(0.0001)).round() as i64;
+                            let fade_mult = clip.fade_envelope_at_offset(offset_f);
+                            let amp = (base_amp * gain * fade_mult).clamp(0.0, 1.0);
 
                             if amp > 0.005 {
                                 let bar_h = (amp * half_h).max(1.0);
@@ -1597,6 +1783,145 @@ impl TimelineView {
                 egui::FontId::proportional(10.0),
                 if clip.is_disabled { ResolveColors::TEXT_MUTED } else { Color32::WHITE },
             );
+        }
+
+        // Интерактивная линия Opacity (0..100%) / Volume (-60..+12 dB) и угловые фейды (Fade In / Fade Out) в стиле DaVinci Resolve
+        if rect.width() > 14.0 && rect.height() > 14.0 {
+            let line_y = Self::clip_envelope_line_y(rect, clip);
+            let fade_in_px = (clip.fade_in_frames.max(0) as f32 * timeline.zoom_factor).clamp(0.0, rect.width());
+            let fade_out_px = (clip.fade_out_frames.max(0) as f32 * timeline.zoom_factor)
+                .clamp(0.0, (rect.width() - fade_in_px).max(0.0));
+            let fade_in_x = rect.min.x + fade_in_px;
+            let fade_out_x = rect.max.x - fade_out_px;
+
+            let active_env_drag = timeline.envelope_session.filter(|s| s.clip_id == clip.id);
+            let is_non_default = if clip.is_audio {
+                clip.volume_db.abs() > 0.05 || clip.fade_in_frames > 0 || clip.fade_out_frames > 0
+            } else {
+                (clip.opacity - 100.0).abs() > 0.1 || clip.fade_in_frames > 0 || clip.fade_out_frames > 0
+            };
+
+            // Затенение областей Fade In и Fade Out (диагональные полупрозрачные клинья как в DaVinci Resolve)
+            let fade_shade = Color32::from_rgba_unmultiplied(0, 0, 0, 115);
+            if fade_in_px > 1.0 {
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        pos2(rect.min.x, rect.min.y),
+                        pos2(fade_in_x, rect.min.y),
+                        pos2(fade_in_x, line_y),
+                        pos2(rect.min.x, rect.max.y),
+                    ],
+                    fade_shade,
+                    Stroke::NONE,
+                ));
+            }
+            if fade_out_px > 1.0 {
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        pos2(fade_out_x, rect.min.y),
+                        pos2(rect.max.x, rect.min.y),
+                        pos2(rect.max.x, rect.max.y),
+                        pos2(fade_out_x, line_y),
+                    ],
+                    fade_shade,
+                    Stroke::NONE,
+                ));
+            }
+
+            // Отрисовка огибающей кривой (Envelope Line)
+            if is_hovered || is_selected || is_non_default || active_env_drag.is_some() {
+                let line_color = if active_env_drag.is_some() {
+                    Color32::WHITE
+                } else if is_hovered {
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 230)
+                } else {
+                    Color32::from_rgba_unmultiplied(235, 240, 245, 165)
+                };
+                let line_w = if active_env_drag.is_some() || is_hovered { 1.6 } else { 1.1 };
+                let env_stroke = Stroke::new(line_w, line_color);
+
+                if fade_in_px > 0.5 {
+                    painter.line_segment([pos2(rect.min.x, rect.max.y), pos2(fade_in_x, line_y)], env_stroke);
+                }
+                if fade_out_x >= fade_in_x {
+                    painter.line_segment([pos2(fade_in_x, line_y), pos2(fade_out_x, line_y)], env_stroke);
+                }
+                if fade_out_px > 0.5 {
+                    painter.line_segment([pos2(fade_out_x, line_y), pos2(rect.max.x, rect.max.y)], env_stroke);
+                }
+            }
+
+            // Отрисовка белых угловых маркеров Fade In / Fade Out в стиле DaVinci Resolve при наведении или активном фейде
+            if is_hovered || active_env_drag.is_some() || clip.fade_in_frames > 0 || clip.fade_out_frames > 0 {
+                let handle_y = (rect.min.y + 7.0).min(rect.center().y);
+                let draw_fade_marker = |hx: f32, is_active: bool| {
+                    if hx >= canvas_rect.min.x && hx <= canvas_rect.max.x {
+                        let fill = if is_active { ResolveColors::ACCENT_ORANGE } else { Color32::WHITE };
+                        painter.line_segment(
+                            [pos2(hx, rect.min.y), pos2(hx, handle_y)],
+                            Stroke::new(1.2, fill),
+                        );
+                        let pts = vec![
+                            pos2(hx, handle_y - 3.5),
+                            pos2(hx + 3.5, handle_y),
+                            pos2(hx, handle_y + 3.5),
+                            pos2(hx - 3.5, handle_y),
+                        ];
+                        painter.add(egui::Shape::convex_polygon(
+                            pts,
+                            fill,
+                            Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 180)),
+                        ));
+                    }
+                };
+
+                if is_hovered || clip.fade_in_frames > 0 || active_env_drag.is_some() {
+                    let in_active = active_env_drag
+                        .map(|s| s.kind == crate::timeline::EnvelopeDragKind::FadeIn)
+                        .unwrap_or(false);
+                    draw_fade_marker((fade_in_x).clamp(rect.min.x + 4.0, rect.max.x - 4.0), in_active);
+                }
+                if !clip.retime_controls_open && (is_hovered || clip.fade_out_frames > 0 || active_env_drag.is_some()) {
+                    let out_active = active_env_drag
+                        .map(|s| s.kind == crate::timeline::EnvelopeDragKind::FadeOut)
+                        .unwrap_or(false);
+                    draw_fade_marker((fade_out_x).clamp(rect.min.x + 4.0, rect.max.x - 4.0), out_active);
+                }
+            }
+
+            // Живой бейдж значения при перетаскивании Opacity / Volume / Fade In / Fade Out
+            if let Some(sess) = active_env_drag {
+                let badge_text = match sess.kind {
+                    crate::timeline::EnvelopeDragKind::Level => {
+                        if clip.is_audio {
+                            format!("{:+.1} dB", clip.volume_db)
+                        } else {
+                            format!("Opacity: {:.0}%", clip.opacity)
+                        }
+                    }
+                    crate::timeline::EnvelopeDragKind::FadeIn => {
+                        let secs = clip.fade_in_frames as f64 / timeline.fps.max(1) as f64;
+                        format!("Fade In: {}f ({:.2}s)", clip.fade_in_frames, secs)
+                    }
+                    crate::timeline::EnvelopeDragKind::FadeOut => {
+                        let secs = clip.fade_out_frames as f64 / timeline.fps.max(1) as f64;
+                        format!("Fade Out: {}f ({:.2}s)", clip.fade_out_frames, secs)
+                    }
+                };
+                let badge_w = 116.0_f32.min(rect.width().max(72.0));
+                let badge_h = 16.0;
+                let badge_x = rect.center().x.clamp(canvas_rect.min.x + badge_w * 0.5 + 4.0, canvas_rect.max.x - badge_w * 0.5 - 4.0);
+                let badge_rect = Rect::from_center_size(pos2(badge_x, rect.center().y), vec2(badge_w, badge_h));
+                painter.rect_filled(badge_rect, CornerRadius::same(3), Color32::from_rgba_unmultiplied(15, 17, 22, 230));
+                painter.rect_stroke(badge_rect, CornerRadius::same(3), Stroke::new(1.0, ResolveColors::ACCENT_ORANGE), StrokeKind::Inside);
+                painter.text(
+                    badge_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    badge_text,
+                    egui::FontId::monospace(9.5),
+                    Color32::WHITE,
+                );
+            }
         }
     }
 

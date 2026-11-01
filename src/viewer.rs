@@ -44,6 +44,11 @@ pub struct ViewerState {
     pub pan_offset: egui::Vec2,
     pub custom_zoom: Option<f32>,
 
+    /// Сырые (непримагниченные) координаты и масштаб при перетаскивании Transform OSC,
+    /// исключающие «залипание» клипа на границе магнитного порога при малых дельтах мыши
+    pub transform_raw_pos: Option<(f32, f32)>,
+    pub transform_raw_zoom: Option<(f32, f32)>,
+
     pub vu_level_left: f32,
     pub vu_level_right: f32,
 }
@@ -63,10 +68,147 @@ impl ViewerState {
 
             pan_offset: egui::Vec2::ZERO,
             custom_zoom: None,
+            transform_raw_pos: None,
+            transform_raw_zoom: None,
 
             vu_level_left: 0.65,
             vu_level_right: 0.62,
         }
+    }
+
+    /// Магнитное прилипание позиции клипа (Transform OSC) к краям экрана 1920x1080 (±960, ±540) и центру (0, 0)
+    /// с учетом текущего масштаба и обрезки (Crop). Возвращает `(snapped_x, snapped_y, snap_guide_x, snap_guide_y)`.
+    pub fn snap_transform_position(
+        raw_x: f32,
+        raw_y: f32,
+        clip: &crate::timeline::Clip,
+        snap_proj_threshold: f32,
+    ) -> (f32, f32, Option<f32>, Option<f32>) {
+        let half_w = 960.0 * clip.zoom_x;
+        let half_h = 540.0 * clip.zoom_y;
+        let left_off = -half_w + (2.0 * half_w) * (clip.crop_left / 100.0);
+        let right_off = half_w - (2.0 * half_w) * (clip.crop_right / 100.0);
+        let top_off = -half_h + (2.0 * half_h) * (clip.crop_top / 100.0);
+        let bottom_off = half_h - (2.0 * half_h) * (clip.crop_bottom / 100.0);
+
+        let mut snapped_x = raw_x;
+        let mut guide_x = None;
+        let x_candidates = [
+            (-960.0 - left_off, -960.0),  // Левый край клипа к левому краю экрана
+            (960.0 - right_off, 960.0),   // Правый край клипа к правому краю экрана
+            (0.0, 0.0),                   // Центр клипа к центру экрана X
+            (-left_off, 0.0),             // Левый край клипа к центру экрана X
+            (-right_off, 0.0),            // Правый край клипа к центру экрана X
+        ];
+        let mut best_dx = snap_proj_threshold + 1e-4;
+        for (target_pos, guide_coord) in x_candidates {
+            let dist = (raw_x - target_pos).abs();
+            if dist < best_dx {
+                best_dx = dist;
+                snapped_x = target_pos;
+                guide_x = Some(guide_coord);
+            }
+        }
+
+        let mut snapped_y = raw_y;
+        let mut guide_y = None;
+        let y_candidates = [
+            (-540.0 - top_off, -540.0),    // Верхний край клипа к верхнему краю экрана
+            (540.0 - bottom_off, 540.0),   // Нижний край клипа к нижнему краю экрана
+            (0.0, 0.0),                    // Центр клипа к центру экрана Y
+            (-top_off, 0.0),               // Верхний край клипа к центру экрана Y
+            (-bottom_off, 0.0),            // Нижний край клипа к центру экрана Y
+        ];
+        let mut best_dy = snap_proj_threshold + 1e-4;
+        for (target_pos, guide_coord) in y_candidates {
+            let dist = (raw_y - target_pos).abs();
+            if dist < best_dy {
+                best_dy = dist;
+                snapped_y = target_pos;
+                guide_y = Some(guide_coord);
+            }
+        }
+
+        (snapped_x, snapped_y, guide_x, guide_y)
+    }
+
+    /// Магнитное прилипание масштаба клипа (Transform Resize) к границам экрана 1920x1080 (±960, ±540) и масштабу 1.0x.
+    /// Возвращает `(snapped_zx, snapped_zy, snap_guide_x, snap_guide_y)`.
+    pub fn snap_transform_zoom(
+        raw_zx: f32,
+        raw_zy: f32,
+        clip: &crate::timeline::Clip,
+        uniform: bool,
+        snap_proj_threshold: f32,
+    ) -> (f32, f32, Option<f32>, Option<f32>) {
+        let ratio = if raw_zx.abs() > 0.001 { raw_zy / raw_zx } else { 1.0 };
+        let l_factor = -960.0 * (1.0 - 2.0 * (clip.crop_left / 100.0));
+        let r_factor = 960.0 * (1.0 - 2.0 * (clip.crop_right / 100.0));
+        let t_factor = -540.0 * (1.0 - 2.0 * (clip.crop_top / 100.0));
+        let b_factor = 540.0 * (1.0 - 2.0 * (clip.crop_bottom / 100.0));
+
+        let mut snapped_zx = raw_zx;
+        let mut snapped_zy = raw_zy;
+        let mut guide_x = None;
+        let mut guide_y = None;
+
+        // Проверка прилипания по X (левый край к -960, правый к +960, или масштаб 1.0)
+        let mut x_targets: Vec<(f32, Option<f32>)> = vec![(1.0, None)];
+        if l_factor.abs() > 1.0 {
+            let zx_l = (-960.0 - clip.position_x) / l_factor;
+            if zx_l > 0.05 {
+                x_targets.push((zx_l, Some(-960.0)));
+            }
+        }
+        if r_factor.abs() > 1.0 {
+            let zx_r = (960.0 - clip.position_x) / r_factor;
+            if zx_r > 0.05 {
+                x_targets.push((zx_r, Some(960.0)));
+            }
+        }
+
+        let mut best_dx_px = snap_proj_threshold;
+        for (cand_zx, g_x) in x_targets {
+            let err_px = (raw_zx - cand_zx).abs() * 960.0;
+            if err_px <= best_dx_px {
+                best_dx_px = err_px;
+                snapped_zx = cand_zx;
+                guide_x = g_x;
+                if uniform {
+                    snapped_zy = (cand_zx * ratio).clamp(0.05, 10.0);
+                }
+            }
+        }
+
+        // Проверка прилипания по Y (верхний край к -540, нижний к +540, или масштаб 1.0)
+        let mut y_targets: Vec<(f32, Option<f32>)> = vec![(1.0, None)];
+        if t_factor.abs() > 1.0 {
+            let zy_t = (-540.0 - clip.position_y) / t_factor;
+            if zy_t > 0.05 {
+                y_targets.push((zy_t, Some(-540.0)));
+            }
+        }
+        if b_factor.abs() > 1.0 {
+            let zy_b = (540.0 - clip.position_y) / b_factor;
+            if zy_b > 0.05 {
+                y_targets.push((zy_b, Some(540.0)));
+            }
+        }
+
+        let mut best_dy_px = snap_proj_threshold;
+        for (cand_zy, g_y) in y_targets {
+            let err_px = (raw_zy - cand_zy).abs() * 540.0;
+            if err_px <= best_dy_px && (!uniform || err_px < best_dx_px) {
+                best_dy_px = err_px;
+                snapped_zy = cand_zy;
+                guide_y = g_y;
+                if uniform && ratio.abs() > 0.001 {
+                    snapped_zx = (cand_zy / ratio).clamp(0.05, 10.0);
+                }
+            }
+        }
+
+        (snapped_zx.clamp(0.05, 10.0), snapped_zy.clamp(0.05, 10.0), guide_x, guide_y)
     }
 
     pub fn render_dual_viewers(
@@ -79,7 +221,7 @@ impl ViewerState {
         ctx: &egui::Context,
     ) {
         // 1. Проверяем Render Cache: если кадр уже отрендерен — мгновенный 0 мс доступ без вызова FFmpeg/DRM
-        let current_sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, timeline.playhead_frame);
+        let current_sig = crate::render_cache::RenderCacheManager::compute_decode_signature(timeline, timeline.playhead_frame);
         let cached_img = if render_cache.mode != crate::render_cache::RenderCacheMode::None {
             render_cache.get(timeline.playhead_frame, current_sig)
         } else {
@@ -91,7 +233,11 @@ impl ViewerState {
 
         if let Some(clip) = active_clip {
             if let Some(path) = &clip.source_path {
-                if video_player.current_path.as_deref() != Some(path.as_path()) {
+                let need_file_open = cached_img.is_none() || (timeline.is_playing && !timeline.is_scrubbing && {
+                    let lookahead_end = (timeline.playhead_frame + 24).min(clip.end_frame());
+                    (timeline.playhead_frame..lookahead_end).any(|f| !render_cache.is_cached(f))
+                });
+                if need_file_open && video_player.current_path.as_deref() != Some(path.as_path()) {
                     let _ = video_player.open_file(path, ctx);
                 }
                 let source_frame = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
@@ -189,16 +335,17 @@ impl ViewerState {
                             && target_src >= video_player.total_frames - 2
                             && presented_src >= video_player.total_frames - 2;
                         let is_match = is_exact_display && (presented_src == target_src || is_eof_hold);
-                        if is_match && clip.contains_frame(timeline.playhead_frame) {
-                            let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, timeline.playhead_frame);
+                        let is_top = timeline.active_video_clip_at(timeline.playhead_frame).map(|ac| ac.id) == Some(clip.id);
+                        if is_match && is_top && clip.contains_frame(timeline.playhead_frame) {
+                            let sig = crate::render_cache::RenderCacheManager::compute_decode_signature(timeline, timeline.playhead_frame);
                             if !render_cache.is_cached(timeline.playhead_frame) {
                                 render_cache.insert(timeline.playhead_frame, std::sync::Arc::clone(img), sig);
                                 inserted_any = true;
                             }
                             if is_eof_hold {
                                 for tl_f in timeline.playhead_frame..clip.end_frame() {
-                                    if clip.contains_frame(tl_f) {
-                                        let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
+                                    if clip.contains_frame(tl_f) && timeline.active_video_clip_at(tl_f).map(|ac| ac.id) == Some(clip.id) {
+                                        let sig = crate::render_cache::RenderCacheManager::compute_decode_signature(timeline, tl_f);
                                         if !render_cache.is_cached(tl_f) {
                                             render_cache.insert(tl_f, std::sync::Arc::clone(img), sig);
                                             inserted_any = true;
@@ -223,12 +370,12 @@ impl ViewerState {
                             let base_tl = clip.timeline_frame_from_source(src_f, timeline.fps);
                             let search_range = ((timeline.fps as f64 / clip.source_fps.max(1.0) / clip.speed.abs().max(0.01)).ceil() as i64).max(2);
                             for tl_f in (base_tl - search_range)..=(base_tl + search_range) {
-                                if clip.contains_frame(tl_f) {
+                                if clip.contains_frame(tl_f) && timeline.active_video_clip_at(tl_f).map(|ac| ac.id) == Some(clip.id) {
                                     let tl_src = clip.source_frame_from_timeline(tl_f, timeline.fps);
                                     let is_match = tl_src == src_f
                                         || (video_player.total_frames > 0 && src_f >= video_player.total_frames - 2 && tl_src >= video_player.total_frames - 2);
                                     if is_match {
-                                        let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
+                                        let sig = crate::render_cache::RenderCacheManager::compute_decode_signature(timeline, tl_f);
                                         let was_cached = render_cache.is_cached(tl_f);
                                         render_cache.insert(tl_f, std::sync::Arc::clone(&img), sig);
                                         if !was_cached {
@@ -242,8 +389,8 @@ impl ViewerState {
                             // устраняя перманентные красные сектора из-за разницы длительностей видео и контейнера!
                             if video_player.total_frames > 0 && src_f >= video_player.total_frames - 2 {
                                 for tl_f in base_tl..clip.end_frame() {
-                                    if clip.contains_frame(tl_f) {
-                                        let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
+                                    if clip.contains_frame(tl_f) && timeline.active_video_clip_at(tl_f).map(|ac| ac.id) == Some(clip.id) {
+                                        let sig = crate::render_cache::RenderCacheManager::compute_decode_signature(timeline, tl_f);
                                         if !render_cache.is_cached(tl_f) {
                                             render_cache.insert(tl_f, std::sync::Arc::clone(&img), sig);
                                             inserted_any = true;
@@ -255,8 +402,8 @@ impl ViewerState {
                             // Если это самый первый кадр клипа, гарантируем кэширование от самого начала клипа clip.start_frame
                             if src_f == 0 && clip.source_in_secs <= 0.001 {
                                 for tl_f in clip.start_frame..=base_tl {
-                                    if clip.contains_frame(tl_f) {
-                                        let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
+                                    if clip.contains_frame(tl_f) && timeline.active_video_clip_at(tl_f).map(|ac| ac.id) == Some(clip.id) {
+                                        let sig = crate::render_cache::RenderCacheManager::compute_decode_signature(timeline, tl_f);
                                         if !render_cache.is_cached(tl_f) {
                                             render_cache.insert(tl_f, std::sync::Arc::clone(&img), sig);
                                             inserted_any = true;
@@ -785,8 +932,9 @@ impl ViewerState {
                     pos2(clip_center.x + dx * cos_a - dy * sin_a, clip_center.y + dx * sin_a + dy * cos_a)
                 };
 
-                // Изоляция цветовых каналов
-                let alpha = (top_clip.opacity / 100.0 * 255.0) as u8;
+                // Изоляция цветовых каналов и поддержка динамического Fade In / Fade Out непрозрачности
+                let effective_opacity = top_clip.effective_opacity_at(timeline.playhead_frame);
+                let alpha = (effective_opacity / 100.0 * 255.0).round().clamp(0.0, 255.0) as u8;
                 let tint = match self.channel_mode {
                     ColorChannelMode::RGB => Color32::from_rgba_unmultiplied(255, 255, 255, alpha),
                     ColorChannelMode::Red => Color32::from_rgba_unmultiplied(255, 60, 60, alpha),
@@ -901,9 +1049,24 @@ impl ViewerState {
                         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
                     }
 
-                    // Обработка интерактивного изменения положения, масштаба и угла клипа
+                    // Обработка интерактивного изменения положения, масштаба и угла клипа с магнитным прилипанием к краям и центру (DaVinci Resolve Magnetic Snap)
                     let mut clip_mutated = false;
                     let top_clip_id = top_clip.id;
+                    let mut active_snap_guide_x: Option<f32> = None;
+                    let mut active_snap_guide_y: Option<f32> = None;
+                    let is_alt = ui.input(|i| i.modifiers.alt);
+                    let snap_proj_thresh = (12.0 / px_scale).clamp(4.0, 48.0);
+
+                    let is_moving_body = body_resp.dragged_by(egui::PointerButton::Primary) && !any_handle_active && !is_space && !mmb_down;
+                    let is_resizing_any = resp_rb.dragged() || resp_lt.dragged() || resp_rt.dragged() || resp_lb.dragged()
+                        || resp_rc.dragged() || resp_lc.dragged() || resp_bc.dragged() || resp_tc.dragged();
+
+                    if !is_moving_body {
+                        self.transform_raw_pos = None;
+                    }
+                    if !is_resizing_any {
+                        self.transform_raw_zoom = None;
+                    }
 
                     if let Some(target_clip) = timeline.clips.iter_mut().find(|c| c.id == top_clip_id) {
                         if resp_rot.dragged() {
@@ -915,11 +1078,19 @@ impl ViewerState {
                                 while angle < -180.0 { angle += 360.0; }
                                 if is_shift {
                                     angle = (angle / 15.0).round() * 15.0;
+                                } else if !is_alt {
+                                    // Магнитное прилипание к 0°, ±90°, ±180°
+                                    for cardinal in [0.0f32, 90.0, -90.0, 180.0, -180.0] {
+                                        if (angle - cardinal).abs() <= 2.5 {
+                                            angle = cardinal;
+                                            break;
+                                        }
+                                    }
                                 }
                                 target_clip.rotation = (angle * 10.0).round() / 10.0;
                                 clip_mutated = true;
                             }
-                        } else if body_resp.dragged_by(egui::PointerButton::Primary) && !any_handle_active && !is_space && !mmb_down {
+                        } else if is_moving_body {
                             let delta = body_resp.drag_delta();
                             let is_shift = ui.input(|i| i.modifiers.shift);
                             let (dx, dy) = if is_shift {
@@ -931,8 +1102,22 @@ impl ViewerState {
                             } else {
                                 (delta.x, delta.y)
                             };
-                            target_clip.position_x += dx / px_scale;
-                            target_clip.position_y += dy / px_scale;
+                            let (raw_x, raw_y) = self
+                                .transform_raw_pos
+                                .get_or_insert((target_clip.position_x, target_clip.position_y));
+                            *raw_x += dx / px_scale;
+                            *raw_y += dy / px_scale;
+
+                            if !is_alt && target_clip.rotation.abs() <= 0.5 {
+                                let (sx, sy, gx, gy) = Self::snap_transform_position(*raw_x, *raw_y, target_clip, snap_proj_thresh);
+                                target_clip.position_x = sx;
+                                target_clip.position_y = sy;
+                                active_snap_guide_x = gx;
+                                active_snap_guide_y = gy;
+                            } else {
+                                target_clip.position_x = *raw_x;
+                                target_clip.position_y = *raw_y;
+                            }
                             clip_mutated = true;
                         } else if resp_rb.dragged() || resp_lt.dragged() || resp_rt.dragged() || resp_lb.dragged() {
                             // Сначала переводим вектор перемещения мыши в локальную (неповёрнутую) систему координат клипа,
@@ -951,14 +1136,23 @@ impl ViewerState {
                             let half_w = (screen_rect.width() * 0.5).max(1.0);
                             let half_h = (screen_rect.height() * 0.5).max(1.0);
                             let zoom_delta = (local_dx / half_w + local_dy / half_h) * 0.5;
-                            let ratio = if target_clip.zoom_x.abs() > 0.001 {
-                                target_clip.zoom_y / target_clip.zoom_x
+                            let (raw_zx, raw_zy) = self
+                                .transform_raw_zoom
+                                .get_or_insert((target_clip.zoom_x, target_clip.zoom_y));
+                            let ratio = if raw_zx.abs() > 0.001 { *raw_zy / *raw_zx } else { 1.0 };
+                            *raw_zx = (*raw_zx + zoom_delta).clamp(0.05, 10.0);
+                            *raw_zy = (*raw_zx * ratio).clamp(0.05, 10.0);
+
+                            if !is_alt && target_clip.rotation.abs() <= 0.5 {
+                                let (szx, szy, gx, gy) = Self::snap_transform_zoom(*raw_zx, *raw_zy, target_clip, true, snap_proj_thresh);
+                                target_clip.zoom_x = szx;
+                                target_clip.zoom_y = szy;
+                                active_snap_guide_x = gx;
+                                active_snap_guide_y = gy;
                             } else {
-                                1.0
-                            };
-                            let new_zx = (target_clip.zoom_x + zoom_delta).clamp(0.05, 10.0);
-                            target_clip.zoom_x = new_zx;
-                            target_clip.zoom_y = (new_zx * ratio).clamp(0.05, 10.0);
+                                target_clip.zoom_x = *raw_zx;
+                                target_clip.zoom_y = *raw_zy;
+                            }
                             clip_mutated = true;
                         } else if resp_rc.dragged() || resp_lc.dragged() {
                             let (screen_delta, sign_x) = if resp_rc.dragged() {
@@ -969,7 +1163,18 @@ impl ViewerState {
                             let local_dx = (screen_delta.x * cos_a + screen_delta.y * sin_a) * sign_x;
                             let half_w = (screen_rect.width() * 0.5).max(1.0);
                             let zoom_delta = local_dx / half_w;
-                            target_clip.zoom_x = (target_clip.zoom_x + zoom_delta).clamp(0.05, 10.0);
+                            let (raw_zx, raw_zy) = self
+                                .transform_raw_zoom
+                                .get_or_insert((target_clip.zoom_x, target_clip.zoom_y));
+                            *raw_zx = (*raw_zx + zoom_delta).clamp(0.05, 10.0);
+
+                            if !is_alt && target_clip.rotation.abs() <= 0.5 {
+                                let (szx, _, gx, _) = Self::snap_transform_zoom(*raw_zx, *raw_zy, target_clip, false, snap_proj_thresh);
+                                target_clip.zoom_x = szx;
+                                active_snap_guide_x = gx;
+                            } else {
+                                target_clip.zoom_x = *raw_zx;
+                            }
                             clip_mutated = true;
                         } else if resp_bc.dragged() || resp_tc.dragged() {
                             let (screen_delta, sign_y) = if resp_bc.dragged() {
@@ -980,9 +1185,37 @@ impl ViewerState {
                             let local_dy = (-screen_delta.x * sin_a + screen_delta.y * cos_a) * sign_y;
                             let half_h = (screen_rect.height() * 0.5).max(1.0);
                             let zoom_delta = local_dy / half_h;
-                            target_clip.zoom_y = (target_clip.zoom_y + zoom_delta).clamp(0.05, 10.0);
+                            let (raw_zx, raw_zy) = self
+                                .transform_raw_zoom
+                                .get_or_insert((target_clip.zoom_x, target_clip.zoom_y));
+                            *raw_zy = (*raw_zy + zoom_delta).clamp(0.05, 10.0);
+
+                            if !is_alt && target_clip.rotation.abs() <= 0.5 {
+                                let (_, szy, _, gy) = Self::snap_transform_zoom(*raw_zx, *raw_zy, target_clip, false, snap_proj_thresh);
+                                target_clip.zoom_y = szy;
+                                active_snap_guide_y = gy;
+                            } else {
+                                target_clip.zoom_y = *raw_zy;
+                            }
                             clip_mutated = true;
                         }
+                    }
+
+                    // Визуальные магнитные направляющие при прилипании к краям или центру экрана (DaVinci Resolve Snap Guides)
+                    let snap_color = Color32::from_rgb(255, 214, 10);
+                    if let Some(gx) = active_snap_guide_x {
+                        let screen_x = screen_rect.center().x + gx * px_scale;
+                        painter.line_segment(
+                            [pos2(screen_x, screen_rect.min.y - 6.0), pos2(screen_x, screen_rect.max.y + 6.0)],
+                            Stroke::new(1.8, snap_color),
+                        );
+                    }
+                    if let Some(gy) = active_snap_guide_y {
+                        let screen_y = screen_rect.center().y + gy * px_scale;
+                        painter.line_segment(
+                            [pos2(screen_rect.min.x - 6.0, screen_y), pos2(screen_rect.max.x + 6.0, screen_y)],
+                            Stroke::new(1.8, snap_color),
+                        );
                     }
 
                     if clip_mutated {
@@ -1411,5 +1644,46 @@ mod tests {
             !cache.is_cached(101),
             "Frame 101 must NOT be poisoned in RenderCache by stale frame 100"
         );
+    }
+
+    #[test]
+    fn test_transform_magnetic_edge_and_center_snapping() {
+        let mut clip = crate::timeline::Clip {
+            zoom_x: 0.5,
+            zoom_y: 0.5,
+            position_x: 0.0,
+            position_y: 0.0,
+            ..Default::default()
+        };
+
+        // 1. При zoom = 0.5 полуширина клипа = 480 px, полувысота = 270 px.
+        // Чтобы левый край клипа коснулся левого края экрана (-960), центр должен быть в X = -480.
+        // Подаём raw_x = -474 (в пределах порога 12 px) и raw_y = -265 (в пределах 12 px от верхнего края -270):
+        let (sx, sy, gx, gy) = ViewerState::snap_transform_position(-474.0, -265.0, &clip, 12.0);
+        assert_eq!(sx, -480.0, "Left edge of 0.5x clip must magnetically snap to left screen border (-960)");
+        assert_eq!(sy, -270.0, "Top edge of 0.5x clip must magnetically snap to top screen border (-540)");
+        assert_eq!(gx, Some(-960.0));
+        assert_eq!(gy, Some(-540.0));
+
+        // 2. Прилипание правого нижнего края к (+960, +540):
+        let (sx2, sy2, gx2, gy2) = ViewerState::snap_transform_position(472.0, 263.0, &clip, 12.0);
+        assert_eq!(sx2, 480.0);
+        assert_eq!(sy2, 270.0);
+        assert_eq!(gx2, Some(960.0));
+        assert_eq!(gy2, Some(540.0));
+
+        // 3. Прилипание центра к (0, 0):
+        let (sx3, sy3, gx3, gy3) = ViewerState::snap_transform_position(5.0, -4.0, &clip, 12.0);
+        assert_eq!(sx3, 0.0);
+        assert_eq!(sy3, 0.0);
+        assert_eq!(gx3, Some(0.0));
+        assert_eq!(gy3, Some(0.0));
+
+        // 4. Прилипание масштаба (Resize) к 1.0x и границам экрана:
+        clip.position_x = 0.0;
+        clip.position_y = 0.0;
+        let (szx, szy, _, _) = ViewerState::snap_transform_zoom(0.992, 0.992, &clip, true, 12.0);
+        assert!((szx - 1.0).abs() < 1e-4);
+        assert!((szy - 1.0).abs() < 1e-4);
     }
 }

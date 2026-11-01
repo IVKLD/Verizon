@@ -79,6 +79,31 @@ pub struct MixSegment {
     pub speed: f64,
     pub gain_l: f32,
     pub gain_r: f32,
+    /// Длительность Fade In в стерео-парах сэмплов (48 кГц)
+    pub fade_in_frames: usize,
+    /// Длительность Fade Out в стерео-парах сэмплов (48 кГц)
+    pub fade_out_frames: usize,
+}
+
+impl MixSegment {
+    /// Линейный множитель громкости Fade In / Fade Out в локальном стерео-фрейме `rel_pair_idx` (0..len/2)
+    #[inline]
+    pub fn fade_gain_at_pair(&self, rel_pair_idx: usize) -> f32 {
+        if self.fade_in_frames == 0 && self.fade_out_frames == 0 {
+            return 1.0;
+        }
+        let total_pairs = (self.len / 2).max(1);
+        let cur_pair = rel_pair_idx.min(total_pairs);
+        let mut mult = 1.0_f32;
+        if self.fade_in_frames > 0 && cur_pair < self.fade_in_frames {
+            mult *= (cur_pair as f32 / self.fade_in_frames as f32).clamp(0.0, 1.0);
+        }
+        if self.fade_out_frames > 0 && cur_pair > total_pairs.saturating_sub(self.fade_out_frames) {
+            let rem = total_pairs.saturating_sub(cur_pair);
+            mult *= (rem as f32 / self.fade_out_frames as f32).clamp(0.0, 1.0);
+        }
+        mult.clamp(0.0, 1.0)
+    }
 }
 
 /// Иммутабельный снимок аудио-таймлайна. Публикуется через ArcSwap (lock-free, wait-free чтение).
@@ -103,6 +128,7 @@ impl MixSnapshot {
             }
             let pcm = &seg.samples;
             let avail_len = pcm.decoded_len.load(Ordering::Acquire).min(pcm.samples.len());
+            let has_fade = seg.fade_in_frames > 0 || seg.fade_out_frames > 0;
 
             let is_normal_speed = (seg.speed - 1.0).abs() < 1e-4;
             if is_normal_speed {
@@ -115,6 +141,7 @@ impl MixSnapshot {
                     continue;
                 }
                 let dst = &mut out[lo - pos..lo - pos + max_mix];
+                let base_rel_pair = (lo - seg.start) / 2;
 
                 let dst_len = dst.len();
                 if lo & 1 == 0 {
@@ -123,14 +150,16 @@ impl MixSnapshot {
                         let src = src_base + pair_idx * 2;
                         let sl = f32::from_bits(pcm.samples[src].load(Ordering::Relaxed));
                         let sr = f32::from_bits(pcm.samples[src + 1].load(Ordering::Relaxed));
-                        pair[0] += sl * seg.gain_l;
-                        pair[1] += sr * seg.gain_r;
+                        let f_gain = if has_fade { seg.fade_gain_at_pair(base_rel_pair + pair_idx) } else { 1.0 };
+                        pair[0] += sl * seg.gain_l * f_gain;
+                        pair[1] += sr * seg.gain_r * f_gain;
                     }
                     let rem = chunks.into_remainder();
                     if !rem.is_empty() {
                         let src = src_base + dst_len - 1;
                         let s = f32::from_bits(pcm.samples[src].load(Ordering::Relaxed));
-                        rem[0] += s * seg.gain_l;
+                        let f_gain = if has_fade { seg.fade_gain_at_pair(base_rel_pair + dst_len / 2) } else { 1.0 };
+                        rem[0] += s * seg.gain_l * f_gain;
                     }
                 } else {
                     let mut chunks = dst.chunks_exact_mut(2);
@@ -138,14 +167,16 @@ impl MixSnapshot {
                         let src = src_base + pair_idx * 2;
                         let sr = f32::from_bits(pcm.samples[src].load(Ordering::Relaxed));
                         let sl = f32::from_bits(pcm.samples[src + 1].load(Ordering::Relaxed));
-                        pair[0] += sr * seg.gain_r;
-                        pair[1] += sl * seg.gain_l;
+                        let f_gain = if has_fade { seg.fade_gain_at_pair(base_rel_pair + pair_idx) } else { 1.0 };
+                        pair[0] += sr * seg.gain_r * f_gain;
+                        pair[1] += sl * seg.gain_l * f_gain;
                     }
                     let rem = chunks.into_remainder();
                     if !rem.is_empty() {
                         let src = src_base + dst_len - 1;
                         let s = f32::from_bits(pcm.samples[src].load(Ordering::Relaxed));
-                        rem[0] += s * seg.gain_r;
+                        let f_gain = if has_fade { seg.fade_gain_at_pair(base_rel_pair + dst_len / 2) } else { 1.0 };
+                        rem[0] += s * seg.gain_r * f_gain;
                     }
                 }
             } else {
@@ -173,7 +204,8 @@ impl MixSnapshot {
                     if src_idx < avail_len {
                         let s = f32::from_bits(pcm.samples[src_idx].load(Ordering::Relaxed));
                         let gain = if is_right_channel { seg.gain_r } else { seg.gain_l };
-                        *sample += s * gain;
+                        let f_gain = if has_fade { seg.fade_gain_at_pair(cur_tl_frame) } else { 1.0 };
+                        *sample += s * gain * f_gain;
                     }
                 }
             }
@@ -898,6 +930,10 @@ impl AudioPlayer {
             let start = ((c.start_frame.max(0) as f64 / fps) * AUDIO_RATE as f64).round() as usize * 2;
             let in_off = (c.source_in_secs.max(0.0) * AUDIO_RATE as f64).round() as usize * 2;
             let len = ((c.duration_frames.max(0) as f64 / fps) * AUDIO_RATE as f64).round() as usize * 2;
+            let total_pairs = len / 2;
+            let fade_in_frames = (((c.fade_in_frames.max(0) as f64 / fps) * AUDIO_RATE as f64).round() as usize).min(total_pairs);
+            let fade_out_frames = (((c.fade_out_frames.max(0) as f64 / fps) * AUDIO_RATE as f64).round() as usize)
+                .min(total_pairs.saturating_sub(fade_in_frames));
 
             total_len = total_len.max(start + len);
             let eff_speed = if c.speed.abs() > 0.001 { c.speed } else { 1.0 };
@@ -909,6 +945,8 @@ impl AudioPlayer {
                 speed: eff_speed,
                 gain_l: vol_linear * pan_l,
                 gain_r: vol_linear * pan_r,
+                fade_in_frames,
+                fade_out_frames,
             });
         }
 
@@ -1137,6 +1175,8 @@ mod tests {
                 speed: 2.0,
                 gain_l: 1.0,
                 gain_r: 1.0,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
             }],
             total_len: 20,
         };
@@ -1160,6 +1200,8 @@ mod tests {
                 speed: -1.0,
                 gain_l: 1.0,
                 gain_r: 1.0,
+                fade_in_frames: 0,
+                fade_out_frames: 0,
             }],
             total_len: 20,
         };
@@ -1170,5 +1212,36 @@ mod tests {
         assert!((out_rev[0] - 0.9).abs() < 1e-4);
         // Кадр 1 на таймлайне -> предпоследний кадр (кадр 8 -> 0.8)
         assert!((out_rev[2] - 0.8).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_audio_mixer_fade_in_and_fade_out() {
+        // 10 стерео-пар (20 сэмплов) со значением 1.0
+        let buf = AudioStreamBuffer::from_vec(vec![1.0f32; 20]);
+        let snapshot = MixSnapshot {
+            segments: vec![MixSegment {
+                samples: buf,
+                start: 0,
+                in_off: 0,
+                len: 20, // 10 стерео-пар
+                speed: 1.0,
+                gain_l: 1.0,
+                gain_r: 1.0,
+                fade_in_frames: 4,
+                fade_out_frames: 4,
+            }],
+            total_len: 20,
+        };
+
+        let mut out = vec![0.0f32; 20];
+        snapshot.mix_block(0, &mut out);
+        // Пара 0 (начало Fade In): 0.0
+        assert!((out[0] - 0.0).abs() < 1e-4);
+        // Пара 2 (середина Fade In 2/4): 0.5
+        assert!((out[4] - 0.5).abs() < 1e-4);
+        // Пара 5 (плато 1.0): 1.0
+        assert!((out[10] - 1.0).abs() < 1e-4);
+        // Пара 8 (середина Fade Out, осталось 2 из 4): 0.5
+        assert!((out[16] - 0.5).abs() < 1e-4);
     }
 }

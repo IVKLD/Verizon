@@ -995,7 +995,12 @@ impl eframe::App for NleApp {
         let ctx = ui.ctx().clone();
 
         // Проверка изменения структуры таймлайна (разрезы, перемещения, удаление, Retime)
-        if self.timeline.structure_dirty {
+        let is_dragging = self.timeline.moving_clip.is_some()
+            || self.timeline.trim_session.is_some()
+            || self.timeline.retime_session.is_some()
+            || self.timeline.envelope_session.is_some();
+
+        if self.timeline.structure_dirty && !is_dragging {
             self.render_cache.invalidate_all();
             self.video_player.flush_queues_on_cut();
             let _ = self.timeline.save_scene_file(&UserPreferences::scene_path());
@@ -1005,6 +1010,7 @@ impl eframe::App for NleApp {
         // Отслеживание активности пользователя для фонового Smart Cache в режиме ожидания (Idle)
         let user_busy = self.timeline.is_playing
             || self.timeline.is_scrubbing
+            || is_dragging
             || ctx.input(|i| i.pointer.primary_down());
 
         if user_busy {
@@ -1031,9 +1037,9 @@ impl eframe::App for NleApp {
                         let start_f = (cur_playhead - backward_window).max(clip.start_frame);
                         let end_f = (cur_playhead + forward_window).min(clip.end_frame());
                         for tl_f in start_f..end_f {
-                            if !self.render_cache.is_cached(tl_f) {
+                            if !self.render_cache.is_cached(tl_f) && self.timeline.active_video_clip_at(tl_f).map(|ac| ac.id) == Some(clip.id) {
                                 let src_f = clip.source_frame_from_timeline(tl_f, self.timeline.fps);
-                                let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(&self.timeline, tl_f);
+                                let sig = crate::render_cache::RenderCacheManager::compute_decode_signature(&self.timeline, tl_f);
                                 uncached_batch.push((src_f, tl_f, sig));
                                 if uncached_batch.len() >= 120 {
                                     break;
@@ -1055,9 +1061,9 @@ impl eframe::App for NleApp {
                         if let Some(ref path) = clip.source_path {
                             let remaining_budget = max_cap.saturating_sub(self.render_cache.stats().cached_frames).min(120);
                             for tl_f in clip.start_frame..clip.end_frame() {
-                                if !self.render_cache.is_cached(tl_f) {
+                                if !self.render_cache.is_cached(tl_f) && self.timeline.active_video_clip_at(tl_f).map(|ac| ac.id) == Some(clip.id) {
                                     let src_f = clip.source_frame_from_timeline(tl_f, self.timeline.fps);
-                                    let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(&self.timeline, tl_f);
+                                    let sig = crate::render_cache::RenderCacheManager::compute_decode_signature(&self.timeline, tl_f);
                                     uncached_batch.push((src_f, tl_f, sig));
                                     if uncached_batch.len() >= remaining_budget {
                                         break;
@@ -1082,9 +1088,9 @@ impl eframe::App for NleApp {
                     }
                     let Some(ref path) = clip.source_path else { continue; };
                     for tl_f in clip.start_frame..clip.end_frame() {
-                        if !self.render_cache.is_cached(tl_f) {
+                        if !self.render_cache.is_cached(tl_f) && self.timeline.active_video_clip_at(tl_f).map(|ac| ac.id) == Some(clip.id) {
                             let src_f = clip.source_frame_from_timeline(tl_f, self.timeline.fps);
-                            let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(&self.timeline, tl_f);
+                            let sig = crate::render_cache::RenderCacheManager::compute_decode_signature(&self.timeline, tl_f);
                             uncached_batch.push((src_f, tl_f, sig));
                             if uncached_batch.len() >= remaining_budget {
                                 break;
@@ -1247,9 +1253,10 @@ impl eframe::App for NleApp {
         if !is_autopilot {
             self.handle_drag_and_drop(&ctx);
             self.handle_keyboard_shortcuts(&ctx);
-            if self.timeline.structure_dirty {
+            if self.timeline.structure_dirty && !is_dragging {
                 self.render_cache.invalidate_all();
                 self.video_player.flush_queues_on_cut();
+                let _ = self.timeline.save_scene_file(&UserPreferences::scene_path());
                 self.timeline.structure_dirty = false;
             }
         }

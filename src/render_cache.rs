@@ -72,9 +72,31 @@ impl RenderCacheManager {
         }
     }
 
-    /// Вычислить сигнатуру валидности для кадра таймлайна
+    /// Вычислить сигнатуру декодирования для кадра таймлайна.
+    /// Зависит ТОЛЬКО от декодируемого исходного кадра активного верхнего видеоклипа (V2 > V1).
+    /// GPU-трансформации (Position, Zoom, Rotation, Crop, Flip, Opacity, Fade In/Out) применяются
+    /// на лету на GPU-кваде во Viewer и НЕ инвалидируют декодированный буфер кадра в Render Cache!
+    pub fn compute_decode_signature(timeline: &TimelineState, frame: i64) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        if let Some(c) = timeline.active_video_clip_at(frame) {
+            1u8.hash(&mut hasher);
+            let src_f = c.source_frame_from_timeline(frame, timeline.fps);
+            src_f.hash(&mut hasher);
+            if let Some(ref path) = c.source_path {
+                path.hash(&mut hasher);
+            } else {
+                c.id.hash(&mut hasher);
+            }
+        } else {
+            0u8.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Вычислить полную сигнатуру валидности для кадра таймлайна (включая параметры композитинга)
     pub fn compute_frame_signature(timeline: &TimelineState, frame: i64) -> u64 {
         let mut hasher = DefaultHasher::new();
+        timeline.active_video_clip_at(frame).map(|c| c.id).hash(&mut hasher);
         // Включаем активные видеоклипы на таймлайне под этим кадром
         for c in &timeline.clips {
             if !c.is_audio && c.contains_frame(frame) {
@@ -91,7 +113,7 @@ impl RenderCacheManager {
                 c.position_x.to_bits().hash(&mut hasher);
                 c.position_y.to_bits().hash(&mut hasher);
                 c.rotation.to_bits().hash(&mut hasher);
-                c.opacity.to_bits().hash(&mut hasher);
+                c.effective_opacity_at(frame).to_bits().hash(&mut hasher);
                 c.flip_h.hash(&mut hasher);
                 c.flip_v.hash(&mut hasher);
                 c.crop_left.to_bits().hash(&mut hasher);
@@ -213,7 +235,10 @@ impl RenderCacheManager {
         let Ok(mut lru) = self.lru_order.lock() else { return; };
         let Ok(mut set) = self.cached_set.write() else { return; };
 
-        if cache.contains_key(&frame) {
+        if let Some(existing) = cache.get(&frame) {
+            if existing.signature == signature && Arc::ptr_eq(&existing.image, &image) {
+                return;
+            }
             cache.insert(frame, CachedRenderFrame { frame, image, signature });
             if let Some(pos) = lru.iter().position(|&f| f == frame) {
                 lru.remove(pos);

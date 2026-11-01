@@ -25,6 +25,25 @@ pub struct TrimSession {
     pub init_source_in_secs: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeDragKind {
+    Level,
+    FadeIn,
+    FadeOut,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EnvelopeDragSession {
+    pub clip_id: u64,
+    pub kind: EnvelopeDragKind,
+    pub mouse_start_x: f32,
+    pub mouse_start_y: f32,
+    pub init_opacity: f32,
+    pub init_volume_db: f32,
+    pub init_fade_in: i64,
+    pub init_fade_out: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Clip {
     pub id: u64,
@@ -60,6 +79,8 @@ pub struct Clip {
     pub volume_db: f32,
     pub pan: f32,
     pub source_audio_stream: usize,
+    pub fade_in_frames: i64,
+    pub fade_out_frames: i64,
 
     // Управление скоростью и Retime Control в стиле DaVinci Resolve
     pub speed: f64,                 // 1.0 = 100%, 0.5 = 50%, 2.0 = 200%, -1.0 = Reverse
@@ -97,6 +118,8 @@ impl Default for Clip {
             volume_db: 0.0,
             pan: 0.0,
             source_audio_stream: 0,
+            fade_in_frames: 0,
+            fade_out_frames: 0,
             speed: 1.0,
             retime_controls_open: false,
             is_disabled: false,
@@ -111,6 +134,31 @@ impl Clip {
 
     pub fn contains_frame(&self, frame: i64) -> bool {
         frame >= self.start_frame && frame < self.end_frame()
+    }
+
+    /// Линейный множитель фейда (Fade In / Fade Out) в локальном кадре клипа `offset_frames` (0..duration_frames)
+    #[inline]
+    pub fn fade_envelope_at_offset(&self, offset_frames: i64) -> f32 {
+        let dur = self.duration_frames.max(1);
+        let rel = offset_frames.clamp(0, dur);
+        let fade_in = self.fade_in_frames.clamp(0, dur);
+        let fade_out = self.fade_out_frames.clamp(0, dur - fade_in);
+        let mut factor = 1.0_f32;
+        if fade_in > 0 && rel < fade_in {
+            factor *= (rel as f32 / fade_in as f32).clamp(0.0, 1.0);
+        }
+        if fade_out > 0 && rel > dur - fade_out {
+            let rem = (dur - rel).max(0);
+            factor *= (rem as f32 / fade_out as f32).clamp(0.0, 1.0);
+        }
+        factor.clamp(0.0, 1.0)
+    }
+
+    /// Эффективная непрозрачность видеоклипа (0..=100%) в глобальном кадре таймлайна с учетом Fade In / Fade Out
+    #[inline]
+    pub fn effective_opacity_at(&self, timeline_frame: i64) -> f32 {
+        let offset = timeline_frame - self.start_frame;
+        (self.opacity * self.fade_envelope_at_offset(offset)).clamp(0.0, 100.0)
     }
 
     /// Перевод глобального кадра таймлайна в локальный номер кадра исходного медиафайла с учетом скорости (Retime)
@@ -188,6 +236,10 @@ pub struct SerializedClip {
     pub volume_db: f32,
     pub pan: f32,
     pub source_audio_stream: usize,
+    #[serde(default)]
+    pub fade_in_frames: i64,
+    #[serde(default)]
+    pub fade_out_frames: i64,
     pub speed: f64,
     pub is_disabled: bool,
 }
@@ -222,6 +274,8 @@ impl From<&Clip> for SerializedClip {
             volume_db: c.volume_db,
             pan: c.pan,
             source_audio_stream: c.source_audio_stream,
+            fade_in_frames: c.fade_in_frames,
+            fade_out_frames: c.fade_out_frames,
             speed: c.speed,
             is_disabled: c.is_disabled,
         }
@@ -263,6 +317,8 @@ impl From<SerializedClip> for Clip {
             volume_db: s.volume_db,
             pan: s.pan,
             source_audio_stream: s.source_audio_stream,
+            fade_in_frames: s.fade_in_frames,
+            fade_out_frames: s.fade_out_frames,
             speed: s.speed,
             retime_controls_open: false,
             is_disabled: s.is_disabled,
@@ -336,6 +392,9 @@ pub struct TimelineState {
 
     // Текущая сессия подрезки краев клипа (DaVinci Resolve Edge Trimming)
     pub trim_session: Option<TrimSession>,
+
+    // Текущая сессия изменения Opacity / Volume / Fade In / Fade Out на клипе (DaVinci Resolve On-Clip Handles)
+    pub envelope_session: Option<EnvelopeDragSession>,
 
     // Очередь импорта медиа
     pub pending_imports: Vec<PathBuf>,
@@ -470,6 +529,7 @@ impl TimelineState {
             dragged_media: None,
             moving_clip: None,
             trim_session: None,
+            envelope_session: None,
             pending_imports: Vec::new(),
             history: Vec::new(),
             redo_stack: Vec::new(),
@@ -688,8 +748,12 @@ impl TimelineState {
                 let src_fps = if right_clip.source_fps > 0.0 { right_clip.source_fps } else { self.fps.max(1) as f64 };
                 let frames_offset = (secs_offset * src_fps).round() as i64;
                 right_clip.source_in_frame = (right_clip.source_in_frame + frames_offset).max(0);
+                right_clip.fade_in_frames = 0;
+                right_clip.fade_out_frames = right_clip.fade_out_frames.clamp(0, right_duration);
 
                 self.clips[idx].duration_frames = left_duration;
+                self.clips[idx].fade_in_frames = self.clips[idx].fade_in_frames.clamp(0, left_duration);
+                self.clips[idx].fade_out_frames = 0;
                 self.clips.insert(idx + 1, right_clip);
             }
         }
@@ -943,6 +1007,8 @@ impl TimelineState {
             clip.source_in_secs = (session.init_source_in_secs + delta_secs).max(0.0);
             let src_fps = if clip.source_fps > 0.0 { clip.source_fps } else { timeline_fps };
             clip.source_in_frame = (session.init_source_in_frame as f64 + (delta_secs * src_fps)).round().max(0.0) as i64;
+            clip.fade_in_frames = clip.fade_in_frames.clamp(0, clip.duration_frames);
+            clip.fade_out_frames = clip.fade_out_frames.clamp(0, (clip.duration_frames - clip.fade_in_frames).max(0));
         };
 
         if self.linked_selection && link_grp.is_some() {
@@ -979,10 +1045,15 @@ impl TimelineState {
             for clip in &mut self.clips {
                 if clip.link_group == link_grp && !self.tracks.get(clip.track_index).map(|t| t.is_locked).unwrap_or(false) {
                     clip.duration_frames = new_duration;
+                    clip.fade_in_frames = clip.fade_in_frames.clamp(0, clip.duration_frames);
+                    clip.fade_out_frames = clip.fade_out_frames.clamp(0, (clip.duration_frames - clip.fade_in_frames).max(0));
                 }
             }
         } else {
-            self.clips[clip_idx].duration_frames = new_duration;
+            let clip = &mut self.clips[clip_idx];
+            clip.duration_frames = new_duration;
+            clip.fade_in_frames = clip.fade_in_frames.clamp(0, clip.duration_frames);
+            clip.fade_out_frames = clip.fade_out_frames.clamp(0, (clip.duration_frames - clip.fade_in_frames).max(0));
         }
 
         self.audio_dirty = true;
@@ -2009,5 +2080,41 @@ mod tests {
         // Должен прилипнуть Out-point к плейхеду (200 - 100 = 100)
         assert_eq!(tl.clips[0].start_frame, 100);
         assert_eq!(tl.clips[0].end_frame(), 200);
+    }
+
+    #[test]
+    fn test_clip_fade_envelope_and_effective_opacity() {
+        let mut tl = TimelineState::new_empty();
+        let clip = Clip {
+            id: 1,
+            name: "Fade Clip".to_string(),
+            track_index: 0,
+            start_frame: 10,
+            duration_frames: 100,
+            opacity: 80.0,
+            fade_in_frames: 20,
+            fade_out_frames: 25,
+            ..Default::default()
+        };
+
+        // В самом начале клипа (кадр 10, offset 0): непрозрачность = 0%
+        assert!((clip.effective_opacity_at(10) - 0.0).abs() < 1e-4);
+        // В середине Fade In (кадр 20, offset 10 из 20): 50% от 80% = 40%
+        assert!((clip.effective_opacity_at(20) - 40.0).abs() < 1e-4);
+        // В плато между фейдами (кадр 50, offset 40): полные 80%
+        assert!((clip.effective_opacity_at(50) - 80.0).abs() < 1e-4);
+        // В середине Fade Out (кадр 97.5 -> проверим offset 95, осталось 5 из 25 = 20% от 80% = 16%)
+        assert!((clip.effective_opacity_at(105) - 16.0).abs() < 1e-4);
+        // В конце клипа (кадр 110, offset 100): 0%
+        assert!((clip.effective_opacity_at(110) - 0.0).abs() < 1e-4);
+
+        // При разрезании клипа лезвием (blade_cut_at) левый кусок сохраняет Fade In, правый сохраняет Fade Out
+        tl.clips.push(clip);
+        assert!(tl.blade_cut_at(1, 60));
+        assert_eq!(tl.clips.len(), 2);
+        assert_eq!(tl.clips[0].fade_in_frames, 20);
+        assert_eq!(tl.clips[0].fade_out_frames, 0);
+        assert_eq!(tl.clips[1].fade_in_frames, 0);
+        assert_eq!(tl.clips[1].fade_out_frames, 25);
     }
 }
