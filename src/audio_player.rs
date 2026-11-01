@@ -857,8 +857,9 @@ impl AudioPlayer {
             };
 
             let vol_linear = 10.0f32.powf(c.volume_db / 20.0);
-            let pan_l = ((1.0 - c.pan) / 2.0).clamp(0.0, 1.0);
-            let pan_r = ((1.0 + c.pan) / 2.0).clamp(0.0, 1.0);
+            let pan_norm = if c.pan.abs() > 1.0 { (c.pan / 100.0).clamp(-1.0, 1.0) } else { c.pan.clamp(-1.0, 1.0) };
+            let pan_l = ((1.0 - pan_norm) / 2.0).clamp(0.0, 1.0);
+            let pan_r = ((1.0 + pan_norm) / 2.0).clamp(0.0, 1.0);
 
             let start = ((c.start_frame.max(0) as f64 / fps) * AUDIO_RATE as f64).round() as usize * 2;
             let in_off = (c.source_in_secs.max(0.0) * AUDIO_RATE as f64).round() as usize * 2;
@@ -940,6 +941,7 @@ impl AudioPlayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timeline::{Clip, TimelineState};
 
     #[test]
     fn test_audio_decode_worker_replay_mkv() {
@@ -1042,5 +1044,39 @@ mod tests {
 
         player.set_master_volume(1.5);
         assert!((player.get_master_volume() - 1.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_audio_pan_normalization() {
+        let mut player = AudioPlayer::new();
+        let mut timeline = TimelineState::new_empty();
+        timeline.fps = 24;
+
+        let test_path = Path::new("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
+        if !test_path.exists() {
+            return;
+        }
+
+        // Клип со смещением панорамы вправо на 50% (+50.0)
+        timeline.clips.push(Clip {
+            id: 1,
+            name: "Pan Test".to_string(),
+            track_index: 2,
+            start_frame: 0,
+            duration_frames: 48,
+            is_audio: true,
+            source_path: Some(test_path.to_path_buf()),
+            volume_db: 0.0,
+            pan: 50.0, // 50% вправо
+            ..Default::default()
+        });
+
+        player.rebuild_timeline_audio(&timeline);
+        let snapshot = player.engine.snapshot.load();
+        assert_eq!(snapshot.segments.len(), 1);
+        let seg = &snapshot.segments[0];
+        // При pan = 50% вправо, левый канал = 0.25, правый канал = 0.75
+        assert!((seg.gain_l - 0.25).abs() < 1e-3);
+        assert!((seg.gain_r - 0.75).abs() < 1e-3);
     }
 }

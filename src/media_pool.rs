@@ -234,12 +234,15 @@ impl MediaPoolState {
                     None
                 };
 
+                let first_audio_track_idx = timeline.tracks.iter().position(|t| !t.is_video).unwrap_or(timeline.tracks.len());
+                let main_video_track_idx = first_audio_track_idx.saturating_sub(1);
+
                 // 1. Создаем видеоклип на V1, если есть видео
                 if asset.has_video {
                     let v_clip = Clip {
                         id: timeline.next_clip_id,
                         name: asset.filename.clone(),
-                        track_index: 1, // V1
+                        track_index: main_video_track_idx,
                         start_frame: start,
                         duration_frames: v_dur,
                         is_audio: false,
@@ -271,7 +274,7 @@ impl MediaPoolState {
                 // 2. Создаем аудиоклипы для ВСЕХ аудиодорожек файла (A1, A2...)
                 if num_audio > 0 {
                     for a_idx in 0..num_audio {
-                        let target_track = 2 + a_idx;
+                        let target_track = first_audio_track_idx + a_idx;
                         timeline.ensure_audio_track(target_track);
 
                         let track_title = if num_audio > 1 {

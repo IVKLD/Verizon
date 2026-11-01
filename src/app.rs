@@ -381,6 +381,11 @@ impl NleApp {
     }
 
     fn handle_keyboard_shortcuts(&mut self, ctx: &Context) {
+        // Если пользователь вводит текст в текстовое поле (TextEdit), глобальные хоткеи таймлайна не должны срабатывать
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+
         let mut import_requested = false;
         let mut scale_change: Option<f32> = None;
         let mut toggle_prefs = false;
@@ -477,8 +482,10 @@ impl NleApp {
                 self.timeline.out_point = None;
             }
 
+            let no_mods = !i.modifiers.ctrl && !i.modifiers.command && !i.modifiers.alt && !i.modifiers.shift;
+
             // J / K / L Shuttle (Прогрессивный Shuttle в стиле DaVinci Resolve)
-            if i.key_pressed(egui::Key::J) {
+            if no_mods && i.key_pressed(egui::Key::J) {
                 if !self.timeline.is_playing {
                     self.timeline.is_playing = true;
                     self.timeline.playback_speed = -1.0;
@@ -494,12 +501,12 @@ impl NleApp {
                     self.timeline.playback_speed = -8.0;
                 }
             }
-            if i.key_pressed(egui::Key::K) {
+            if no_mods && i.key_pressed(egui::Key::K) {
                 self.timeline.is_playing = false;
                 self.timeline.playback_speed = 1.0;
                 self.video_player.pause();
             }
-            if i.key_pressed(egui::Key::L) {
+            if no_mods && i.key_pressed(egui::Key::L) {
                 if !self.timeline.is_playing {
                     self.timeline.is_playing = true;
                     self.timeline.playback_speed = 1.0;
@@ -517,18 +524,17 @@ impl NleApp {
             }
 
             // Инструменты: A (Arrow), T (Trim), B (Blade)
-            if i.key_pressed(egui::Key::A) {
+            if no_mods && i.key_pressed(egui::Key::A) {
                 self.timeline.active_tool = Tool::Selection;
             }
-            if i.key_pressed(egui::Key::T) {
+            if no_mods && i.key_pressed(egui::Key::T) {
                 self.timeline.active_tool = Tool::Trim;
             }
-            if i.key_pressed(egui::Key::B) {
-                if i.modifiers.ctrl {
-                    self.timeline.blade_all_at_playhead();
-                } else {
-                    self.timeline.active_tool = Tool::Blade;
-                }
+            if no_mods && i.key_pressed(egui::Key::B) {
+                self.timeline.active_tool = Tool::Blade;
+            }
+            if (i.modifiers.ctrl || i.modifiers.command) && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(egui::Key::B) {
+                self.timeline.blade_all_at_playhead();
             }
 
             // Enter: вставить выбранный клип из пула на таймлайн
@@ -537,7 +543,7 @@ impl NleApp {
             }
 
             // Snapping: N
-            if i.key_pressed(egui::Key::N) {
+            if no_mods && i.key_pressed(egui::Key::N) {
                 self.timeline.snapping_enabled = !self.timeline.snapping_enabled;
             }
 
@@ -546,8 +552,29 @@ impl NleApp {
                 self.timeline.linked_selection = !self.timeline.linked_selection;
             }
 
+            // Ctrl+C: Копировать выделенный клип в буфер обмена
+            if (i.modifiers.ctrl || i.modifiers.command) && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(egui::Key::C) {
+                if self.timeline.copy_selected_clip() {
+                    self.notification = Some(("📋 Клип скопирован в буфер".to_string(), std::time::Instant::now()));
+                }
+            }
+
+            // Ctrl+V: Вставить клип из буфера обмена в плейхед
+            if (i.modifiers.ctrl || i.modifiers.command) && !i.modifiers.shift && !i.modifiers.alt && i.key_pressed(egui::Key::V) {
+                if self.timeline.paste_clipboard() {
+                    self.notification = Some(("📋 Клип вставлен на таймлайн".to_string(), std::time::Instant::now()));
+                }
+            }
+
+            // Снятие выделения клипа: Ctrl+Shift+A или Alt+D (DaVinci Resolve Deselect)
+            if ((i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(egui::Key::A))
+                || (i.modifiers.alt && !i.modifiers.ctrl && i.key_pressed(egui::Key::D))
+            {
+                self.timeline.selected_clip_id = None;
+            }
+
             // In / Out: I / O (без модификаторов)
-            if !i.modifiers.ctrl && !i.modifiers.command {
+            if no_mods {
                 if i.key_pressed(egui::Key::I) {
                     self.timeline.in_point = Some(self.timeline.playhead_frame);
                 }
@@ -590,13 +617,22 @@ impl NleApp {
             }
 
             // D: Отключить / Включить клип (DaVinci Resolve Disable/Enable Clip)
-            if !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.command && i.key_pressed(egui::Key::D) {
+            if no_mods && i.key_pressed(egui::Key::D) {
                 if let Some(sel_id) = self.timeline.selected_clip_id {
-                    if let Some(c) = self.timeline.clips.iter_mut().find(|c| c.id == sel_id) {
+                    let link_grp = self.timeline.clips.iter().find(|c| c.id == sel_id).and_then(|c| c.link_group);
+                    self.timeline.push_history();
+                    if self.timeline.linked_selection && link_grp.is_some() {
+                        let target_clips: Vec<u64> = self.timeline.clips.iter().filter(|c| c.link_group == link_grp).map(|c| c.id).collect();
+                        for id in target_clips {
+                            if let Some(c) = self.timeline.clips.iter_mut().find(|c| c.id == id) {
+                                c.is_disabled = !c.is_disabled;
+                            }
+                        }
+                    } else if let Some(c) = self.timeline.clips.iter_mut().find(|c| c.id == sel_id) {
                         c.is_disabled = !c.is_disabled;
-                        self.timeline.structure_dirty = true;
-                        self.timeline.audio_dirty = true;
                     }
+                    self.timeline.structure_dirty = true;
+                    self.timeline.audio_dirty = true;
                 }
             }
 

@@ -387,11 +387,49 @@ impl TimelineView {
                 let delta_frames = (dx / timeline.zoom_factor).round() as i64;
                 match trim.edge {
                     crate::timeline::TrimEdge::Start => {
-                        let target_start = trim.init_start_frame + delta_frames;
+                        let mut target_start = trim.init_start_frame + delta_frames;
+                        if timeline.snapping_enabled {
+                            let snap_thresh = (timeline.snapping_threshold_px / timeline.zoom_factor).max(2.0) as i64;
+                            if (target_start - timeline.playhead_frame).abs() <= snap_thresh {
+                                target_start = timeline.playhead_frame;
+                            }
+                            for other in &timeline.clips {
+                                if other.id == trim.clip_id {
+                                    continue;
+                                }
+                                if (target_start - other.start_frame).abs() <= snap_thresh {
+                                    target_start = other.start_frame;
+                                    break;
+                                }
+                                if (target_start - other.end_frame()).abs() <= snap_thresh {
+                                    target_start = other.end_frame();
+                                    break;
+                                }
+                            }
+                        }
                         timeline.trim_clip_start_session(&trim, target_start);
                     }
                     crate::timeline::TrimEdge::End => {
-                        let target_end = trim.init_start_frame + trim.init_duration_frames + delta_frames;
+                        let mut target_end = trim.init_start_frame + trim.init_duration_frames + delta_frames;
+                        if timeline.snapping_enabled {
+                            let snap_thresh = (timeline.snapping_threshold_px / timeline.zoom_factor).max(2.0) as i64;
+                            if (target_end - timeline.playhead_frame).abs() <= snap_thresh {
+                                target_end = timeline.playhead_frame;
+                            }
+                            for other in &timeline.clips {
+                                if other.id == trim.clip_id {
+                                    continue;
+                                }
+                                if (target_end - other.start_frame).abs() <= snap_thresh {
+                                    target_end = other.start_frame;
+                                    break;
+                                }
+                                if (target_end - other.end_frame()).abs() <= snap_thresh {
+                                    target_end = other.end_frame();
+                                    break;
+                                }
+                            }
+                        }
                         timeline.trim_clip_end_session(&trim, target_end);
                     }
                 }
@@ -421,11 +459,11 @@ impl TimelineView {
                 let dx = m_pos.x - start_mouse_x;
                 let dy = m_pos.y - start_mouse_y;
                 let delta_frames = (dx / timeline.zoom_factor).round() as i64;
-                let delta_tracks = (dy / timeline.track_height).round() as isize;
+                let init_center_y = timeline.track_top_y(init_track) + timeline.track_height(init_track) * 0.5;
+                let cur_rel_y = (init_center_y + dy).max(0.0);
+                let target_track = timeline.track_at_y(cur_rel_y);
 
                 let target_start = (init_start_frame + delta_frames).max(0);
-                let target_track = (init_track as isize + delta_tracks).clamp(0, timeline.tracks.len().saturating_sub(1) as isize) as usize;
-
                 timeline.move_clip_to_track(drag_id, target_start, Some(target_track));
             }
             if ui.input(|i| i.pointer.any_released() || !i.pointer.primary_down()) {
@@ -580,9 +618,16 @@ impl TimelineView {
                             media.link_group
                         };
 
+                        let first_audio_track_idx = timeline.tracks.iter().position(|t| !t.is_video).unwrap_or(timeline.tracks.len());
+                        let main_video_track_idx = first_audio_track_idx.saturating_sub(1);
+
                         if media.has_video && num_audio > 0 {
                             // Создаем связанную группу: Видео на выбранной видеодорожке + Все дорожки аудио на A1, A2...
-                            let video_track = if target_track_idx < 2 { target_track_idx } else { 1 };
+                            let video_track = if timeline.tracks.get(target_track_idx).map(|t| t.is_video).unwrap_or(false) {
+                                target_track_idx
+                            } else {
+                                main_video_track_idx
+                            };
                             let v_clip = Clip {
                                 id: timeline.next_clip_id,
                                 name: media.name.clone(),
@@ -612,7 +657,7 @@ impl TimelineView {
                             timeline.clips.push(v_clip);
 
                             for a_idx in 0..num_audio {
-                                let track_idx = 2 + a_idx;
+                                let track_idx = first_audio_track_idx + a_idx;
                                 timeline.ensure_audio_track(track_idx);
 
                                 let track_name = if num_audio > 1 {
@@ -682,6 +727,7 @@ impl TimelineView {
                             timeline.clips.push(new_clip);
                         }
                         timeline.audio_dirty = true;
+                        timeline.structure_dirty = true;
                         drop_completed = true;
                     }
                 }

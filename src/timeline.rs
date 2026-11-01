@@ -350,6 +350,9 @@ pub struct TimelineState {
     // Флаг изменения структуры таймлайна (разрез, удаление, перемещение, подрезка, скорость)
     pub structure_dirty: bool,
 
+    // Буфер обмена клипов (Ctrl+C / Ctrl+V)
+    pub clipboard: Option<Vec<Clip>>,
+
     // Высота дорожек и параметры отображения таймлайна (Timeline View Options)
     pub track_height: f32, // Глобальная высота дорожки по умолчанию (52.0 px)
     pub resizing_track: Option<(usize, f32, f32)>, // (индекс дорожки, стартовый Y курсора, начальная высота)
@@ -470,6 +473,7 @@ impl TimelineState {
             pending_imports: Vec::new(),
             history: Vec::new(),
             redo_stack: Vec::new(),
+            clipboard: None,
             audio_dirty: true,
             structure_dirty: false,
             track_height: default_h,
@@ -674,19 +678,16 @@ impl TimelineState {
                 right_clip.duration_frames = right_duration;
                 right_clip.link_group = new_link_group;
 
-                let frames_offset = if self.fps > 0 {
-                    (left_duration as f64 * (right_clip.source_fps / self.fps as f64)).round() as i64
-                } else {
-                    left_duration
-                };
-                right_clip.source_in_frame += frames_offset;
-
                 let secs_offset = if self.fps > 0 {
-                    left_duration as f64 / self.fps as f64
+                    (left_duration as f64 / self.fps as f64) * right_clip.speed
                 } else {
                     0.0
                 };
-                right_clip.source_in_secs += secs_offset;
+                right_clip.source_in_secs = (right_clip.source_in_secs + secs_offset).max(0.0);
+
+                let src_fps = if right_clip.source_fps > 0.0 { right_clip.source_fps } else { self.fps.max(1) as f64 };
+                let frames_offset = (secs_offset * src_fps).round() as i64;
+                right_clip.source_in_frame = (right_clip.source_in_frame + frames_offset).max(0);
 
                 self.clips[idx].duration_frames = left_duration;
                 self.clips.insert(idx + 1, right_clip);
@@ -832,24 +833,47 @@ impl TimelineState {
 
         if self.snapping_enabled {
             let snap_threshold = (self.snapping_threshold_px / self.zoom_factor).max(2.0) as i64;
+            let clip_dur = self.clips[clip_idx].duration_frames;
 
-            // Прилипание к плейхеду
+            // Прилипание к 0
+            if target_frame.abs() <= snap_threshold {
+                target_frame = 0;
+            }
+
+            // Прилипание In-point к плейхеду
             if (target_frame - self.playhead_frame).abs() <= snap_threshold {
                 target_frame = self.playhead_frame;
             }
 
-            // Прилипание к границам других несвязанных клипов
+            // Прилипание Out-point к плейхеду
+            let target_end = target_frame + clip_dur;
+            if (target_end - self.playhead_frame).abs() <= snap_threshold {
+                target_frame = (self.playhead_frame - clip_dur).max(0);
+            }
+
+            // Прилипание к границам других несвязанных клипов (In-point и Out-point)
             let current_link = self.clips[clip_idx].link_group;
             for other in &self.clips {
                 if other.id == clip_id || (current_link.is_some() && other.link_group == current_link) {
                     continue;
                 }
+                // Наше начало к чужому началу или концу
                 if (target_frame - other.start_frame).abs() <= snap_threshold {
                     target_frame = other.start_frame;
                     break;
                 }
                 if (target_frame - other.end_frame()).abs() <= snap_threshold {
                     target_frame = other.end_frame();
+                    break;
+                }
+                // Наш конец к чужому началу или концу
+                let cur_end = target_frame + clip_dur;
+                if (cur_end - other.start_frame).abs() <= snap_threshold {
+                    target_frame = (other.start_frame - clip_dur).max(0);
+                    break;
+                }
+                if (cur_end - other.end_frame()).abs() <= snap_threshold {
+                    target_frame = (other.end_frame() - clip_dur).max(0);
                     break;
                 }
             }
@@ -903,18 +927,22 @@ impl TimelineState {
         }
 
         let link_grp = self.clips[clip_idx].link_group;
+        let timeline_fps = self.fps.max(1) as f64;
+        let clip_speed = self.clips[clip_idx].speed.abs().max(0.001);
         // Нельзя подрезать левее начала исходного файла медиа
-        let min_start = (session.init_start_frame - session.init_source_in_frame).max(0);
+        let max_frames_left = (session.init_source_in_secs * timeline_fps / clip_speed).floor() as i64;
+        let min_start = (session.init_start_frame - max_frames_left).max(0);
         let max_start = session.init_start_frame + session.init_duration_frames - 1;
         let clamped_start = target_start.clamp(min_start, max_start);
         let delta_frames = clamped_start - session.init_start_frame;
 
         let apply_trim = |clip: &mut Clip| {
-            let fps = clip.source_fps.max(1.0);
             clip.start_frame = clamped_start;
             clip.duration_frames = session.init_duration_frames - delta_frames;
-            clip.source_in_frame = session.init_source_in_frame + delta_frames;
-            clip.source_in_secs = session.init_source_in_secs + (delta_frames as f64 / fps);
+            let delta_secs = (delta_frames as f64 / timeline_fps) * clip.speed;
+            clip.source_in_secs = (session.init_source_in_secs + delta_secs).max(0.0);
+            let src_fps = if clip.source_fps > 0.0 { clip.source_fps } else { timeline_fps };
+            clip.source_in_frame = (session.init_source_in_frame as f64 + (delta_secs * src_fps)).round().max(0.0) as i64;
         };
 
         if self.linked_selection && link_grp.is_some() {
@@ -1060,9 +1088,77 @@ impl TimelineState {
     /// Показать весь таймлайн целиком (Shift + Z в Resolve)
     pub fn zoom_to_fit(&mut self, available_width: f32) {
         let total_frames = self.timeline_end_frame().max(self.fps as i64 * 10);
-        let optimal_zoom = (available_width / total_frames as f32).clamp(0.0005, 50.0);
+        let optimal_zoom = ((available_width - 180.0).max(200.0) / total_frames as f32).clamp(0.0005, 50.0);
         self.zoom_factor = optimal_zoom;
         self.scroll_x = 0.0;
+    }
+
+    /// Скопировать выделенный клип (или группу связанных клипов) в буфер обмена (Ctrl+C)
+    pub fn copy_selected_clip(&mut self) -> bool {
+        if let Some(sel_id) = self.selected_clip_id {
+            if let Some(clip) = self.clips.iter().find(|c| c.id == sel_id) {
+                let link_grp = clip.link_group;
+                let to_copy: Vec<Clip> = if self.linked_selection && link_grp.is_some() {
+                    self.clips.iter().filter(|c| c.link_group == link_grp).cloned().collect()
+                } else {
+                    vec![clip.clone()]
+                };
+                if !to_copy.is_empty() {
+                    self.clipboard = Some(to_copy);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Вставить клипы из буфера обмена в позицию плейхеда (Ctrl+V)
+    pub fn paste_clipboard(&mut self) -> bool {
+        if let Some(clips) = self.clipboard.clone() {
+            if clips.is_empty() {
+                return false;
+            }
+            self.push_history();
+            let max_existing_id = self.clips.iter().map(|c| c.id).max().unwrap_or(0);
+            self.next_clip_id = self.next_clip_id.max(max_existing_id + 1);
+            let max_existing_link = self.clips.iter().filter_map(|c| c.link_group).max().unwrap_or(0);
+            self.next_link_id = self.next_link_id.max(max_existing_link + 1);
+
+            let min_start = clips.iter().map(|c| c.start_frame).min().unwrap_or(0);
+            let paste_start = self.playhead_frame;
+            let new_link_grp = if clips.iter().any(|c| c.link_group.is_some()) {
+                let id = self.next_link_id;
+                self.next_link_id += 1;
+                Some(id)
+            } else {
+                None
+            };
+
+            let mut max_dur = 0i64;
+            let mut first_new_id = None;
+            for c in clips {
+                let mut new_clip = c.clone();
+                new_clip.id = self.next_clip_id;
+                if first_new_id.is_none() {
+                    first_new_id = Some(new_clip.id);
+                }
+                self.next_clip_id += 1;
+                let offset = new_clip.start_frame - min_start;
+                new_clip.start_frame = paste_start + offset;
+                if new_clip.link_group.is_some() {
+                    new_clip.link_group = new_link_grp;
+                }
+                max_dur = max_dur.max(offset + new_clip.duration_frames);
+                self.clips.push(new_clip);
+            }
+
+            self.selected_clip_id = first_new_id;
+            self.playhead_frame = paste_start + max_dur;
+            self.audio_dirty = true;
+            self.structure_dirty = true;
+            return true;
+        }
+        false
     }
 }
 
@@ -1801,5 +1897,117 @@ mod tests {
         assert_eq!(c.crop_right, 15.0);
         assert_eq!(c.crop_top, 5.0);
         assert_eq!(c.crop_bottom, 8.0);
+    }
+
+    #[test]
+    fn test_timeline_copy_and_paste() {
+        let mut tl = TimelineState::new_empty();
+        tl.fps = 24;
+        tl.clips.push(Clip {
+            id: 1,
+            name: "Clip 1".to_string(),
+            track_index: 0,
+            start_frame: 0,
+            duration_frames: 48,
+            is_audio: false,
+            color: Color32::BLUE,
+            link_group: Some(10),
+            ..Default::default()
+        });
+        tl.clips.push(Clip {
+            id: 2,
+            name: "Audio 1".to_string(),
+            track_index: 2,
+            start_frame: 0,
+            duration_frames: 48,
+            is_audio: true,
+            color: Color32::GREEN,
+            link_group: Some(10),
+            ..Default::default()
+        });
+
+        // Выбираем клип 1 и копируем (с учетом linked_selection)
+        tl.selected_clip_id = Some(1);
+        assert!(tl.copy_selected_clip());
+        assert!(tl.clipboard.is_some());
+        assert_eq!(tl.clipboard.as_ref().unwrap().len(), 2);
+
+        // Перемещаем плейхед на кадр 100 и вставляем
+        tl.playhead_frame = 100;
+        assert!(tl.paste_clipboard());
+        assert_eq!(tl.clips.len(), 4);
+
+        // Вставленные клипы должны начинаться с кадра 100 и иметь новый общий link_group
+        let pasted_v = tl.clips.iter().find(|c| c.id != 1 && !c.is_audio).unwrap();
+        let pasted_a = tl.clips.iter().find(|c| c.id != 2 && c.is_audio).unwrap();
+        assert_eq!(pasted_v.start_frame, 100);
+        assert_eq!(pasted_a.start_frame, 100);
+        assert_eq!(pasted_v.link_group, pasted_a.link_group);
+        assert_ne!(pasted_v.link_group, Some(10));
+        assert_eq!(tl.playhead_frame, 148);
+    }
+
+    #[test]
+    fn test_blade_cut_speed_retime_continuity() {
+        let mut tl = TimelineState::new_empty();
+        tl.fps = 30;
+        tl.clips.push(Clip {
+            id: 1,
+            name: "2x Speed Video".to_string(),
+            track_index: 0,
+            start_frame: 0,
+            duration_frames: 60, // 2 секунды на таймлайне = 4 секунды (120 кадров) исходника
+            is_audio: false,
+            color: Color32::BLUE,
+            source_fps: 30.0,
+            source_in_frame: 0,
+            source_in_secs: 0.0,
+            speed: 2.0,
+            ..Default::default()
+        });
+
+        // Режем на кадре 30 (ровно 1 секунда на таймлайне)
+        assert!(tl.blade_cut_at(1, 30));
+        assert_eq!(tl.clips.len(), 2);
+
+        let left = &tl.clips[0];
+        let right = &tl.clips[1];
+        assert_eq!(left.duration_frames, 30);
+        assert_eq!(right.start_frame, 30);
+        assert_eq!(right.duration_frames, 30);
+
+        // Исходный кадр на стыке реза: левый клип на кадре 29 выдает исходный кадр 58
+        let left_last_src = left.source_frame_from_timeline(29, tl.fps);
+        // Правый клип на кадре 30 выдает исходный кадр 60
+        let right_first_src = right.source_frame_from_timeline(30, tl.fps);
+        assert_eq!(left_last_src, 58);
+        assert_eq!(right_first_src, 60);
+    }
+
+    #[test]
+    fn test_magnetic_snapping_out_point() {
+        let mut tl = TimelineState::new_empty();
+        tl.snapping_enabled = true;
+        tl.zoom_factor = 1.0;
+        tl.snapping_threshold_px = 10.0;
+        tl.playhead_frame = 200;
+
+        tl.clips.push(Clip {
+            id: 1,
+            name: "Clip 1".to_string(),
+            track_index: 0,
+            start_frame: 0,
+            duration_frames: 100,
+            is_audio: false,
+            color: Color32::BLUE,
+            ..Default::default()
+        });
+
+        // Перемещаем клип так, чтобы его правый край (Out-point: start + 100) был около плейхеда (200),
+        // т.е. raw_start = 96 (конец был бы 196, в пределах 10 px от 200)
+        tl.move_clip_to_track(1, 96, None);
+        // Должен прилипнуть Out-point к плейхеду (200 - 100 = 100)
+        assert_eq!(tl.clips[0].start_frame, 100);
+        assert_eq!(tl.clips[0].end_frame(), 200);
     }
 }
