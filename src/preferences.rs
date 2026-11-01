@@ -35,6 +35,8 @@ pub struct UserPreferences {
     pub timecode_display_frames: bool, // false: SMPTE, true: Frames
     pub theme_accent_idx: usize,       // 0: DaVinci Orange, 1: Resolve Blue, 2: Studio Gold
     pub hide_titlebar: bool,           // Скрыть заголовок окна (Borderless)
+    #[serde(default)]
+    pub single_viewer_mode: bool,      // Скрыть Source Viewer (100% Timeline)
 
     // 2. Editing & Timeline
     pub default_fps: u32,
@@ -92,6 +94,7 @@ impl Default for UserPreferences {
             timecode_display_frames: false,
             theme_accent_idx: 0, // DaVinci Orange
             hide_titlebar: false,
+            single_viewer_mode: false,
 
             default_fps: 60,
             default_width: 1920,
@@ -224,7 +227,6 @@ impl PreferencesModalState {
 
         let header_height = 46.0;
         let footer_height = 50.0;
-        let body_height = (win_height - header_height - footer_height - 2.0).max(200.0);
         let sidebar_width = (win_width * 0.21).clamp(150.0, 190.0);
         let (accent, _) = get_accent_colors(self.draft.theme_accent_idx);
 
@@ -245,8 +247,12 @@ impl PreferencesModalState {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
 
+                let actual_width = ui.available_width().max(400.0);
+                let actual_height = ui.available_height().max(300.0);
+                let actual_body_h = (actual_height - header_height - footer_height).max(180.0);
+
                 // 1. ШАПКА ОКНА (Header): фиксированный прямоугольник с 3 независимыми зонами (Заголовок | Вкладки | Кнопка ✕)
-                let (header_outer, _) = ui.allocate_exact_size(Vec2::new(win_width, header_height), egui::Sense::hover());
+                let (header_outer, _) = ui.allocate_exact_size(Vec2::new(actual_width, header_height), egui::Sense::hover());
                 ui.painter().rect_filled(
                     header_outer,
                     CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 },
@@ -257,7 +263,7 @@ impl PreferencesModalState {
                     Stroke::new(1.0, Color32::from_rgb(0x26, 0x29, 0x32)),
                 );
 
-                let header_inner = header_outer.shrink2(Vec2::new(16.0, 7.0));
+                let header_inner = header_outer.shrink2(Vec2::new(14.0, 7.0));
 
                 // 1a. Левая зона шапки: заголовок «⚙ Preferences»
                 let left_rect = Rect::from_min_max(
@@ -350,12 +356,12 @@ impl PreferencesModalState {
                 );
                 let close_btn = egui::Button::new(
                     egui::RichText::new("✕")
-                        .size(14.0)
+                        .size(14.5)
                         .strong()
-                        .color(Color32::from_rgb(0xe2, 0xe6, 0xf0)),
+                        .color(Color32::from_rgb(0xf2, 0xf6, 0xff)),
                 )
-                .fill(Color32::from_rgb(0x25, 0x28, 0x32))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(0x36, 0x3a, 0x46)))
+                .fill(Color32::from_rgb(0x2a, 0x2e, 0x3a))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(0x42, 0x48, 0x5a)))
                 .corner_radius(CornerRadius::same(4));
 
                 let close_resp = right_ui.add(close_btn).on_hover_text("Закрыть [Esc]");
@@ -368,7 +374,7 @@ impl PreferencesModalState {
                 }
 
                 // 2. ТЕЛО ОКНА (Body): фиксированный прямоугольник, разделенный на Сайдбар слева и ScrollArea справа
-                let (body_outer, _) = ui.allocate_exact_size(Vec2::new(win_width, body_height), egui::Sense::hover());
+                let (body_outer, _) = ui.allocate_exact_size(Vec2::new(actual_width, actual_body_h), egui::Sense::hover());
                 let body_inner = body_outer.shrink2(Vec2::new(14.0, 10.0));
 
                 let sidebar_rect = Rect::from_min_size(body_inner.min, Vec2::new(sidebar_width, body_inner.height()));
@@ -405,12 +411,11 @@ impl PreferencesModalState {
                     .auto_shrink([false, false])
                     .max_height(content_rect.height())
                     .show(&mut content_ui, |ui| {
-                        ui.set_width((content_rect.width() - 12.0).max(180.0));
                         self.render_content(ui);
                     });
 
                 // 3. ПОДВАЛ ОКНА (Footer): фиксированный прямоугольник (Reset слева | Cancel + Save справа)
-                let (footer_outer, _) = ui.allocate_exact_size(Vec2::new(win_width, footer_height), egui::Sense::hover());
+                let (footer_outer, _) = ui.allocate_exact_size(Vec2::new(actual_width, footer_height), egui::Sense::hover());
                 ui.painter().rect_filled(
                     footer_outer,
                     CornerRadius { nw: 0, ne: 0, sw: 6, se: 6 },
@@ -503,7 +508,6 @@ fn pref_card<R>(ui: &mut Ui, title: &str, subtitle: Option<&str>, add_contents: 
 
     frame.show(ui, |ui| {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-        ui.set_width(ui.available_width());
         ui.vertical(|ui| {
             ui.add(
                 egui::Label::new(
@@ -539,7 +543,6 @@ fn pref_grid<R>(ui: &mut Ui, id_salt: &str, add_rows: impl FnOnce(&mut Ui) -> R)
         .num_columns(2)
         .spacing([14.0, 10.0])
         .min_col_width(170.0)
-        .max_col_width(210.0)
         .show(ui, add_rows)
         .inner
 }

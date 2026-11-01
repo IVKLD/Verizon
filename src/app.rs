@@ -19,6 +19,7 @@ pub enum Page {
     Cut,
     Edit,
     Color,
+    Fairlight,
     Deliver,
 }
 
@@ -31,6 +32,7 @@ pub enum Tab {
     Viewers,
     Inspector,
     Timeline,
+    Audio,
 }
 
 struct ResolveTabViewer<'a> {
@@ -42,6 +44,7 @@ struct ResolveTabViewer<'a> {
     audio_player: &'a mut AudioPlayer,
     waveform_mgr: &'a WaveformManager,
     render_cache: &'a mut crate::render_cache::RenderCacheManager,
+    fairlight: &'a mut crate::audio_effects::FairlightWorkstationState,
 }
 
 impl<'a> TabViewer for ResolveTabViewer<'a> {
@@ -57,6 +60,7 @@ impl<'a> TabViewer for ResolveTabViewer<'a> {
             Tab::Viewers => "🖥 Viewers".into(),
             Tab::Inspector => "🔍 Inspector".into(),
             Tab::Timeline => "🎬 Timeline".into(),
+            Tab::Audio => "🎚 Audio Mixer / VST".into(),
         }
     }
 
@@ -81,6 +85,9 @@ impl<'a> TabViewer for ResolveTabViewer<'a> {
             Tab::Timeline => {
                 TimelineView::render(ui, self.timeline, self.waveform_mgr, self.render_cache);
             }
+            Tab::Audio => {
+                self.fairlight.render_workstation(ui);
+            }
         }
     }
 }
@@ -98,6 +105,7 @@ pub struct NleApp {
     pub waveform_mgr: WaveformManager,
     pub render_cache: crate::render_cache::RenderCacheManager,
     pub bg_cache_engine: crate::render_cache::BackgroundCacheEngine,
+    pub fairlight: crate::audio_effects::FairlightWorkstationState,
     pub preferences: UserPreferences,
     pub preferences_modal: crate::preferences::PreferencesModalState,
     pub show_preferences_window: bool,
@@ -128,6 +136,7 @@ impl NleApp {
             waveform_mgr: WaveformManager::new(),
             render_cache: crate::render_cache::RenderCacheManager::default(),
             bg_cache_engine: crate::render_cache::BackgroundCacheEngine::new(),
+            fairlight: crate::audio_effects::FairlightWorkstationState::new(),
             preferences: prefs.clone(),
             preferences_modal: crate::preferences::PreferencesModalState::new(),
             show_preferences_window: false,
@@ -143,6 +152,7 @@ impl NleApp {
         app.timeline.loop_enabled = prefs.loop_enabled;
         app.timeline.stop_at_timeline_end = prefs.stop_at_timeline_end;
         app.timeline.zoom_step_percent = prefs.zoom_step_percent;
+        app.viewer.single_viewer_mode = prefs.single_viewer_mode;
 
         app.render_cache.mode = match prefs.render_cache_mode {
             0 => crate::render_cache::RenderCacheMode::None,
@@ -178,7 +188,10 @@ impl NleApp {
             None
         };
 
-        if let Some(dock) = loaded_dock {
+        if let Some(mut dock) = loaded_dock {
+            if dock.find_tab(&Tab::Audio).is_none() {
+                dock.push_to_first_leaf(Tab::Audio);
+            }
             app.dock_state = dock;
         } else {
             app.reset_dock_layout();
@@ -191,6 +204,7 @@ impl NleApp {
         self.preferences.snapping_enabled = self.timeline.snapping_enabled;
         self.preferences.linked_selection = self.timeline.linked_selection;
         self.preferences.loop_enabled = self.timeline.loop_enabled;
+        self.preferences.single_viewer_mode = self.viewer.single_viewer_mode;
         self.preferences.save();
     }
 
@@ -255,11 +269,11 @@ impl NleApp {
             vec![Tab::MediaPool],
         );
 
-        // 3. Справа сверху: Inspector (Inspector строго справа от Viewers/предпросмотра)
+        // 3. Справа сверху: Inspector и Audio Mixer
         let [_center, _right] = dock.main_surface_mut().split_right(
             center,
-            0.70,
-            vec![Tab::Inspector],
+            0.68,
+            vec![Tab::Inspector, Tab::Audio],
         );
 
         self.dock_state = dock;
@@ -894,7 +908,7 @@ impl NleApp {
                 ui.horizontal(|ui| {
                     // Адаптивное центрирование кнопок рабочих пространств DaVinci Resolve 21
                     let total_w = ui.available_width();
-                    let buttons_w = 320.0;
+                    let buttons_w = 380.0;
                     let right_widgets_w = 140.0;
                     let center_pad = ((total_w - buttons_w - right_widgets_w) * 0.5).max(0.0);
                     ui.add_space(center_pad);
@@ -904,6 +918,7 @@ impl NleApp {
                         (Page::Cut, "✂ Cut"),
                         (Page::Edit, "🎞 Edit"),
                         (Page::Color, "🎨 Color"),
+                        (Page::Fairlight, "🎵 Fairlight"),
                         (Page::Deliver, "🚀 Deliver"),
                     ];
 
@@ -967,6 +982,7 @@ impl NleApp {
 
         self.video_player.drop_frames_enabled = self.preferences.drop_frames_enabled;
         self.audio_player.set_master_volume(self.preferences.master_volume);
+        self.viewer.single_viewer_mode = self.preferences.single_viewer_mode;
 
         self.notification = Some((
             "✔ Настройки DaVinci Resolve 21 успешно сохранены и применены".to_string(),
@@ -1158,7 +1174,7 @@ impl eframe::App for NleApp {
         self.render_top_bar(ui);
         self.render_bottom_page_bar(ui);
 
-        // 6. Отображение активной страницы (Media / Edit)
+        // 6. Отображение активной страницы (Media / Edit / Fairlight)
         match self.current_page {
             Page::Media => {
                 // Полноценная страница DaVinci Resolve 21 Media Page
@@ -1168,6 +1184,10 @@ impl eframe::App for NleApp {
                     &mut self.video_player,
                     &ctx,
                 );
+            }
+            Page::Fairlight => {
+                // Полноэкранная рабочая станция аудиопостпродакшна DaVinci Fairlight
+                self.fairlight.render_workstation(ui);
             }
             Page::Edit | Page::Cut | Page::Color | Page::Deliver => {
                 // Страница монтажа Edit Page
@@ -1206,6 +1226,7 @@ impl eframe::App for NleApp {
                         audio_player: &mut self.audio_player,
                         waveform_mgr: &self.waveform_mgr,
                         render_cache: &mut self.render_cache,
+                        fairlight: &mut self.fairlight,
                     };
 
                     DockArea::new(&mut self.dock_state)
@@ -1216,6 +1237,16 @@ impl eframe::App for NleApp {
                         .show_inside(ui, &mut tab_viewer);
                 }
             }
+        }
+
+        // Автосинхронизация и автосохранение настроек и расположения окон
+        if self.viewer.single_viewer_mode != self.preferences.single_viewer_mode {
+            self.preferences.single_viewer_mode = self.viewer.single_viewer_mode;
+            self.save_preferences();
+        }
+
+        if ctx.input(|i| i.pointer.any_released()) {
+            self.save_dock_layout();
         }
 
         // 7. Синхронизация Audio Mixer ПОСЛЕ обработки всех событий ввода, кликов и изменений таймлайна в текущем кадре
@@ -1284,5 +1315,55 @@ mod tests {
         let p = path.unwrap();
         assert_eq!(p.to_str().unwrap(), "/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
         assert!(p.exists(), "Target file on disk must exist");
+    }
+
+    #[test]
+    fn test_dock_layout_has_audio_tab_and_single_viewer_persistence() {
+        let mut dock = DockState::new(vec![Tab::Viewers]);
+        let [top, _bottom] = dock.main_surface_mut().split_below(
+            NodeIndex::root(),
+            0.55,
+            vec![Tab::Timeline],
+        );
+        let [_left, center] = dock.main_surface_mut().split_left(
+            top,
+            0.22,
+            vec![Tab::MediaPool],
+        );
+        let [_center, _right] = dock.main_surface_mut().split_right(
+            center,
+            0.68,
+            vec![Tab::Inspector, Tab::Audio],
+        );
+
+        assert!(dock.find_tab(&Tab::Audio).is_some(), "Default dock state must contain Tab::Audio");
+        assert!(dock.find_tab(&Tab::Timeline).is_some());
+        assert!(dock.find_tab(&Tab::Viewers).is_some());
+        assert!(dock.find_tab(&Tab::Inspector).is_some());
+
+        let mut prefs = UserPreferences::default();
+        assert!(!prefs.single_viewer_mode);
+        prefs.single_viewer_mode = true;
+        let json = serde_json::to_string(&prefs).expect("Serialize preferences");
+        let loaded: UserPreferences = serde_json::from_str(&json).expect("Deserialize preferences");
+        assert!(loaded.single_viewer_mode, "single_viewer_mode must survive serialization");
+    }
+
+    #[test]
+    fn test_fairlight_workstation_page_rendering() {
+        let ctx = egui::Context::default();
+        let mut fairlight = crate::audio_effects::FairlightWorkstationState::new();
+
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(1920.0, 1080.0)));
+
+        let mut out = ctx.run_ui(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                fairlight.render_workstation(ui);
+            });
+        });
+        out.textures_delta.clear();
+
+        assert!(fairlight.track_racks.len() >= 8, "Fairlight workstation must initialize at least 8 audio channels");
     }
 }

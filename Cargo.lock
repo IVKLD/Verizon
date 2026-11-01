@@ -2866,6 +2866,7 @@ dependencies = [
  "egui",
  "egui_dock",
  "ffmpeg-next",
+ "libc",
  "rfd",
  "serde",
  "serde_json",

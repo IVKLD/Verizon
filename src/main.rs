@@ -1,4 +1,5 @@
 mod app;
+pub mod audio_effects;
 mod autopilot;
 mod audio_player;
 mod inspector;
