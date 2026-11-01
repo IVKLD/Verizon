@@ -376,23 +376,96 @@ impl BackgroundCacheEngine {
         egui_ctx: egui::Context,
         cancel_flag: Arc<AtomicBool>,
     ) {
-        let Ok(mut ictx) = ffmpeg_next::format::input(&path) else { return; };
-        let Some(video_stream) = ictx.streams().best(ffmpeg_next::media::Type::Video) else { return; };
-        let stream_idx = video_stream.index();
-        let time_base = video_stream.time_base();
-        let Ok(mut context_decoder) = ffmpeg_next::codec::context::Context::from_parameters(video_stream.parameters()) else { return; };
-        unsafe {
-            (*context_decoder.as_mut_ptr()).thread_type =
-                (ffmpeg_next::ffi::FF_THREAD_FRAME | ffmpeg_next::ffi::FF_THREAD_SLICE) as i32;
+        unsafe extern "C" fn get_vaapi_format(
+            _ctx: *mut ffmpeg_next::ffi::AVCodecContext,
+            pix_fmts: *const ffmpeg_next::ffi::AVPixelFormat,
+        ) -> ffmpeg_next::ffi::AVPixelFormat {
+            let mut p = pix_fmts;
+            while *p != ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+                if *p == ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI {
+                    return *p;
+                }
+                p = p.add(1);
+            }
+            *pix_fmts
         }
-        let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8)
-            .min(16);
-        context_decoder.set_threading(ffmpeg_next::codec::threading::Config {
-            kind: ffmpeg_next::codec::threading::Type::Frame,
-            count: num_threads,
-        });
+
+        struct HwDeviceGuard(*mut ffmpeg_next::ffi::AVBufferRef);
+        impl Drop for HwDeviceGuard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        ffmpeg_next::ffi::av_buffer_unref(&mut self.0);
+                    }
+                }
+            }
+        }
+
+        let Ok(mut ictx) = ffmpeg_next::format::input(&path) else { return; };
+        let (stream_idx, time_base, params) = {
+            let Some(video_stream) = ictx.streams().best(ffmpeg_next::media::Type::Video) else { return; };
+            (video_stream.index(), video_stream.time_base(), video_stream.parameters())
+        };
+
+        // Отключаем демультиплексирование не-видео потоков (аудио/субтитры), чтобы не нагружать I/O и шину
+        for mut s in ictx.streams_mut() {
+            if s.index() != stream_idx {
+                unsafe {
+                    (*s.as_mut_ptr()).discard = ffmpeg_next::ffi::AVDiscard::AVDISCARD_ALL;
+                }
+            }
+        }
+
+        let Ok(mut context_decoder) = ffmpeg_next::codec::context::Context::from_parameters(params) else { return; };
+        unsafe {
+            (*context_decoder.as_mut_ptr()).flags2 |= ffmpeg_next::ffi::AV_CODEC_FLAG2_FAST as i32;
+        }
+
+        // Аппаратное ускорение на GPU (VAAPI для AMD Radeon RX 9070 XT)
+        let mut raw_hw_ctx: *mut ffmpeg_next::ffi::AVBufferRef = std::ptr::null_mut();
+        for dev in &crate::video_decoder::vaapi_render_nodes() {
+            if let Ok(c_str) = std::ffi::CString::new(dev.as_os_str().as_encoded_bytes()) {
+                let ret = unsafe {
+                    ffmpeg_next::ffi::av_hwdevice_ctx_create(
+                        &mut raw_hw_ctx,
+                        ffmpeg_next::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                        c_str.as_ptr(),
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                if ret == 0 && !raw_hw_ctx.is_null() {
+                    break;
+                }
+            }
+        }
+        let _hw_guard = HwDeviceGuard(raw_hw_ctx);
+
+        if !raw_hw_ctx.is_null() {
+            unsafe {
+                let c_ptr = context_decoder.as_mut_ptr();
+                (*c_ptr).thread_count = 1;
+                (*c_ptr).thread_type = 0;
+                (*c_ptr).hw_device_ctx = ffmpeg_next::ffi::av_buffer_ref(raw_hw_ctx);
+                (*c_ptr).get_format = Some(get_vaapi_format);
+                (*c_ptr).extra_hw_frames = 8;
+            }
+        } else {
+            // Если VAAPI недоступен — используем многопоточный декодер CPU
+            unsafe {
+                (*context_decoder.as_mut_ptr()).thread_type =
+                    (ffmpeg_next::ffi::FF_THREAD_FRAME | ffmpeg_next::ffi::FF_THREAD_SLICE) as i32;
+            }
+            let num_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(16)
+                .min(32);
+            context_decoder.set_threading(ffmpeg_next::codec::threading::Config {
+                kind: ffmpeg_next::codec::threading::Type::Frame,
+                count: num_threads,
+            });
+        }
+
         let Ok(mut decoder) = context_decoder.decoder().video() else { return; };
 
         let first_src = frames[0].0;
@@ -428,7 +501,9 @@ impl BackgroundCacheEngine {
         ) else { return; };
 
         let mut decoded_frame = ffmpeg_next::util::frame::Video::empty();
+        let mut sw_frame = ffmpeg_next::util::frame::Video::empty();
         let mut rgb_frame = ffmpeg_next::util::frame::Video::empty();
+        let mut pixel_buf: Vec<egui::Color32> = Vec::with_capacity((scaled_w * scaled_h) as usize);
 
         let mut target_map: HashMap<i64, Vec<(i64, u64)>> = HashMap::with_capacity(frames.len());
         for (src_f, tl_f, sig) in frames {
@@ -461,28 +536,64 @@ impl BackgroundCacheEngine {
                     };
 
                     if let Some(tl_targets) = target_map.remove(&cur_src_f) {
-                        if scaler.run(&decoded_frame, &mut rgb_frame).is_ok() {
+                        let fmt = unsafe { (*decoded_frame.as_ptr()).format };
+                        let frame_to_scale = if fmt == ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32 {
+                            let ok = unsafe {
+                                ffmpeg_next::ffi::av_hwframe_transfer_data(sw_frame.as_mut_ptr(), decoded_frame.as_ptr(), 0) == 0
+                            };
+                            if ok {
+                                &sw_frame
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            &decoded_frame
+                        };
+
+                        if scaler.input().format != frame_to_scale.format()
+                            || scaler.input().width != frame_to_scale.width()
+                            || scaler.input().height != frame_to_scale.height()
+                        {
+                            if let Ok(new_scaler) = ffmpeg_next::software::scaling::Context::get(
+                                frame_to_scale.format(),
+                                frame_to_scale.width(),
+                                frame_to_scale.height(),
+                                ffmpeg_next::format::Pixel::RGBA,
+                                scaled_w,
+                                scaled_h,
+                                ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
+                            ) {
+                                scaler = new_scaler;
+                            }
+                        }
+
+                        if scaler.run(frame_to_scale, &mut rgb_frame).is_ok() {
                             let data = rgb_frame.data(0);
                             let stride = rgb_frame.stride(0);
-                            let mut pixels = Vec::with_capacity((scaled_w * scaled_h * 4) as usize);
-                            for row in 0..scaled_h as usize {
-                                let start = row * stride;
-                                let end = start + (scaled_w as usize * 4);
-                                if end <= data.len() {
-                                    pixels.extend_from_slice(&data[start..end]);
+                            let row_len = scaled_w as usize * 4;
+                            pixel_buf.clear();
+                            if stride == row_len && data.len() >= (scaled_w * scaled_h * 4) as usize {
+                                pixel_buf.extend_from_slice(bytemuck::cast_slice::<u8, egui::Color32>(&data[..(scaled_w * scaled_h * 4) as usize]));
+                            } else {
+                                for row in 0..scaled_h as usize {
+                                    let start = row * stride;
+                                    if start + row_len <= data.len() {
+                                        pixel_buf.extend_from_slice(bytemuck::cast_slice::<u8, egui::Color32>(&data[start..start + row_len]));
+                                    }
                                 }
                             }
-                            let color_img = ColorImage::from_rgba_unmultiplied(
-                                [scaled_w as usize, scaled_h as usize],
-                                &pixels,
-                            );
+                            let color_img = ColorImage {
+                                size: [scaled_w as usize, scaled_h as usize],
+                                source_size: egui::vec2(scaled_w as f32, scaled_h as f32),
+                                pixels: std::mem::replace(&mut pixel_buf, Vec::with_capacity((scaled_w * scaled_h) as usize)),
+                            };
                             let arc_img = Arc::new(color_img);
                             last_valid_img = Some(Arc::clone(&arc_img));
                             for (tl_f, sig) in tl_targets {
                                 cache.insert(tl_f, Arc::clone(&arc_img), sig);
                                 cached_count += 1;
                             }
-                            if cached_count % 2 == 0 || target_map.is_empty() {
+                            if cached_count % 8 == 0 || target_map.is_empty() {
                                 egui_ctx.request_repaint();
                             }
                         }
@@ -525,21 +636,57 @@ impl BackgroundCacheEngine {
 
                 if let Some(key) = matched_key {
                     let tl_targets = target_map.remove(&key).unwrap();
-                    if scaler.run(&decoded_frame, &mut rgb_frame).is_ok() {
+                    let fmt = unsafe { (*decoded_frame.as_ptr()).format };
+                    let frame_to_scale = if fmt == ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32 {
+                        let ok = unsafe {
+                            ffmpeg_next::ffi::av_hwframe_transfer_data(sw_frame.as_mut_ptr(), decoded_frame.as_ptr(), 0) == 0
+                        };
+                        if ok {
+                            &sw_frame
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        &decoded_frame
+                    };
+
+                    if scaler.input().format != frame_to_scale.format()
+                        || scaler.input().width != frame_to_scale.width()
+                        || scaler.input().height != frame_to_scale.height()
+                    {
+                        if let Ok(new_scaler) = ffmpeg_next::software::scaling::Context::get(
+                            frame_to_scale.format(),
+                            frame_to_scale.width(),
+                            frame_to_scale.height(),
+                            ffmpeg_next::format::Pixel::RGBA,
+                            scaled_w,
+                            scaled_h,
+                            ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
+                        ) {
+                            scaler = new_scaler;
+                        }
+                    }
+
+                    if scaler.run(frame_to_scale, &mut rgb_frame).is_ok() {
                         let data = rgb_frame.data(0);
                         let stride = rgb_frame.stride(0);
-                        let mut pixels = Vec::with_capacity((scaled_w * scaled_h * 4) as usize);
-                        for row in 0..scaled_h as usize {
-                            let start = row * stride;
-                            let end = start + (scaled_w as usize * 4);
-                            if end <= data.len() {
-                                pixels.extend_from_slice(&data[start..end]);
+                        let row_len = scaled_w as usize * 4;
+                        pixel_buf.clear();
+                        if stride == row_len && data.len() >= (scaled_w * scaled_h * 4) as usize {
+                            pixel_buf.extend_from_slice(bytemuck::cast_slice::<u8, egui::Color32>(&data[..(scaled_w * scaled_h * 4) as usize]));
+                        } else {
+                            for row in 0..scaled_h as usize {
+                                let start = row * stride;
+                                if start + row_len <= data.len() {
+                                    pixel_buf.extend_from_slice(bytemuck::cast_slice::<u8, egui::Color32>(&data[start..start + row_len]));
+                                }
                             }
                         }
-                        let color_img = ColorImage::from_rgba_unmultiplied(
-                            [scaled_w as usize, scaled_h as usize],
-                            &pixels,
-                        );
+                        let color_img = ColorImage {
+                            size: [scaled_w as usize, scaled_h as usize],
+                            source_size: egui::vec2(scaled_w as f32, scaled_h as f32),
+                            pixels: std::mem::replace(&mut pixel_buf, Vec::with_capacity((scaled_w * scaled_h) as usize)),
+                        };
                         let arc_img = Arc::new(color_img);
                         last_valid_img = Some(Arc::clone(&arc_img));
                         for (tl_f, sig) in tl_targets {

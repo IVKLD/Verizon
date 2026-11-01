@@ -75,7 +75,7 @@ pub struct VideoPlayer {
 /// При двух GPU декодируем на менее мощном (меньше VRAM, обычно встроенный): дискретная карта остаётся свободной
 /// для композитинга интерфейса и других приложений (браузер, YouTube), а декод 4K HEVC идёт на VCN встроенной графики.
 /// Явный выбор: переменная окружения `VERIZON_VAAPI_DEVICE=/dev/dri/renderDNNN`.
-fn vaapi_render_nodes() -> Vec<PathBuf> {
+pub(crate) fn vaapi_render_nodes() -> Vec<PathBuf> {
     let mut nodes: Vec<(u64, PathBuf)> = std::fs::read_dir("/dev/dri")
         .into_iter()
         .flatten()

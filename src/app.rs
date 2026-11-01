@@ -1026,6 +1026,7 @@ impl eframe::App for NleApp {
             let max_cap = self.render_cache.max_frames.max(60);
             let forward_window = (max_cap.saturating_sub(30)).max(60) as i64;
             let backward_window = 30i64;
+            let batch_limit = max_cap.min(360);
             let mut uncached_batch = Vec::new();
             let mut chosen_path = None;
             let mut chosen_fps = 60.0;
@@ -1041,7 +1042,7 @@ impl eframe::App for NleApp {
                                 let src_f = clip.source_frame_from_timeline(tl_f, self.timeline.fps);
                                 let sig = crate::render_cache::RenderCacheManager::compute_decode_signature(&self.timeline, tl_f);
                                 uncached_batch.push((src_f, tl_f, sig));
-                                if uncached_batch.len() >= 120 {
+                                if uncached_batch.len() >= batch_limit {
                                     break;
                                 }
                             }
@@ -1059,7 +1060,7 @@ impl eframe::App for NleApp {
                 if let Some(clip) = self.timeline.active_video_clip_at(cur_playhead) {
                     if !clip.is_disabled {
                         if let Some(ref path) = clip.source_path {
-                            let remaining_budget = max_cap.saturating_sub(self.render_cache.stats().cached_frames).min(120);
+                            let remaining_budget = max_cap.saturating_sub(self.render_cache.stats().cached_frames).min(batch_limit);
                             for tl_f in clip.start_frame..clip.end_frame() {
                                 if !self.render_cache.is_cached(tl_f) && self.timeline.active_video_clip_at(tl_f).map(|ac| ac.id) == Some(clip.id) {
                                     let src_f = clip.source_frame_from_timeline(tl_f, self.timeline.fps);
@@ -1081,7 +1082,7 @@ impl eframe::App for NleApp {
 
             // 3) Если под плейхедом всё закэшировано и в кэше ещё есть место — ищем любой другой клип
             if uncached_batch.is_empty() && self.render_cache.stats().cached_frames < max_cap.saturating_sub(16) {
-                let remaining_budget = max_cap.saturating_sub(self.render_cache.stats().cached_frames).min(120);
+                let remaining_budget = max_cap.saturating_sub(self.render_cache.stats().cached_frames).min(batch_limit);
                 'find_any: for clip in &self.timeline.clips {
                     if clip.is_audio || clip.is_disabled {
                         continue;
