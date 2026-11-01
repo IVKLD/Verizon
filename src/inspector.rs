@@ -41,6 +41,11 @@ impl InspectorState {
                 let mut video_changed = false;
                 let mut audio_changed = false;
 
+                // Автоматическое переключение на вкладку Audio для чисто звуковых клипов
+                if clip.is_audio && self.current_tab == InspectorTab::Video {
+                    self.current_tab = InspectorTab::Audio;
+                }
+
                 // Заголовок клипа
                 ui.horizontal(|ui| {
                     let icon = if clip.is_audio { "🎵" } else { "🎬" };
@@ -323,6 +328,69 @@ impl InspectorState {
                                         ui.end_row();
                                     });
                             });
+
+                            ui.add_space(6.0);
+
+                            // Секция SPEED & RETIME для видеоклипа
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new("SPEED & RETIME")
+                                    .size(11.0)
+                                    .color(ResolveColors::TEXT_PRIMARY)
+                                    .strong(),
+                            )
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                egui::Grid::new("video_speed_grid")
+                                    .num_columns(3)
+                                    .spacing([8.0, 6.0])
+                                    .show(ui, |ui| {
+                                        ui.label(egui::RichText::new("Speed").size(11.0).color(ResolveColors::TEXT_MUTED));
+                                        let mut speed_pct = (clip.speed.abs() * 100.0).round();
+                                        let spd_resp = ui.add(DragValue::new(&mut speed_pct).speed(1.0).range(5.0..=2000.0).suffix("%"));
+                                        if spd_resp.drag_started() {
+                                            needs_history = true;
+                                        }
+                                        if spd_resp.changed() {
+                                            let sign = if clip.speed < 0.0 { -1.0 } else { 1.0 };
+                                            let target_speed = (speed_pct / 100.0) * sign;
+                                            if target_speed.abs() > 0.01 {
+                                                let old_speed_abs = clip.speed.abs().max(0.01);
+                                                let ratio = old_speed_abs / (speed_pct / 100.0);
+                                                let new_dur = ((clip.duration_frames as f64 * ratio).round() as i64).max(1);
+                                                clip.duration_frames = new_dur;
+                                                clip.speed = target_speed;
+                                                video_changed = true;
+                                                audio_changed = true;
+                                            }
+                                        }
+                                        if ui.button("⟲").on_hover_text("Сбросить скорость к 100%").clicked() {
+                                            needs_history = true;
+                                            let old_speed_abs = clip.speed.abs().max(0.01);
+                                            let new_dur = ((clip.duration_frames as f64 * old_speed_abs).round() as i64).max(1);
+                                            clip.duration_frames = new_dur;
+                                            clip.speed = if clip.speed < 0.0 { -1.0 } else { 1.0 };
+                                            video_changed = true;
+                                            audio_changed = true;
+                                        }
+                                        ui.end_row();
+
+                                        ui.label(egui::RichText::new("Direction").size(11.0).color(ResolveColors::TEXT_MUTED));
+                                        let mut is_rev = clip.speed < 0.0;
+                                        if ui.checkbox(&mut is_rev, "Reverse").changed() {
+                                            needs_history = true;
+                                            clip.speed = if is_rev { -clip.speed.abs() } else { clip.speed.abs() };
+                                            video_changed = true;
+                                            audio_changed = true;
+                                        }
+                                        ui.end_row();
+
+                                        ui.label(egui::RichText::new("Retime Controls").size(11.0).color(ResolveColors::TEXT_MUTED));
+                                        if ui.checkbox(&mut clip.retime_controls_open, "Show [Ctrl+R]").changed() {
+                                            video_changed = true;
+                                        }
+                                        ui.end_row();
+                                    });
+                            });
                         }
                         InspectorTab::Audio => {
                             // Секция AUDIO
@@ -367,6 +435,66 @@ impl InspectorState {
                                         if v_ch || v_rst || p_ch || p_rst {
                                             audio_changed = true;
                                         }
+                                    });
+                            });
+
+                            ui.add_space(6.0);
+
+                            // Секция SPEED & RETIME для аудиоклипа
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new("SPEED & RETIME")
+                                    .size(11.0)
+                                    .color(ResolveColors::TEXT_PRIMARY)
+                                    .strong(),
+                            )
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                egui::Grid::new("audio_speed_grid")
+                                    .num_columns(3)
+                                    .spacing([8.0, 6.0])
+                                    .show(ui, |ui| {
+                                        ui.label(egui::RichText::new("Speed").size(11.0).color(ResolveColors::TEXT_MUTED));
+                                        let mut speed_pct = (clip.speed.abs() * 100.0).round();
+                                        let spd_resp = ui.add(DragValue::new(&mut speed_pct).speed(1.0).range(5.0..=2000.0).suffix("%"));
+                                        if spd_resp.drag_started() {
+                                            needs_history = true;
+                                        }
+                                        if spd_resp.changed() {
+                                            let sign = if clip.speed < 0.0 { -1.0 } else { 1.0 };
+                                            let target_speed = (speed_pct / 100.0) * sign;
+                                            if target_speed.abs() > 0.01 {
+                                                let old_speed_abs = clip.speed.abs().max(0.01);
+                                                let ratio = old_speed_abs / (speed_pct / 100.0);
+                                                let new_dur = ((clip.duration_frames as f64 * ratio).round() as i64).max(1);
+                                                clip.duration_frames = new_dur;
+                                                clip.speed = target_speed;
+                                                audio_changed = true;
+                                            }
+                                        }
+                                        if ui.button("⟲").on_hover_text("Сбросить скорость к 100%").clicked() {
+                                            needs_history = true;
+                                            let old_speed_abs = clip.speed.abs().max(0.01);
+                                            let new_dur = ((clip.duration_frames as f64 * old_speed_abs).round() as i64).max(1);
+                                            clip.duration_frames = new_dur;
+                                            clip.speed = if clip.speed < 0.0 { -1.0 } else { 1.0 };
+                                            audio_changed = true;
+                                        }
+                                        ui.end_row();
+
+                                        ui.label(egui::RichText::new("Direction").size(11.0).color(ResolveColors::TEXT_MUTED));
+                                        let mut is_rev = clip.speed < 0.0;
+                                        if ui.checkbox(&mut is_rev, "Reverse").changed() {
+                                            needs_history = true;
+                                            clip.speed = if is_rev { -clip.speed.abs() } else { clip.speed.abs() };
+                                            audio_changed = true;
+                                        }
+                                        ui.end_row();
+
+                                        ui.label(egui::RichText::new("Retime Controls").size(11.0).color(ResolveColors::TEXT_MUTED));
+                                        if ui.checkbox(&mut clip.retime_controls_open, "Show [Ctrl+R]").changed() {
+                                            audio_changed = true;
+                                        }
+                                        ui.end_row();
                                     });
                             });
                         }

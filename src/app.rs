@@ -1218,7 +1218,7 @@ impl eframe::App for NleApp {
         self.audio_player.sync_playhead_frame(
             self.timeline.playhead_frame,
             self.timeline.fps,
-            self.timeline.is_playing && !self.timeline.is_scrubbing,
+            self.timeline.is_playing && !self.timeline.is_scrubbing && (self.timeline.playback_speed - 1.0).abs() < 1e-3,
         );
 
         // 8. Автопилот самопроверки ПОСЛЕ рендера Viewers (чтобы замерять актуальный декодированный кадр текущего тика)
@@ -1233,7 +1233,7 @@ impl eframe::App for NleApp {
             self.audio_player.sync_playhead_frame(
                 self.timeline.playhead_frame,
                 self.timeline.fps,
-                self.timeline.is_playing && !self.timeline.is_scrubbing,
+                self.timeline.is_playing && !self.timeline.is_scrubbing && (self.timeline.playback_speed - 1.0).abs() < 1e-3,
             );
         }
 

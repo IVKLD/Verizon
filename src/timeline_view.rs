@@ -1479,20 +1479,35 @@ impl TimelineView {
                             1.0
                         };
 
+                        let speed = if clip.speed.abs() > 0.001 { clip.speed } else { 1.0 };
+                        let step_sec = step_px as f64 * sec_per_px;
+
                         while x < visible_end_x {
-                            let t_start = clip.source_in_secs + (k as f64 * step_px as f64 * sec_per_px);
-                            let t_end = t_start + (step_px as f64 * sec_per_px);
+                            let t_rel = k as f64 * step_sec;
+                            let (t_start, t_end) = if speed < 0.0 {
+                                let clip_dur_sec = clip.duration_frames as f64 / timeline.fps.max(1) as f64;
+                                let rev_0 = (clip_dur_sec - t_rel).max(0.0) * speed.abs();
+                                let rev_1 = (clip_dur_sec - (t_rel + step_sec)).max(0.0) * speed.abs();
+                                (clip.source_in_secs + rev_1, clip.source_in_secs + rev_0)
+                            } else {
+                                let s0 = clip.source_in_secs + (t_rel * speed);
+                                let s1 = s0 + (step_sec * speed);
+                                (s0, s1)
+                            };
+
                             let s_start = t_start * pts_per_sec;
                             let s_end = t_end * pts_per_sec;
+                            let min_s = s_start.min(s_end);
+                            let max_s = s_start.max(s_end);
 
-                            let idx_start = (s_start.max(0.0) as usize).min(peaks_len);
-                            let idx_end = (s_end.ceil() as usize).min(peaks_len);
+                            let idx_start = (min_s.max(0.0) as usize).min(peaks_len);
+                            let idx_end = (max_s.ceil() as usize).min(peaks_len);
 
                             let base_amp = if idx_start >= peaks_len {
                                 0.0
                             } else if idx_end <= idx_start + 1 {
                                 // Zoom In (сильное приближение): плавная субпиксельная интерполяция
-                                let frac = (s_start - idx_start as f64).clamp(0.0, 1.0) as f32;
+                                let frac = (min_s - idx_start as f64).clamp(0.0, 1.0) as f32;
                                 let p0 = peaks_slice[idx_start];
                                 let p1 = if idx_start + 1 < peaks_len { peaks_slice[idx_start + 1] } else { p0 };
                                 p0 * (1.0 - frac) + p1 * frac

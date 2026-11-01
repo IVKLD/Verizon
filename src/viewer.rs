@@ -295,8 +295,8 @@ impl ViewerState {
         self.render_viewer_toolbar(ui, video_player, render_cache);
         ui.separator();
 
-        // ОБЛАСТЬ МОНИТОРОВ: Одиночный или Двойной режим
-        if self.single_viewer_mode {
+        // ОБЛАСТЬ МОНИТОРОВ: Одиночный или Двойной режим (в Cinema Mode всегда полноэкранный программный монитор)
+        if self.single_viewer_mode || self.cinema_mode {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 self.render_program_viewer(ui, timeline, video_player);
             });
@@ -677,7 +677,7 @@ impl ViewerState {
 
             if let Some(mut top_clip) = top_clip {
                 // Коэффициент масштаба пикселей таймлайна (в координатах растра 1920x1080 DaVinci Resolve)
-                let px_scale = screen_rect.width() / 1920.0;
+                let px_scale = (screen_rect.width() / 1920.0).max(0.001);
 
                 let clip_w = screen_rect.width() * top_clip.zoom_x;
                 let clip_h = screen_rect.height() * top_clip.zoom_y;
@@ -892,6 +892,14 @@ impl ViewerState {
                             top_clip.rotation = target_clip.rotation;
                         }
                         ui.ctx().request_repaint();
+                    }
+
+                    let any_drag_started = body_resp.drag_started()
+                        || resp_rot.drag_started()
+                        || resp_lt.drag_started() || resp_rt.drag_started() || resp_lb.drag_started() || resp_rb.drag_started()
+                        || resp_tc.drag_started() || resp_bc.drag_started() || resp_lc.drag_started() || resp_rc.drag_started();
+                    if any_drag_started {
+                        timeline.push_history();
                     }
 
                     let any_drag_stopped = body_resp.drag_stopped()

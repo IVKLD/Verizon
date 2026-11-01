@@ -75,6 +75,8 @@ pub struct MixSegment {
     pub in_off: usize,
     /// Длина сегмента (в interleaved-сэмплах)
     pub len: usize,
+    /// Скорость воспроизведения (1.0 = нормальная, 2.0 = 2x, -1.0 = реверс)
+    pub speed: f64,
     pub gain_l: f32,
     pub gain_r: f32,
 }
@@ -99,48 +101,80 @@ impl MixSnapshot {
             if lo >= hi {
                 continue;
             }
-            let src_base = seg.in_off + (lo - seg.start);
             let pcm = &seg.samples;
             let avail_len = pcm.decoded_len.load(Ordering::Acquire).min(pcm.samples.len());
-            if src_base >= avail_len {
-                continue;
-            }
-            let max_mix = (hi - lo).min(avail_len - src_base);
-            if max_mix == 0 {
-                continue;
-            }
-            let dst = &mut out[lo - pos..lo - pos + max_mix];
 
-            let dst_len = dst.len();
-            if lo & 1 == 0 {
-                let mut chunks = dst.chunks_exact_mut(2);
-                for (pair_idx, pair) in chunks.by_ref().enumerate() {
-                    let src = src_base + pair_idx * 2;
-                    let sl = f32::from_bits(pcm.samples[src].load(Ordering::Relaxed));
-                    let sr = f32::from_bits(pcm.samples[src + 1].load(Ordering::Relaxed));
-                    pair[0] += sl * seg.gain_l;
-                    pair[1] += sr * seg.gain_r;
+            let is_normal_speed = (seg.speed - 1.0).abs() < 1e-4;
+            if is_normal_speed {
+                let src_base = seg.in_off + (lo - seg.start);
+                if src_base >= avail_len {
+                    continue;
                 }
-                let rem = chunks.into_remainder();
-                if !rem.is_empty() {
-                    let src = src_base + dst_len - 1;
-                    let s = f32::from_bits(pcm.samples[src].load(Ordering::Relaxed));
-                    rem[0] += s * seg.gain_l;
+                let max_mix = (hi - lo).min(avail_len - src_base);
+                if max_mix == 0 {
+                    continue;
+                }
+                let dst = &mut out[lo - pos..lo - pos + max_mix];
+
+                let dst_len = dst.len();
+                if lo & 1 == 0 {
+                    let mut chunks = dst.chunks_exact_mut(2);
+                    for (pair_idx, pair) in chunks.by_ref().enumerate() {
+                        let src = src_base + pair_idx * 2;
+                        let sl = f32::from_bits(pcm.samples[src].load(Ordering::Relaxed));
+                        let sr = f32::from_bits(pcm.samples[src + 1].load(Ordering::Relaxed));
+                        pair[0] += sl * seg.gain_l;
+                        pair[1] += sr * seg.gain_r;
+                    }
+                    let rem = chunks.into_remainder();
+                    if !rem.is_empty() {
+                        let src = src_base + dst_len - 1;
+                        let s = f32::from_bits(pcm.samples[src].load(Ordering::Relaxed));
+                        rem[0] += s * seg.gain_l;
+                    }
+                } else {
+                    let mut chunks = dst.chunks_exact_mut(2);
+                    for (pair_idx, pair) in chunks.by_ref().enumerate() {
+                        let src = src_base + pair_idx * 2;
+                        let sr = f32::from_bits(pcm.samples[src].load(Ordering::Relaxed));
+                        let sl = f32::from_bits(pcm.samples[src + 1].load(Ordering::Relaxed));
+                        pair[0] += sr * seg.gain_r;
+                        pair[1] += sl * seg.gain_l;
+                    }
+                    let rem = chunks.into_remainder();
+                    if !rem.is_empty() {
+                        let src = src_base + dst_len - 1;
+                        let s = f32::from_bits(pcm.samples[src].load(Ordering::Relaxed));
+                        rem[0] += s * seg.gain_r;
+                    }
                 }
             } else {
-                let mut chunks = dst.chunks_exact_mut(2);
-                for (pair_idx, pair) in chunks.by_ref().enumerate() {
-                    let src = src_base + pair_idx * 2;
-                    let sr = f32::from_bits(pcm.samples[src].load(Ordering::Relaxed));
-                    let sl = f32::from_bits(pcm.samples[src + 1].load(Ordering::Relaxed));
-                    pair[0] += sr * seg.gain_r;
-                    pair[1] += sl * seg.gain_l;
-                }
-                let rem = chunks.into_remainder();
-                if !rem.is_empty() {
-                    let src = src_base + dst_len - 1;
-                    let s = f32::from_bits(pcm.samples[src].load(Ordering::Relaxed));
-                    rem[0] += s * seg.gain_r;
+                // Воспроизведение с изменением скорости (Retime) или реверсом
+                let dst = &mut out[lo - pos..hi - pos];
+                let tl_sample_start = lo - seg.start;
+                let total_tl_frames = (seg.len / 2).max(1);
+
+                for (idx, sample) in dst.iter_mut().enumerate() {
+                    let cur_tl_sample = tl_sample_start + idx;
+                    let cur_tl_frame = cur_tl_sample / 2;
+                    let is_right_channel = (cur_tl_sample & 1) != 0;
+
+                    let src_frame_f64 = if seg.speed < 0.0 {
+                        let rev_frame = total_tl_frames.saturating_sub(1 + cur_tl_frame);
+                        rev_frame as f64 * seg.speed.abs()
+                    } else {
+                        cur_tl_frame as f64 * seg.speed
+                    };
+
+                    let src_frame = src_frame_f64.floor() as usize;
+                    let ch_offset = if is_right_channel { 1 } else { 0 };
+                    let src_idx = seg.in_off + (src_frame * 2) + ch_offset;
+
+                    if src_idx < avail_len {
+                        let s = f32::from_bits(pcm.samples[src_idx].load(Ordering::Relaxed));
+                        let gain = if is_right_channel { seg.gain_r } else { seg.gain_l };
+                        *sample += s * gain;
+                    }
                 }
             }
         }
@@ -866,11 +900,13 @@ impl AudioPlayer {
             let len = ((c.duration_frames.max(0) as f64 / fps) * AUDIO_RATE as f64).round() as usize * 2;
 
             total_len = total_len.max(start + len);
+            let eff_speed = if c.speed.abs() > 0.001 { c.speed } else { 1.0 };
             segments.push(MixSegment {
                 samples: clip_samples,
                 start,
                 in_off,
                 len,
+                speed: eff_speed,
                 gain_l: vol_linear * pan_l,
                 gain_r: vol_linear * pan_r,
             });
@@ -1078,5 +1114,61 @@ mod tests {
         // При pan = 50% вправо, левый канал = 0.25, правый канал = 0.75
         assert!((seg.gain_l - 0.25).abs() < 1e-3);
         assert!((seg.gain_r - 0.75).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_audio_mixer_retime_playback() {
+        let mut samples_to_store = Vec::with_capacity(100);
+        // Заполняем 50 стерео-сэмплов (100 float) возрастающими значениями: [0.0, 0.0, 0.1, 0.1, 0.2, 0.2, ...]
+        for i in 0..50 {
+            let val = i as f32 / 10.0;
+            samples_to_store.push(val);
+            samples_to_store.push(val);
+        }
+        let buf = AudioStreamBuffer::from_vec(samples_to_store);
+
+        // 1. Проверяем 2x ускорение: сегмент длиной 20 сэмплов (10 кадров) играет в 2 раза быстрее
+        let snapshot_2x = MixSnapshot {
+            segments: vec![MixSegment {
+                samples: buf.clone(),
+                start: 0,
+                in_off: 0,
+                len: 20,
+                speed: 2.0,
+                gain_l: 1.0,
+                gain_r: 1.0,
+            }],
+            total_len: 20,
+        };
+
+        let mut out_2x = vec![0.0f32; 8];
+        snapshot_2x.mix_block(0, &mut out_2x);
+        // Кадр 0 на таймлайне -> кадр 0 источника (0.0)
+        assert!((out_2x[0] - 0.0).abs() < 1e-4);
+        // Кадр 1 на таймлайне -> кадр 2 источника (0.2)
+        assert!((out_2x[2] - 0.2).abs() < 1e-4);
+        // Кадр 2 на таймлайне -> кадр 4 источника (0.4)
+        assert!((out_2x[4] - 0.4).abs() < 1e-4);
+
+        // 2. Проверяем реверс: сегмент длиной 20 сэмплов (10 кадров) со speed = -1.0
+        let snapshot_rev = MixSnapshot {
+            segments: vec![MixSegment {
+                samples: buf.clone(),
+                start: 0,
+                in_off: 0,
+                len: 20,
+                speed: -1.0,
+                gain_l: 1.0,
+                gain_r: 1.0,
+            }],
+            total_len: 20,
+        };
+
+        let mut out_rev = vec![0.0f32; 8];
+        snapshot_rev.mix_block(0, &mut out_rev);
+        // Кадр 0 на таймлайне -> последний кадр (кадр 9 -> 0.9)
+        assert!((out_rev[0] - 0.9).abs() < 1e-4);
+        // Кадр 1 на таймлайне -> предпоследний кадр (кадр 8 -> 0.8)
+        assert!((out_rev[2] - 0.8).abs() < 1e-4);
     }
 }
