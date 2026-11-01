@@ -435,18 +435,7 @@ impl BackgroundCacheEngine {
                         pts
                     };
 
-                    let matched_key = if target_map.contains_key(&cur_src_f) {
-                        Some(cur_src_f)
-                    } else if target_map.contains_key(&(cur_src_f - 1)) {
-                        Some(cur_src_f - 1)
-                    } else if target_map.contains_key(&(cur_src_f + 1)) {
-                        Some(cur_src_f + 1)
-                    } else {
-                        None
-                    };
-
-                    if let Some(key) = matched_key {
-                        let tl_targets = target_map.remove(&key).unwrap();
+                    if let Some(tl_targets) = target_map.remove(&cur_src_f) {
                         if scaler.run(&decoded_frame, &mut rgb_frame).is_ok() {
                             let data = rgb_frame.data(0);
                             let stride = rgb_frame.stride(0);

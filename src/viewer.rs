@@ -175,22 +175,27 @@ impl ViewerState {
         if render_cache.mode != crate::render_cache::RenderCacheMode::None {
             let mut inserted_any = false;
 
-            // 1) Точное кэширование текущего положения плейхеда при кликах и на паузе
+            // 1) Точное кэширование текущего положения плейхеда при кликах и на паузе:
+            // СТРОГИЙ ИНВАРИАНТ: кэшируем ТОЛЬКО при 100% точном совпадении (last_exact_frame == target_src и last_decoded_frame == target_src),
+            // исключая отравление Render Cache приблизительными кадрами скраб-кэша или соседними кадрами!
             if let Some(clip) = active_clip {
                 let is_same_file = clip.source_path.as_deref() == video_player.current_path.as_deref();
                 if is_same_file {
                     let target_src = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
                     if let Some(ref img) = video_player.last_displayed_image {
                         let presented_src = video_player.last_exact_frame;
-                        let is_match = (presented_src - target_src).abs() <= 1
-                            || (video_player.total_frames > 0 && target_src >= video_player.total_frames - 2 && presented_src >= video_player.total_frames - 2);
+                        let is_exact_display = presented_src == video_player.last_decoded_frame;
+                        let is_eof_hold = video_player.total_frames > 0
+                            && target_src >= video_player.total_frames - 2
+                            && presented_src >= video_player.total_frames - 2;
+                        let is_match = is_exact_display && (presented_src == target_src || is_eof_hold);
                         if is_match && clip.contains_frame(timeline.playhead_frame) {
                             let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, timeline.playhead_frame);
                             if !render_cache.is_cached(timeline.playhead_frame) {
                                 render_cache.insert(timeline.playhead_frame, std::sync::Arc::clone(img), sig);
                                 inserted_any = true;
                             }
-                            if video_player.total_frames > 0 && target_src >= video_player.total_frames - 2 {
+                            if is_eof_hold {
                                 for tl_f in timeline.playhead_frame..clip.end_frame() {
                                     if clip.contains_frame(tl_f) {
                                         let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
@@ -202,21 +207,11 @@ impl ViewerState {
                                 }
                             }
                         }
-                        if presented_src >= 0 {
-                            let tl_presented = clip.timeline_frame_from_source(presented_src, timeline.fps);
-                            if clip.contains_frame(tl_presented) {
-                                let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_presented);
-                                if !render_cache.is_cached(tl_presented) {
-                                    render_cache.insert(tl_presented, std::sync::Arc::clone(img), sig);
-                                    inserted_any = true;
-                                }
-                            }
-                        }
                     }
                 }
             }
 
-            // 2) Кэширование всех декодированных кадров из фоновой очереди (включая концы клипов, даже если плейхед за пределами клипа)
+            // 2) Кэширование всех точно декодированных кадров из фоновой очереди (безусловная запись точных кадров)
             if let Some(ref current_path) = video_player.current_path {
                 let current_path_buf = current_path.clone();
                 for (src_f, img) in video_player.newly_cached_frames.drain(..) {
@@ -234,8 +229,9 @@ impl ViewerState {
                                         || (video_player.total_frames > 0 && src_f >= video_player.total_frames - 2 && tl_src >= video_player.total_frames - 2);
                                     if is_match {
                                         let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(timeline, tl_f);
-                                        if !render_cache.is_cached(tl_f) {
-                                            render_cache.insert(tl_f, std::sync::Arc::clone(&img), sig);
+                                        let was_cached = render_cache.is_cached(tl_f);
+                                        render_cache.insert(tl_f, std::sync::Arc::clone(&img), sig);
+                                        if !was_cached {
                                             inserted_any = true;
                                         }
                                     }
@@ -543,12 +539,55 @@ impl ViewerState {
         let avail_w = ui.available_width().max(80.0);
         let avail_h = (ui.available_height() - 34.0).max(60.0);
         let aspect = 16.0 / 9.0;
-        let (video_w, video_h) = if avail_w / avail_h > aspect {
-            (avail_h * aspect, avail_h)
+        let pad_w = (avail_w - 24.0).max(60.0);
+        let pad_h = (avail_h - 24.0).max(45.0);
+        let (fit_w, fit_h) = if pad_w / pad_h > aspect {
+            (pad_h * aspect, pad_h)
         } else {
-            (avail_w, avail_w / aspect)
+            (pad_w, pad_w / aspect)
         };
-        let (rect, _response) = ui.allocate_exact_size(vec2(avail_w, avail_h), egui::Sense::hover());
+        let monitor_scale = self.custom_zoom.unwrap_or_else(|| match self.zoom_mode {
+            ZoomMode::Fit => 1.0,
+            ZoomMode::Fifty => 0.5,
+            ZoomMode::Hundred => 1.0 * (1080.0 / fit_h.max(1.0)),
+            ZoomMode::TwoHundred => 2.0,
+        });
+        let video_w = fit_w * monitor_scale;
+        let video_h = fit_h * monitor_scale;
+        let (rect, response) = ui.allocate_exact_size(vec2(avail_w, avail_h), egui::Sense::click_and_drag());
+
+        let pointer_in_source = ui.input(|i| i.pointer.hover_pos().map(|p| rect.contains(p)).unwrap_or(false));
+        if pointer_in_source {
+            let (zoom_delta, raw_wheel_y) = ui.input(|i| {
+                let zd = i.zoom_delta();
+                let mut wy = i.smooth_scroll_delta.y;
+                if wy.abs() < 0.01 {
+                    for ev in &i.events {
+                        if let egui::Event::MouseWheel { delta, .. } = ev {
+                            wy += delta.y * 24.0;
+                        }
+                    }
+                }
+                (zd, wy)
+            });
+            let factor = if (zoom_delta - 1.0).abs() > 0.001 {
+                zoom_delta.clamp(0.75, 1.35)
+            } else if raw_wheel_y.abs() > 0.05 {
+                (1.0f32 + raw_wheel_y * 0.0025f32).clamp(0.8f32, 1.25f32)
+            } else {
+                1.0
+            };
+            if (factor - 1.0).abs() > 0.001 {
+                let cur = self.custom_zoom.unwrap_or(monitor_scale);
+                self.custom_zoom = Some((cur * factor).clamp(0.1, 10.0));
+                ui.ctx().request_repaint();
+            }
+        }
+        if response.double_clicked() {
+            self.zoom_mode = ZoomMode::Fit;
+            self.custom_zoom = None;
+            self.pan_offset = egui::Vec2::ZERO;
+        }
 
         let painter = ui.painter_at(rect);
         // Задний фон монитора (нейтральный студийный тёмно-серый как в DaVinci Resolve)
@@ -556,12 +595,12 @@ impl ViewerState {
         painter.rect_stroke(rect, CornerRadius::same(2), Stroke::new(1.0, ResolveColors::BORDER), StrokeKind::Inside);
 
         // Экран проекта (Screen Canvas) — чисто чёрный (#000000) прямоугольник с чёткими границами
-        let screen_rect = Rect::from_center_size(rect.center(), vec2(video_w, video_h));
+        let screen_rect = Rect::from_center_size(rect.center() + self.pan_offset, vec2(video_w, video_h));
         painter.rect_filled(screen_rect, CornerRadius::ZERO, Color32::BLACK);
         painter.rect_stroke(screen_rect, CornerRadius::ZERO, Stroke::new(1.0, Color32::from_rgb(0x38, 0x3c, 0x48)), StrokeKind::Outside);
 
         if let Some(tex) = &video_player.texture {
-            painter.image(
+            painter.with_clip_rect(screen_rect.intersect(rect)).image(
                 tex.id(),
                 screen_rect,
                 Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
@@ -608,12 +647,13 @@ impl ViewerState {
         let avail_h = (ui.available_height() - transport_h - 6.0).max(60.0);
 
         let aspect = 16.0 / 9.0;
-        let (fit_w, fit_h) = if avail_w / avail_h > aspect {
-            // Контейнер шире, чем 16:9: высота = высоте контейнера!
-            (avail_h * aspect, avail_h)
+        // Студийный отступ вокруг холста 16:9, чтобы рамка Transform OSC и ручка вращения (32px сверху) никогда не обрезались!
+        let pad_w = (avail_w - 56.0).max(60.0);
+        let pad_h = (avail_h - 68.0).max(45.0);
+        let (fit_w, fit_h) = if pad_w / pad_h > aspect {
+            (pad_h * aspect, pad_h)
         } else {
-            // Контейнер уже: ширина = ширине контейнера
-            (avail_w, avail_w / aspect)
+            (pad_w, pad_w / aspect)
         };
 
         // Применение зума монитора (Fit / 50% / 100% / 200% / Custom)
@@ -623,31 +663,59 @@ impl ViewerState {
             ZoomMode::Hundred => 1.0 * (1080.0 / fit_h.max(1.0)),
             ZoomMode::TwoHundred => 2.0,
         });
-        let screen_w = fit_w * monitor_scale;
-        let screen_h = fit_h * monitor_scale;
 
         ui.horizontal(|ui| {
             // Контейнер предпросмотра занимает полную высоту контейнера dock с поддержкой панорамирования и зума
             let (rect, rect_resp) = ui.allocate_exact_size(vec2(avail_w, avail_h), egui::Sense::click_and_drag());
             let painter = ui.painter_at(rect);
 
-            // Обработка панорамирования вьюера (Middle Mouse Drag или Space + Left Drag) и зума (Ctrl + MouseWheel)
+            // Проверка геометрического вхождения курсора в rect (не зависит от перехвата hover дочерним виджетом Transform)
+            let pointer_in_viewer = ui.input(|i| i.pointer.hover_pos().map(|p| rect.contains(p)).unwrap_or(false));
             let is_space = ui.input(|i| i.key_down(egui::Key::Space));
-            let mmb_drag = rect_resp.dragged_by(egui::PointerButton::Middle);
-            let space_drag = is_space && rect_resp.dragged();
-            if mmb_drag || space_drag {
-                self.pan_offset += rect_resp.drag_delta();
+            let mmb_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
+            let lmb_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+            let pointer_delta = ui.input(|i| i.pointer.delta());
+
+            if pointer_in_viewer && (mmb_down || (is_space && lmb_down)) {
+                self.pan_offset += pointer_delta;
                 ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
-            } else if is_space && rect_resp.hovered() {
+                ui.ctx().request_repaint();
+            } else if pointer_in_viewer && is_space {
                 ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
             }
 
-            if rect_resp.hovered() && ui.input(|i| i.modifiers.ctrl || i.modifiers.command) {
-                let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
-                if scroll_y.abs() > 0.1 {
-                    let cur = self.custom_zoom.unwrap_or(monitor_scale);
-                    let factor = (1.0f32 + scroll_y * 0.002f32).clamp(0.8f32, 1.25f32);
-                    self.custom_zoom = Some((cur * factor).clamp(0.1, 10.0));
+            // Масштабирование предпросмотра (Ctrl + Колесо мыши через zoom_delta() ИЛИ обычное колесо мыши над монитором)
+            if pointer_in_viewer {
+                let (zoom_delta, raw_wheel_y, hover_pos) = ui.input(|i| {
+                    let zd = i.zoom_delta();
+                    let mut wy = i.smooth_scroll_delta.y;
+                    if wy.abs() < 0.01 {
+                        for ev in &i.events {
+                            if let egui::Event::MouseWheel { delta, .. } = ev {
+                                wy += delta.y * 24.0;
+                            }
+                        }
+                    }
+                    (zd, wy, i.pointer.hover_pos())
+                });
+
+                let factor = if (zoom_delta - 1.0).abs() > 0.001 {
+                    zoom_delta.clamp(0.75, 1.35)
+                } else if raw_wheel_y.abs() > 0.05 {
+                    (1.0f32 + raw_wheel_y * 0.0025f32).clamp(0.8f32, 1.25f32)
+                } else {
+                    1.0
+                };
+
+                if (factor - 1.0).abs() > 0.001 {
+                    let old_scale = self.custom_zoom.unwrap_or(monitor_scale);
+                    let new_scale = (old_scale * factor).clamp(0.1, 10.0);
+                    let actual_ratio = new_scale / old_scale.max(0.001);
+                    if let Some(cursor) = hover_pos {
+                        let rel = cursor - (rect.center() + self.pan_offset);
+                        self.pan_offset -= rel * (actual_ratio - 1.0);
+                    }
+                    self.custom_zoom = Some(new_scale);
                     ui.ctx().request_repaint();
                 }
             }
@@ -657,6 +725,10 @@ impl ViewerState {
                 self.custom_zoom = None;
                 self.pan_offset = egui::Vec2::ZERO;
             }
+
+            let effective_scale = self.custom_zoom.unwrap_or(monitor_scale);
+            let screen_w = fit_w * effective_scale;
+            let screen_h = fit_h * effective_scale;
 
             // 1. Задний фон монитора (студийный тёмно-серый backdrop DaVinci Resolve)
             painter.rect_filled(rect, CornerRadius::same(2), Color32::from_rgb(0x13, 0x14, 0x18));
@@ -723,11 +795,13 @@ impl ViewerState {
                     ColorChannelMode::Monochrome => Color32::from_rgba_unmultiplied(200, 200, 200, alpha),
                 };
 
-                // Отрисовка живого кадра видео (Frame-Accurate без двоения и мерцания)
+                // Отрисовка живого кадра видео строго внутри границ экрана проекта (screen_rect),
+                // тогда как интерактивная рамка Transform OSC рисуется поверх всего монитора (painter)!
+                let video_painter = painter.with_clip_rect(screen_rect.intersect(rect));
                 if let Some(tex) = &video_player.texture {
                     if rot_deg.abs() <= 0.01 {
                         let uv = Rect::from_min_max(pos2(uv_min_x, uv_min_y), pos2(uv_max_x, uv_max_y));
-                        painter.image(tex.id(), cropped_rect, uv, tint);
+                        video_painter.image(tex.id(), cropped_rect, uv, tint);
                     } else {
                         let mut mesh = egui::Mesh::with_texture(tex.id());
                         let p_lt = rotate_pt(cropped_rect.left_top());
@@ -741,7 +815,7 @@ impl ViewerState {
                         mesh.vertices.push(egui::epaint::Vertex { pos: p_lb, uv: pos2(uv_min_x, uv_max_y), color: tint });
                         mesh.add_triangle(idx, idx + 1, idx + 2);
                         mesh.add_triangle(idx, idx + 2, idx + 3);
-                        painter.add(egui::Shape::mesh(mesh));
+                        video_painter.add(egui::Shape::mesh(mesh));
                     }
                 }
 
@@ -758,8 +832,12 @@ impl ViewerState {
                     let p_lc = pos2((p_lt.x + p_lb.x) * 0.5, (p_lt.y + p_lb.y) * 0.5);
                     let p_rc = pos2((p_rt.x + p_rb.x) * 0.5, (p_rt.y + p_rb.y) * 0.5);
 
-                    // Тонкая белая рамка клипа как в Resolve
-                    let frame_stroke = Stroke::new(1.0, Color32::from_rgb(235, 235, 240));
+                    // Тонкая белая с синим свечением рамка клипа как в Resolve
+                    let shadow_stroke = Stroke::new(2.5, Color32::from_rgba_unmultiplied(0, 0, 0, 160));
+                    for seg in [[p_lt, p_rt], [p_rt, p_rb], [p_rb, p_lb], [p_lb, p_lt]] {
+                        painter.line_segment(seg, shadow_stroke);
+                    }
+                    let frame_stroke = Stroke::new(1.5, Color32::from_rgb(41, 151, 255));
                     painter.line_segment([p_lt, p_rt], frame_stroke);
                     painter.line_segment([p_rt, p_rb], frame_stroke);
                     painter.line_segment([p_rb, p_lb], frame_stroke);
@@ -767,16 +845,16 @@ impl ViewerState {
 
                     // Центральная точка привязки (Anchor Point с перекрестием в стиле Resolve)
                     let resolve_blue = Color32::from_rgb(41, 151, 255);
-                    painter.circle_stroke(clip_center, 5.0, Stroke::new(1.2, resolve_blue));
-                    painter.line_segment([pos2(clip_center.x - 8.0, clip_center.y), pos2(clip_center.x + 8.0, clip_center.y)], Stroke::new(1.2, resolve_blue));
-                    painter.line_segment([pos2(clip_center.x, clip_center.y - 8.0), pos2(clip_center.x, clip_center.y + 8.0)], Stroke::new(1.2, resolve_blue));
+                    painter.circle_stroke(clip_center, 5.5, Stroke::new(1.5, resolve_blue));
+                    painter.line_segment([pos2(clip_center.x - 9.0, clip_center.y), pos2(clip_center.x + 9.0, clip_center.y)], Stroke::new(1.5, resolve_blue));
+                    painter.line_segment([pos2(clip_center.x, clip_center.y - 9.0), pos2(clip_center.x, clip_center.y + 9.0)], Stroke::new(1.5, resolve_blue));
 
                     // Стебель и ручка вращения (Rotation Stalk & Handle вверху клипа)
-                    let stalk_len = 32.0;
+                    let stalk_len = 28.0;
                     let stalk_dir = rotate_pt(pos2(clip_center.x, clip_center.y - 1.0)) - clip_center;
                     let stalk_norm = stalk_dir.normalized();
                     let p_rot = p_tc + stalk_norm * stalk_len;
-                    painter.line_segment([p_tc, p_rot], Stroke::new(1.2, resolve_blue));
+                    painter.line_segment([p_tc, p_rot], Stroke::new(1.5, resolve_blue));
 
                     // Интерактивные области ручек управления
                     let h_sz = vec2(16.0, 16.0);
@@ -790,8 +868,14 @@ impl ViewerState {
                     let resp_lc = ui.interact(Rect::from_center_size(p_lc, h_sz), ui.id().with("tr_lc"), egui::Sense::drag());
                     let resp_rc = ui.interact(Rect::from_center_size(p_rc, h_sz), ui.id().with("tr_rc"), egui::Sense::drag());
 
-                    let resp_rot = ui.interact(Rect::from_center_size(p_rot, vec2(18.0, 18.0)), ui.id().with("tr_rot"), egui::Sense::drag());
-                    let body_resp = ui.interact(video_box_rect, ui.id().with("tr_body"), egui::Sense::drag());
+                    let resp_rot = ui.interact(Rect::from_center_size(p_rot, vec2(20.0, 20.0)), ui.id().with("tr_rot"), egui::Sense::drag());
+                    let body_resp = ui.interact(video_box_rect.intersect(rect), ui.id().with("tr_body"), egui::Sense::click_and_drag());
+
+                    if body_resp.double_clicked() {
+                        self.zoom_mode = ZoomMode::Fit;
+                        self.custom_zoom = None;
+                        self.pan_offset = egui::Vec2::ZERO;
+                    }
 
                     let any_handle_active = resp_lt.hovered() || resp_rt.hovered() || resp_lb.hovered() || resp_rb.hovered()
                         || resp_tc.hovered() || resp_bc.hovered() || resp_lc.hovered() || resp_rc.hovered()
@@ -810,10 +894,10 @@ impl ViewerState {
                         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeVertical);
                     } else if resp_lc.hovered() || resp_rc.hovered() {
                         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
-                    } else if body_resp.hovered() && !any_handle_active {
+                    } else if body_resp.hovered() && !any_handle_active && !is_space && !mmb_down {
                         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grab);
                     }
-                    if body_resp.dragged() && !any_handle_active {
+                    if body_resp.dragged_by(egui::PointerButton::Primary) && !any_handle_active && !is_space && !mmb_down {
                         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Grabbing);
                     }
 
@@ -835,7 +919,7 @@ impl ViewerState {
                                 target_clip.rotation = (angle * 10.0).round() / 10.0;
                                 clip_mutated = true;
                             }
-                        } else if body_resp.dragged() && !any_handle_active {
+                        } else if body_resp.dragged_by(egui::PointerButton::Primary) && !any_handle_active && !is_space && !mmb_down {
                             let delta = body_resp.drag_delta();
                             let is_shift = ui.input(|i| i.modifiers.shift);
                             let (dx, dy) = if is_shift {
@@ -851,33 +935,51 @@ impl ViewerState {
                             target_clip.position_y += dy / px_scale;
                             clip_mutated = true;
                         } else if resp_rb.dragged() || resp_lt.dragged() || resp_rt.dragged() || resp_lb.dragged() {
-                            let raw_delta = if resp_rb.dragged() {
-                                resp_rb.drag_delta()
+                            // Сначала переводим вектор перемещения мыши в локальную (неповёрнутую) систему координат клипа,
+                            // и только затем учитываем знаки квадранта ручки — так ручки работают 1:1 при любом угле поворота!
+                            let (screen_delta, sign_x, sign_y) = if resp_rb.dragged() {
+                                (resp_rb.drag_delta(), 1.0f32, 1.0f32)
                             } else if resp_lt.dragged() {
-                                -resp_lt.drag_delta()
+                                (resp_lt.drag_delta(), -1.0f32, -1.0f32)
                             } else if resp_rt.dragged() {
-                                vec2(resp_rt.drag_delta().x, -resp_rt.drag_delta().y)
+                                (resp_rt.drag_delta(), 1.0f32, -1.0f32)
                             } else {
-                                vec2(-resp_lb.drag_delta().x, resp_lb.drag_delta().y)
+                                (resp_lb.drag_delta(), -1.0f32, 1.0f32)
                             };
-                            let local_dx = raw_delta.x * cos_a + raw_delta.y * sin_a;
-                            let local_dy = -raw_delta.x * sin_a + raw_delta.y * cos_a;
-                            let zoom_delta = (local_dx / screen_rect.width().max(1.0) + local_dy / screen_rect.height().max(1.0)) * 1.5;
-                            target_clip.zoom_x = (target_clip.zoom_x + zoom_delta).clamp(0.05, 10.0);
-                            target_clip.zoom_y = (target_clip.zoom_y + zoom_delta).clamp(0.05, 10.0);
+                            let local_dx = (screen_delta.x * cos_a + screen_delta.y * sin_a) * sign_x;
+                            let local_dy = (-screen_delta.x * sin_a + screen_delta.y * cos_a) * sign_y;
+                            let half_w = (screen_rect.width() * 0.5).max(1.0);
+                            let half_h = (screen_rect.height() * 0.5).max(1.0);
+                            let zoom_delta = (local_dx / half_w + local_dy / half_h) * 0.5;
+                            let ratio = if target_clip.zoom_x.abs() > 0.001 {
+                                target_clip.zoom_y / target_clip.zoom_x
+                            } else {
+                                1.0
+                            };
+                            let new_zx = (target_clip.zoom_x + zoom_delta).clamp(0.05, 10.0);
+                            target_clip.zoom_x = new_zx;
+                            target_clip.zoom_y = (new_zx * ratio).clamp(0.05, 10.0);
                             clip_mutated = true;
                         } else if resp_rc.dragged() || resp_lc.dragged() {
-                            let raw_dx = if resp_rc.dragged() { resp_rc.drag_delta().x } else { -resp_lc.drag_delta().x };
-                            let raw_dy = if resp_rc.dragged() { resp_rc.drag_delta().y } else { -resp_lc.drag_delta().y };
-                            let local_dx = raw_dx * cos_a + raw_dy * sin_a;
-                            let zoom_delta = (local_dx / screen_rect.width().max(1.0)) * 2.0;
+                            let (screen_delta, sign_x) = if resp_rc.dragged() {
+                                (resp_rc.drag_delta(), 1.0f32)
+                            } else {
+                                (resp_lc.drag_delta(), -1.0f32)
+                            };
+                            let local_dx = (screen_delta.x * cos_a + screen_delta.y * sin_a) * sign_x;
+                            let half_w = (screen_rect.width() * 0.5).max(1.0);
+                            let zoom_delta = local_dx / half_w;
                             target_clip.zoom_x = (target_clip.zoom_x + zoom_delta).clamp(0.05, 10.0);
                             clip_mutated = true;
                         } else if resp_bc.dragged() || resp_tc.dragged() {
-                            let raw_dx = if resp_bc.dragged() { resp_bc.drag_delta().x } else { -resp_tc.drag_delta().x };
-                            let raw_dy = if resp_bc.dragged() { resp_bc.drag_delta().y } else { -resp_tc.drag_delta().y };
-                            let local_dy = -raw_dx * sin_a + raw_dy * cos_a;
-                            let zoom_delta = (local_dy / screen_rect.height().max(1.0)) * 2.0;
+                            let (screen_delta, sign_y) = if resp_bc.dragged() {
+                                (resp_bc.drag_delta(), 1.0f32)
+                            } else {
+                                (resp_tc.drag_delta(), -1.0f32)
+                            };
+                            let local_dy = (-screen_delta.x * sin_a + screen_delta.y * cos_a) * sign_y;
+                            let half_h = (screen_rect.height() * 0.5).max(1.0);
+                            let zoom_delta = local_dy / half_h;
                             target_clip.zoom_y = (target_clip.zoom_y + zoom_delta).clamp(0.05, 10.0);
                             clip_mutated = true;
                         }
@@ -1202,5 +1304,112 @@ mod tests {
         viewer.custom_zoom = None;
         assert_eq!(viewer.pan_offset, egui::Vec2::ZERO);
         assert_eq!(viewer.custom_zoom, None);
+    }
+
+    #[test]
+    fn test_viewer_ctrl_wheel_zoom_with_transform_overlay() {
+        let ctx = egui::Context::default();
+        let mut viewer = ViewerState::new();
+        viewer.show_transform_overlay = true;
+        viewer.single_viewer_mode = true;
+        let mut timeline = TimelineState::new_empty();
+        timeline.clips.push(crate::timeline::Clip {
+            id: 1,
+            name: "TestClip".to_string(),
+            track_index: 1,
+            start_frame: 0,
+            duration_frames: 200,
+            is_audio: false,
+            source_path: Some(std::path::PathBuf::from("/tmp/test_cache_poison.mp4")),
+            source_fps: 24.0,
+            ..Default::default()
+        });
+        let mut player = VideoPlayer::new();
+        let mut cache = crate::render_cache::RenderCacheManager::new(
+            crate::render_cache::RenderCacheMode::Smart,
+            360,
+        );
+
+        // Первый проход для инициализации геометрии окна
+        let mut init_input = egui::RawInput::default();
+        init_input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 720.0)));
+        let mut out1 = ctx.run_ui(init_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let c = ui.ctx().clone();
+                viewer.render_dual_viewers(ui, &mut timeline, &mut player, &mut cache, (0.0, 0.0), &c);
+            });
+        });
+        out1.textures_delta.clear();
+
+        // Второй проход: курсор в центре монитора (прямо над клипом с включенным Transform OSC) + Ctrl+Wheel (Event::Zoom)
+        let mut zoom_input = egui::RawInput::default();
+        zoom_input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 720.0)));
+        zoom_input.events.push(egui::Event::PointerMoved(pos2(600.0, 350.0)));
+        zoom_input.events.push(egui::Event::Zoom(1.2));
+        let mut out2 = ctx.run_ui(zoom_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let c = ui.ctx().clone();
+                viewer.render_dual_viewers(ui, &mut timeline, &mut player, &mut cache, (0.0, 0.0), &c);
+            });
+        });
+        out2.textures_delta.clear();
+
+        let zoomed = viewer.custom_zoom.expect("Ctrl + MouseWheel (Event::Zoom) must update custom_zoom even over Transform OSC");
+        assert!(zoomed > 1.15, "Expected zoom > 1.15, got {}", zoomed);
+    }
+
+    #[test]
+    fn test_render_cache_never_poisoned_by_neighbor_frame() {
+        let ctx = egui::Context::default();
+        let mut viewer = ViewerState::new();
+        let mut timeline = TimelineState::new_empty();
+        timeline.clips.push(crate::timeline::Clip {
+            id: 1,
+            name: "TestClip".to_string(),
+            track_index: 1,
+            start_frame: 0,
+            duration_frames: 200,
+            is_audio: false,
+            source_path: Some(std::path::PathBuf::from("/tmp/test_cache_poison.mp4")),
+            source_fps: 24.0,
+            ..Default::default()
+        });
+        let mut player = VideoPlayer::new();
+        let mut cache = crate::render_cache::RenderCacheManager::new(
+            crate::render_cache::RenderCacheMode::Smart,
+            360,
+        );
+
+        let dummy_path = std::path::PathBuf::from("/tmp/test_cache_poison.mp4");
+        if let Some(clip) = timeline.clips.iter_mut().find(|c| !c.is_audio) {
+            clip.start_frame = 0;
+            clip.duration_frames = 200;
+            clip.source_path = Some(dummy_path.clone());
+        }
+        player.current_path = Some(dummy_path);
+        player.total_frames = 200;
+
+        let img_100 = std::sync::Arc::new(egui::ColorImage::filled([16, 16], Color32::RED));
+        player.last_displayed_image = Some(std::sync::Arc::clone(&img_100));
+        player.last_exact_frame = 100;
+        player.last_decoded_frame = 100;
+
+        // Плейхед сдвинут на 101, но декодер ещё показывает старый кадр 100:
+        // Кадр 101 НЕ должен быть отравлен картинкой от кадра 100!
+        timeline.playhead_frame = 101;
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 720.0)));
+        let mut out = ctx.run_ui(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let c = ui.ctx().clone();
+                viewer.render_dual_viewers(ui, &mut timeline, &mut player, &mut cache, (0.0, 0.0), &c);
+            });
+        });
+        out.textures_delta.clear();
+
+        assert!(
+            !cache.is_cached(101),
+            "Frame 101 must NOT be poisoned in RenderCache by stale frame 100"
+        );
     }
 }

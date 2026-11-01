@@ -177,6 +177,8 @@ pub struct PreferencesModalState {
     pub draft: UserPreferences,
     pub initialized: bool,
     pub is_dirty: bool,
+    #[cfg(test)]
+    pub last_close_btn_rect: Option<Rect>,
 }
 
 impl PreferencesModalState {
@@ -187,6 +189,8 @@ impl PreferencesModalState {
             draft: UserPreferences::default(),
             initialized: false,
             is_dirty: false,
+            #[cfg(test)]
+            last_close_btn_rect: None,
         }
     }
 
@@ -202,21 +206,34 @@ impl PreferencesModalState {
         let mut apply_result = None;
         let mut should_close = false;
 
-        let win_width = 920.0;
-        let win_height = 620.0;
-        let header_height = 44.0;
-        let footer_height = 48.0;
-        let body_height = win_height - header_height - footer_height;
-        let sidebar_width = 180.0;
+        let screen = ctx.content_rect();
+        let win_width = if screen.width() > 100.0 {
+            (screen.width() - 24.0).clamp(520.0, 920.0)
+        } else {
+            920.0
+        };
+        let win_height = if screen.height() > 100.0 {
+            (screen.height() - 24.0).clamp(380.0, 620.0)
+        } else {
+            620.0
+        };
+        let win_pos = egui::pos2(
+            screen.min.x + ((screen.width() - win_width) * 0.5).max(0.0),
+            screen.min.y + ((screen.height() - win_height) * 0.5).max(0.0),
+        );
+
+        let header_height = 46.0;
+        let footer_height = 50.0;
+        let body_height = (win_height - header_height - footer_height - 2.0).max(200.0);
+        let sidebar_width = (win_width * 0.21).clamp(150.0, 190.0);
         let (accent, _) = get_accent_colors(self.draft.theme_accent_idx);
 
         egui::Window::new("preferences_modal_window")
-            .open(open)
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
+            .fixed_pos(win_pos)
             .fixed_size([win_width, win_height])
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .frame(
                 egui::Frame::new()
                     .fill(Color32::from_rgb(0x13, 0x14, 0x17))
@@ -226,210 +243,246 @@ impl PreferencesModalState {
             )
             .show(ctx, |ui| {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                ui.set_width(win_width);
-                ui.set_height(win_height);
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
 
-                ui.vertical(|ui| {
-                    // 1. Верхний единый заголовок окна модалки: 100% ширина, заголовок + табы System/User + крестик закрытия
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(0x18, 0x1a, 0x20))
-                        .stroke(Stroke::NONE)
-                        .inner_margin(egui::Margin::symmetric(16, 8))
-                        .show(ui, |ui| {
-                            ui.set_width(win_width - 32.0);
-                            ui.set_height(header_height - 16.0);
-                            ui.horizontal_centered(|ui| {
-                                // Заголовок слева
-                                ui.horizontal(|ui| {
-                                    ui.set_width(200.0);
-                                    ui.label(
-                                        egui::RichText::new("⚙ Preferences")
-                                            .size(13.0)
-                                            .strong()
-                                            .color(Color32::WHITE),
-                                    );
-                                });
+                // 1. ШАПКА ОКНА (Header): фиксированный прямоугольник с 3 независимыми зонами (Заголовок | Вкладки | Кнопка ✕)
+                let (header_outer, _) = ui.allocate_exact_size(Vec2::new(win_width, header_height), egui::Sense::hover());
+                ui.painter().rect_filled(
+                    header_outer,
+                    CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 },
+                    Color32::from_rgb(0x18, 0x1a, 0x20),
+                );
+                ui.painter().line_segment(
+                    [header_outer.left_bottom(), header_outer.right_bottom()],
+                    Stroke::new(1.0, Color32::from_rgb(0x26, 0x29, 0x32)),
+                );
 
-                                // Центр: переключатель вкладок System | User
-                                let center_width = 180.0;
-                                let left_pad = ((win_width - 32.0) - 200.0 - 50.0 - center_width) * 0.5;
-                                if left_pad > 0.0 {
-                                    ui.add_space(left_pad);
-                                }
+                let header_inner = header_outer.shrink2(Vec2::new(16.0, 7.0));
 
-                                egui::Frame::new()
-                                    .fill(Color32::from_rgb(0x12, 0x13, 0x17))
-                                    .stroke(Stroke::new(1.0, Color32::from_rgb(0x28, 0x2b, 0x34)))
-                                    .corner_radius(CornerRadius::same(4))
-                                    .inner_margin(egui::Margin::symmetric(3, 2))
-                                    .show(ui, |ui| {
-                                        let sys_active = self.current_tab == PrefTab::System;
-                                        let user_active = self.current_tab == PrefTab::User;
+                // 1a. Левая зона шапки: заголовок «⚙ Preferences»
+                let left_rect = Rect::from_min_max(
+                    header_inner.min,
+                    egui::pos2(header_inner.center().x - 90.0, header_inner.max.y),
+                );
+                let mut left_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("pref_hdr_left")
+                        .max_rect(left_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                left_ui.label(
+                    egui::RichText::new("⚙ Preferences")
+                        .size(13.5)
+                        .strong()
+                        .color(Color32::WHITE),
+                );
 
-                                        let sys_btn = egui::Button::new(
-                                            egui::RichText::new("  System  ")
-                                                .size(11.5)
-                                                .strong()
-                                                .color(if sys_active { Color32::WHITE } else { Color32::from_rgb(0x92, 0x97, 0xa5) }),
-                                        )
-                                        .fill(if sys_active { accent.gamma_multiply(0.35) } else { Color32::TRANSPARENT })
-                                        .stroke(if sys_active { Stroke::new(1.0, accent) } else { Stroke::NONE })
-                                        .corner_radius(CornerRadius::same(3));
+                // 1b. Центральная зона шапки: переключатель вкладок [ System | User ]
+                let pill_rect = Rect::from_center_size(header_outer.center(), Vec2::new(168.0, 28.0));
+                ui.painter().rect_filled(pill_rect, CornerRadius::same(4), Color32::from_rgb(0x12, 0x13, 0x17));
+                ui.painter().rect_stroke(
+                    pill_rect,
+                    CornerRadius::same(4),
+                    Stroke::new(1.0, Color32::from_rgb(0x28, 0x2b, 0x34)),
+                    egui::StrokeKind::Inside,
+                );
+                let pill_inner = pill_rect.shrink2(Vec2::new(3.0, 2.0));
+                let half_pill_w = (pill_inner.width() - 4.0) * 0.5;
+                let sys_rect = Rect::from_min_size(pill_inner.min, Vec2::new(half_pill_w, pill_inner.height()));
+                let usr_rect = Rect::from_min_size(
+                    egui::pos2(pill_inner.min.x + half_pill_w + 4.0, pill_inner.min.y),
+                    Vec2::new(half_pill_w, pill_inner.height()),
+                );
 
-                                        if ui.add(sys_btn).clicked() {
-                                            self.current_tab = PrefTab::System;
-                                            self.current_section = PrefSection::SystemMemoryGpu;
-                                        }
+                let sys_active = self.current_tab == PrefTab::System;
+                let user_active = self.current_tab == PrefTab::User;
 
-                                        let user_btn = egui::Button::new(
-                                            egui::RichText::new("  User  ")
-                                                .size(11.5)
-                                                .strong()
-                                                .color(if user_active { Color32::WHITE } else { Color32::from_rgb(0x92, 0x97, 0xa5) }),
-                                        )
-                                        .fill(if user_active { accent.gamma_multiply(0.35) } else { Color32::TRANSPARENT })
-                                        .stroke(if user_active { Stroke::new(1.0, accent) } else { Stroke::NONE })
-                                        .corner_radius(CornerRadius::same(3));
+                let mut sys_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("pref_hdr_sys")
+                        .max_rect(sys_rect)
+                        .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)),
+                );
+                let sys_btn = egui::Button::new(
+                    egui::RichText::new("System")
+                        .size(11.5)
+                        .strong()
+                        .color(if sys_active { Color32::WHITE } else { Color32::from_rgb(0x92, 0x97, 0xa5) }),
+                )
+                .fill(if sys_active { accent.gamma_multiply(0.35) } else { Color32::TRANSPARENT })
+                .stroke(if sys_active { Stroke::new(1.0, accent) } else { Stroke::NONE })
+                .corner_radius(CornerRadius::same(3));
+                if sys_ui.add(sys_btn).clicked() {
+                    self.current_tab = PrefTab::System;
+                    self.current_section = PrefSection::SystemMemoryGpu;
+                }
 
-                                        if ui.add(user_btn).clicked() {
-                                            self.current_tab = PrefTab::User;
-                                            self.current_section = PrefSection::UserAppearance;
-                                        }
-                                    });
+                let mut usr_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("pref_hdr_usr")
+                        .max_rect(usr_rect)
+                        .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)),
+                );
+                let user_btn = egui::Button::new(
+                    egui::RichText::new("User")
+                        .size(11.5)
+                        .strong()
+                        .color(if user_active { Color32::WHITE } else { Color32::from_rgb(0x92, 0x97, 0xa5) }),
+                )
+                .fill(if user_active { accent.gamma_multiply(0.35) } else { Color32::TRANSPARENT })
+                .stroke(if user_active { Stroke::new(1.0, accent) } else { Stroke::NONE })
+                .corner_radius(CornerRadius::same(3));
+                if usr_ui.add(user_btn).clicked() {
+                    self.current_tab = PrefTab::User;
+                    self.current_section = PrefSection::UserAppearance;
+                }
 
-                                // Кнопка закрытия ✕ справа
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let close_btn = egui::Button::new(
-                                        egui::RichText::new("✕")
-                                            .size(13.0)
-                                            .color(Color32::from_rgb(0xa2, 0xa8, 0xb8)),
-                                    )
-                                    .fill(Color32::TRANSPARENT)
-                                    .stroke(Stroke::NONE);
+                // 1c. Правая зона шапки: кнопка закрытия ✕ (жестко закреплена у правого края шапки)
+                let close_rect = Rect::from_min_max(
+                    egui::pos2(header_inner.max.x - 30.0, header_outer.center().y - 13.0),
+                    egui::pos2(header_inner.max.x, header_outer.center().y + 13.0),
+                );
+                let mut right_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("pref_hdr_close")
+                        .max_rect(close_rect)
+                        .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)),
+                );
+                let close_btn = egui::Button::new(
+                    egui::RichText::new("✕")
+                        .size(14.0)
+                        .strong()
+                        .color(Color32::from_rgb(0xe2, 0xe6, 0xf0)),
+                )
+                .fill(Color32::from_rgb(0x25, 0x28, 0x32))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(0x36, 0x3a, 0x46)))
+                .corner_radius(CornerRadius::same(4));
 
-                                    if ui.add(close_btn).on_hover_text("Закрыть [Esc]").clicked() {
-                                        should_close = true;
-                                    }
-                                });
-                            });
-                        });
+                let close_resp = right_ui.add(close_btn).on_hover_text("Закрыть [Esc]");
+                #[cfg(test)]
+                {
+                    self.last_close_btn_rect = Some(close_resp.rect);
+                }
+                if close_resp.clicked() {
+                    should_close = true;
+                }
 
-                    // Тонкая разделительная черта под заголовком
-                    ui.separator();
+                // 2. ТЕЛО ОКНА (Body): фиксированный прямоугольник, разделенный на Сайдбар слева и ScrollArea справа
+                let (body_outer, _) = ui.allocate_exact_size(Vec2::new(win_width, body_height), egui::Sense::hover());
+                let body_inner = body_outer.shrink2(Vec2::new(14.0, 10.0));
 
-                    // 2. Основная рабочая область: Сайдбар слева, Настройки справа
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(0x13, 0x14, 0x17))
-                        .inner_margin(egui::Margin::symmetric(14, 10))
-                        .show(ui, |ui| {
-                            let avail_w = (win_width - 28.0).max(400.0);
-                            let avail_h = (body_height - 20.0).max(200.0);
-                            ui.set_width(avail_w);
-                            ui.set_height(avail_h);
+                let sidebar_rect = Rect::from_min_size(body_inner.min, Vec2::new(sidebar_width, body_inner.height()));
+                ui.painter().rect_filled(sidebar_rect, CornerRadius::same(4), Color32::from_rgb(0x16, 0x17, 0x1c));
+                ui.painter().rect_stroke(
+                    sidebar_rect,
+                    CornerRadius::same(4),
+                    Stroke::new(1.0, Color32::from_rgb(0x23, 0x25, 0x2c)),
+                    egui::StrokeKind::Inside,
+                );
 
-                            ui.horizontal(|ui| {
-                                // Сайдбар со списком категорий
-                                egui::Frame::new()
-                                    .fill(Color32::from_rgb(0x16, 0x17, 0x1c))
-                                    .stroke(Stroke::new(1.0, Color32::from_rgb(0x23, 0x25, 0x2c)))
-                                    .corner_radius(CornerRadius::same(4))
-                                    .inner_margin(egui::Margin::symmetric(6, 6))
-                                    .show(ui, |ui| {
-                                        ui.set_width(sidebar_width);
-                                        ui.set_height(avail_h - 12.0);
-                                        ui.vertical(|ui| {
-                                            self.render_sidebar(ui);
-                                        });
-                                    });
+                let mut sidebar_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("pref_body_sidebar")
+                        .max_rect(sidebar_rect.shrink(6.0))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                sidebar_ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
+                self.render_sidebar(&mut sidebar_ui);
 
-                                ui.add_space(8.0);
+                let content_rect = Rect::from_min_max(
+                    egui::pos2(sidebar_rect.max.x + 12.0, body_inner.min.y),
+                    body_inner.max,
+                );
+                let mut content_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("pref_body_content")
+                        .max_rect(content_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                content_ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("preferences_body_scroll")
+                    .auto_shrink([false, false])
+                    .max_height(content_rect.height())
+                    .show(&mut content_ui, |ui| {
+                        ui.set_width((content_rect.width() - 12.0).max(180.0));
+                        self.render_content(ui);
+                    });
 
-                                // Правая область с карточками настроек
-                                let content_w = (avail_w - sidebar_width - 24.0).max(200.0);
-                                egui::Frame::new()
-                                    .fill(Color32::from_rgb(0x13, 0x14, 0x17))
-                                    .inner_margin(egui::Margin::ZERO)
-                                    .show(ui, |ui| {
-                                        ui.set_width(content_w);
-                                        ui.set_height(avail_h - 12.0);
-                                        egui::ScrollArea::vertical()
-                                            .auto_shrink([false, false])
-                                            .max_height(avail_h - 12.0)
-                                            .show(ui, |ui| {
-                                                ui.set_width(content_w - 14.0);
-                                                ui.vertical(|ui| {
-                                                    self.render_content(ui);
-                                                });
-                                            });
-                                    });
-                            });
-                        });
+                // 3. ПОДВАЛ ОКНА (Footer): фиксированный прямоугольник (Reset слева | Cancel + Save справа)
+                let (footer_outer, _) = ui.allocate_exact_size(Vec2::new(win_width, footer_height), egui::Sense::hover());
+                ui.painter().rect_filled(
+                    footer_outer,
+                    CornerRadius { nw: 0, ne: 0, sw: 6, se: 6 },
+                    Color32::from_rgb(0x17, 0x18, 0x1e),
+                );
+                ui.painter().line_segment(
+                    [footer_outer.left_top(), footer_outer.right_top()],
+                    Stroke::new(1.0, Color32::from_rgb(0x26, 0x29, 0x32)),
+                );
 
-                    // Тонкая разделительная черта перед нижним баром
-                    ui.separator();
+                let footer_inner = footer_outer.shrink2(Vec2::new(16.0, 10.0));
+                let mut ftr_left_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("pref_ftr_left")
+                        .max_rect(footer_inner)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                let reset_btn = egui::Button::new(
+                    egui::RichText::new("⟲  Reset to Defaults")
+                        .size(11.0)
+                        .color(Color32::from_rgb(0xa2, 0xa8, 0xb6)),
+                )
+                .fill(Color32::from_rgb(0x1e, 0x20, 0x26))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(0x2d, 0x30, 0x39)))
+                .corner_radius(CornerRadius::same(3))
+                .min_size(Vec2::new(134.0, 28.0));
 
-                    // 3. Нижний бар действий: Сброс | Отмена | Сохранить
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(0x17, 0x18, 0x1e))
-                        .stroke(Stroke::NONE)
-                        .inner_margin(egui::Margin::symmetric(16, 10))
-                        .show(ui, |ui| {
-                            ui.set_width(win_width - 32.0);
-                            ui.set_height(footer_height - 20.0);
-                            ui.horizontal_centered(|ui| {
-                                let reset_btn = egui::Button::new(
-                                    egui::RichText::new("⟲  Reset to Defaults")
-                                        .size(11.0)
-                                        .color(Color32::from_rgb(0xa2, 0xa8, 0xb6)),
-                                )
-                                .fill(Color32::from_rgb(0x1e, 0x20, 0x26))
-                                .stroke(Stroke::new(1.0, Color32::from_rgb(0x2d, 0x30, 0x39)))
-                                .corner_radius(CornerRadius::same(3));
+                if ftr_left_ui.add(reset_btn).clicked() {
+                    self.draft = UserPreferences::default();
+                }
 
-                                if ui.add(reset_btn).clicked() {
-                                    self.draft = UserPreferences::default();
-                                }
+                let mut ftr_right_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("pref_ftr_right")
+                        .max_rect(footer_inner)
+                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                );
+                ftr_right_ui.spacing_mut().item_spacing.x = 8.0;
 
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let save_btn = egui::Button::new(
-                                        egui::RichText::new("  Save  ")
-                                            .size(12.0)
-                                            .color(Color32::WHITE)
-                                            .strong(),
-                                    )
-                                    .fill(accent)
-                                    .stroke(Stroke::new(1.0, accent))
-                                    .corner_radius(CornerRadius::same(3))
-                                    .min_size(Vec2::new(82.0, 26.0));
+                let save_btn = egui::Button::new(
+                    egui::RichText::new("  Save  ")
+                        .size(12.0)
+                        .color(Color32::WHITE)
+                        .strong(),
+                )
+                .fill(accent)
+                .stroke(Stroke::new(1.0, accent))
+                .corner_radius(CornerRadius::same(3))
+                .min_size(Vec2::new(84.0, 28.0));
 
-                                    if ui.add(save_btn).clicked() {
-                                        apply_result = Some(self.draft.clone());
-                                        should_close = true;
-                                    }
+                if ftr_right_ui.add(save_btn).clicked() {
+                    apply_result = Some(self.draft.clone());
+                    should_close = true;
+                }
 
-                                    ui.add_space(8.0);
+                let cancel_btn = egui::Button::new(
+                    egui::RichText::new("  Cancel  ")
+                        .size(11.5)
+                        .color(Color32::from_rgb(0xd5, 0xda, 0xe5)),
+                )
+                .fill(Color32::from_rgb(0x23, 0x25, 0x2c))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(0x30, 0x33, 0x3d)))
+                .corner_radius(CornerRadius::same(3))
+                .min_size(Vec2::new(76.0, 28.0));
 
-                                    let cancel_btn = egui::Button::new(
-                                        egui::RichText::new("  Cancel  ")
-                                            .size(11.5)
-                                            .color(Color32::from_rgb(0xd5, 0xda, 0xe5)),
-                                    )
-                                    .fill(Color32::from_rgb(0x23, 0x25, 0x2c))
-                                    .stroke(Stroke::new(1.0, Color32::from_rgb(0x30, 0x33, 0x3d)))
-                                    .corner_radius(CornerRadius::same(3))
-                                    .min_size(Vec2::new(72.0, 26.0));
+                if ftr_right_ui.add(cancel_btn).clicked() {
+                    should_close = true;
+                }
 
-                                    if ui.add(cancel_btn).clicked() {
-                                        should_close = true;
-                                    }
-                                });
-                            });
-                        });
-
-                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        should_close = true;
-                    }
-                });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    should_close = true;
+                }
             });
 
         if should_close {
@@ -1333,5 +1386,64 @@ mod tests {
             });
             out_small.textures_delta.clear();
         }
+    }
+
+    #[test]
+    fn test_preferences_close_button_click() {
+        let ctx = Context::default();
+        let mut modal = PreferencesModalState::new();
+        let mut open = true;
+
+        // Первый проход: рендер окна по центру экрана 1920x1080 (окно 920x620 -> x: 500..1420, y: 230..850)
+        let mut input1 = egui::RawInput::default();
+        input1.screen_rect = Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1920.0, 1080.0)));
+        let mut out1 = ctx.run_ui(input1, |ctx| {
+            let _ = modal.render(ctx, &mut open);
+        });
+        out1.textures_delta.clear();
+        assert!(open);
+
+        let close_rect = modal.last_close_btn_rect.expect("Close button must be rendered");
+        let close_pos = close_rect.center();
+
+        // Второй проход: наведение курсора на кнопку ✕
+        let mut input_hover = egui::RawInput::default();
+        input_hover.screen_rect = Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1920.0, 1080.0)));
+        input_hover.events.push(egui::Event::PointerMoved(close_pos));
+        let mut out_hover = ctx.run_ui(input_hover, |ctx| {
+            let _ = modal.render(ctx, &mut open);
+        });
+        out_hover.textures_delta.clear();
+
+        let close_pos = modal.last_close_btn_rect.expect("Close button must be rendered").center();
+        let mut input2 = egui::RawInput::default();
+        input2.screen_rect = Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1920.0, 1080.0)));
+        input2.events.push(egui::Event::PointerMoved(close_pos));
+        input2.events.push(egui::Event::PointerButton {
+            pos: close_pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let mut out2 = ctx.run_ui(input2, |ctx| {
+            let _ = modal.render(ctx, &mut open);
+        });
+        out2.textures_delta.clear();
+
+        let mut input3 = egui::RawInput::default();
+        input3.screen_rect = Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1920.0, 1080.0)));
+        input3.events.push(egui::Event::PointerMoved(close_pos));
+        input3.events.push(egui::Event::PointerButton {
+            pos: close_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let mut out3 = ctx.run_ui(input3, |ctx| {
+            let _ = modal.render(ctx, &mut open);
+        });
+        out3.textures_delta.clear();
+
+        assert!(!open, "Clicking the ✕ button in the Preferences header must close the modal dialog");
     }
 }

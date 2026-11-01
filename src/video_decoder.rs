@@ -413,8 +413,7 @@ impl VideoPlayer {
                 let img = Arc::clone(&self.scrub_cache[idx].1);
                 self.rendered_frames_in_sample += 1;
                 self.last_fingerprint = image_fingerprint(&img);
-                self.last_displayed_image = Some(Arc::clone(&img));
-                let data = ImageData::Color(img);
+                let data = ImageData::Color(Arc::clone(&img));
                 if let Some(tex) = &mut self.texture {
                     tex.set(data, TextureOptions::LINEAR);
                 } else {
@@ -422,6 +421,7 @@ impl VideoPlayer {
                 }
                 self.last_decoded_frame = cached_f;
                 if cached_f == target_frame {
+                    self.last_displayed_image = Some(img);
                     self.last_exact_frame = cached_f;
                 }
             }
@@ -481,26 +481,41 @@ impl VideoPlayer {
     /// Дренирование свежих кадров из фонового воркера в очередь при воспроизведении по Render Cache,
     /// чтобы фоновый декодер декодировал упреждающе и выход из закэшированной зоны был бесшовным
     fn drain_incoming_into_cache(&mut self) {
+        let mut newly_cached: Vec<(i64, Arc<ColorImage>)> = Vec::new();
+        let mut garbage: Vec<ColorImage> = Vec::new();
         if let Some(rx) = &self.frame_rx {
             while let Ok((epoch, raw_frame_num, image)) = rx.try_recv() {
                 if raw_frame_num >= 0 {
                     let arc_img = Arc::new(image);
                     self.newly_cached_frames.push((raw_frame_num, Arc::clone(&arc_img)));
-                    if epoch == self.current_epoch {
+                    newly_cached.push((raw_frame_num, Arc::clone(&arc_img)));
+                    self.last_displayed_epoch = self.last_displayed_epoch.max(epoch);
+                    if self.is_playing_mode && epoch == self.current_epoch {
                         if let Some(back) = self.frame_queue.back_mut() {
                             if back.0 == raw_frame_num {
-                                back.1 = arc_img;
+                                let old = std::mem::replace(&mut back.1, arc_img);
+                                garbage.extend(Arc::try_unwrap(old).ok());
                                 continue;
                             }
                         }
                         self.frame_queue.push_back((raw_frame_num, arc_img));
                         while self.frame_queue.len() > 180 {
-                            self.frame_queue.pop_front();
+                            if let Some((_, old)) = self.frame_queue.pop_front() {
+                                garbage.extend(Arc::try_unwrap(old).ok());
+                            }
                         }
+                    } else {
+                        garbage.extend(Arc::try_unwrap(arc_img).ok());
                     }
+                } else {
+                    garbage.push(image);
                 }
             }
         }
+        for (cf, cimg) in newly_cached {
+            self.cache_scrub_frame(cf, cimg, &mut garbage);
+        }
+        self.recycle_images(garbage);
     }
 
     /// Обновление воспроизведения с упреждающей подготовкой следующей монтажной склейки (Zero-Latency Cut)
@@ -624,11 +639,15 @@ impl VideoPlayer {
         } else {
             self.pause();
             if let Some(img) = cached_image {
+                let mut garbage = Vec::new();
+                self.cache_scrub_frame(target_frame, Arc::clone(&img), &mut garbage);
+                self.recycle_images(garbage);
                 self.present_playback_frame(ctx, img);
                 self.last_decoded_frame = target_frame;
                 self.last_exact_frame = target_frame;
                 self.last_playback_target = target_frame;
-                self.poll_frames(ctx);
+                // Дренируем завершенные фоновые Seek-кадры ТОЛЬКО в кэш, никогда не перезаписывая текстуру закэшированного кадра!
+                self.drain_incoming_into_cache();
             } else {
                 self.seek_and_decode(target_frame, ctx);
             }
@@ -690,7 +709,9 @@ impl VideoPlayer {
                 }
 
                 if epoch == self.current_epoch {
-                    if frame_num <= cut_limit {
+                    // В очередь живого воспроизведения помещаем только кадры >= target_frame,
+                    // чтобы пре-ролл не завершался досрочно на кадрах разгона GOP и не было вспышек старых кадров
+                    if frame_num <= cut_limit && frame_num >= target_frame {
                         if let Some(back) = self.frame_queue.back_mut() {
                             if back.0 == frame_num {
                                 let old = std::mem::replace(&mut back.1, arc_img);
@@ -881,8 +902,13 @@ impl VideoPlayer {
         }
     }
 
-    /// Выводит кадр воспроизведения на GPU текстуру
+    /// Выводит кадр воспроизведения на GPU текстуру (пропуская повторную загрузку идентичного буфера в VRAM)
     pub fn present_playback_frame(&mut self, ctx: &Context, img: Arc<ColorImage>) {
+        if let (Some(prev), Some(_)) = (&self.last_displayed_image, &self.texture) {
+            if Arc::ptr_eq(prev, &img) {
+                return;
+            }
+        }
         self.last_displayed_image = Some(Arc::clone(&img));
         let data = ImageData::Color(img);
         if let Some(tex) = &mut self.texture {
@@ -975,24 +1001,38 @@ impl VideoPlayer {
                     continue;
                 }
 
-                // Обновляем монитор только если кадр совпадает с целевым (плейхедом)
-                // или включен режим воспроизведения. Упреждающие кадры Smart Cache не сбивают текущий кадр паузы!
+                if is_preview {
+                    // Превью ключевого кадра показываем только при холодном старте, когда ещё нет ни одного кадра на экране
+                    if self.last_decoded_frame < 0 && epoch == self.current_epoch {
+                        self.rendered_frames_in_sample += 1;
+                        self.last_fingerprint = image_fingerprint(&arc_img);
+                        let data = ImageData::Color(Arc::clone(&arc_img));
+                        if let Some(tex) = &mut self.texture {
+                            tex.set(data, TextureOptions::LINEAR);
+                        } else {
+                            self.texture = Some(ctx.load_texture("video_frame", data, TextureOptions::LINEAR));
+                        }
+                        self.last_decoded_frame = frame_num;
+                    } else {
+                        stale.extend(Arc::try_unwrap(arc_img).ok());
+                    }
+                    continue;
+                }
+
+                // Обновляем монитор только если точный кадр совпадает с целевым (плейхедом)
+                // или включен режим воспроизведения. Упреждающие кадры не сбивают текущий кадр паузы!
                 if self.is_playing_mode || frame_num == self.last_playback_target {
                     self.rendered_frames_in_sample += 1;
                     self.last_fingerprint = image_fingerprint(&arc_img);
-                    let data = ImageData::Color(Arc::clone(&arc_img));
+                    self.last_displayed_image = Some(Arc::clone(&arc_img));
+                    let data = ImageData::Color(arc_img);
                     if let Some(tex) = &mut self.texture {
                         tex.set(data, TextureOptions::LINEAR);
                     } else {
                         self.texture = Some(ctx.load_texture("video_frame", data, TextureOptions::LINEAR));
                     }
                     self.last_decoded_frame = frame_num;
-                    if !is_preview {
-                        self.last_displayed_image = Some(arc_img);
-                        if epoch == self.current_epoch {
-                            self.last_exact_frame = frame_num;
-                        }
-                    }
+                    self.last_exact_frame = frame_num;
                 }
             }
         }
@@ -1022,7 +1062,8 @@ impl VideoPlayer {
         if self.is_real_video {
             let now = std::time::Instant::now();
             let elapsed = now.duration_since(self.last_request_time).as_millis();
-            if let Some(dist) = self.try_apply_scrub_cache(target_frame, 45, ctx) {
+            let max_scrub_dist = if self.last_decoded_frame < 0 { 45 } else { 6 };
+            if let Some(dist) = self.try_apply_scrub_cache(target_frame, max_scrub_dist, ctx) {
                 if dist == 0 {
                     self.last_playback_target = target_frame;
                     self.last_exact_frame = target_frame;
@@ -1031,7 +1072,7 @@ impl VideoPlayer {
                     }
                     return;
                 }
-                // Если dist > 0, мы показали ближайший кадр из скраб-кэша для мгновенного отклика (Zero-Lag),
+                // Если dist > 0, мы показали ближайший соседний кадр из скраб-кэша для мгновенного отклика (Zero-Lag),
                 // но точный целевой кадр target_frame обязан быть декодирован и отправлен в Render Cache!
             }
             let prev_delivered = self.last_displayed_epoch >= self.current_epoch;
@@ -1434,7 +1475,7 @@ impl VideoPlayer {
 
                     let can_decode_forward = !waiting_for_keyframe
                         && current_pts >= 0
-                        && target_pts >= current_pts
+                        && target_pts > current_pts
                         && (target_pts - current_pts) <= gop_max_pts;
 
                     if !can_decode_forward {
@@ -1515,7 +1556,7 @@ impl VideoPlayer {
                                             } else {
                                                 target_frame
                                             };
-                                            if current_pts >= 0 && new_target_pts >= current_pts && (new_target_pts - current_pts) <= gop_max_pts {
+                                            if current_pts >= 0 && new_target_pts > current_pts && (new_target_pts - current_pts) <= gop_max_pts {
                                                 target_pts = new_target_pts;
                                                 keyframe_sent = false;
                                             } else {
@@ -1582,6 +1623,27 @@ impl VideoPlayer {
                                                 &mut seek_pixel_buf,
                                             );
                                             break;
+                                        }
+
+                                        // При скраббинге сохраняем последние 5 кадров перед target_frame в кэш,
+                                        // чтобы движение каретки назад и туда-сюда попадало в кэш за 0 мс без повторного декодирования GOP!
+                                        if f_num >= 0 && f_num >= target_frame - 5 && f_num < target_frame {
+                                            if seek_pixel_buf.capacity() < w * h {
+                                                seek_pixel_buf = Vec::with_capacity(w * h);
+                                            }
+                                            if let Some(nb_img) = Self::scale_and_copy_frame(
+                                                &mut scaler,
+                                                &decoded_frame,
+                                                &mut sw_frame,
+                                                &mut rgba_frame,
+                                                w,
+                                                h,
+                                                &mut seek_pixel_buf,
+                                            ) {
+                                                if frame_tx.send((epoch, f_num, nb_img)).is_err() {
+                                                    break 'worker_loop;
+                                                }
+                                            }
                                         }
 
                                         if !keyframe_sent {
@@ -1721,7 +1783,6 @@ impl VideoPlayer {
                         && !waiting_for_keyframe;
 
                     let mut keyframe_preview_sent = can_continue_forward && start_frame <= current_decoded_frame + 2;
-                    let mut last_catchup_preview: i64 = -999;
                     if can_continue_forward {
                         vaapi_fifo.retain(|(_, fn_out, _)| *fn_out >= start_frame);
                         for (ep, _, _) in vaapi_fifo.iter_mut() {
@@ -1869,17 +1930,17 @@ impl VideoPlayer {
                                     let f_num = (pts as f64 * time_base_f * fps).round() as i64;
                                     current_decoded_frame = f_num;
 
-                                    // Кадры до start_playback_frame (разгон от ключевого кадра) передаем на масштабирование
-                                    // с их реальным номером кадра, чтобы они сразу попадали в RenderCache и превращали красную зону в синюю!
+                                    // Кадры до start_playback_frame (разгон от ключевого кадра):
+                                    // отправляем максимум 1 отрицательное превью для холодного старта,
+                                    // не засоряя очередь воспроизведения и не создавая 1-кадровых дыр в RenderCache
                                     if f_num < start_playback_frame {
-                                        if !keyframe_preview_sent || (f_num - last_catchup_preview >= 2) {
+                                        if !keyframe_preview_sent {
                                             keyframe_preview_sent = true;
-                                            last_catchup_preview = f_num;
                                             let mut moved = ffmpeg_next::util::frame::Video::empty();
                                             unsafe {
                                                 ffmpeg_next::ffi::av_frame_move_ref(moved.as_mut_ptr(), decoded_frame.as_mut_ptr());
                                             }
-                                            if !transfer_and_send(active_epoch, f_num, moved, &recycle_rx, &scale_tx) {
+                                            if !transfer_and_send(active_epoch, -(f_num + 1), moved, &recycle_rx, &scale_tx) {
                                                 break 'worker_loop;
                                             }
                                         }

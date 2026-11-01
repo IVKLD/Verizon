@@ -1014,18 +1014,23 @@ impl eframe::App for NleApp {
             && self.last_user_activity.elapsed().as_secs_f32() >= self.preferences.auto_cache_idle_secs
             && !self.bg_cache_engine.is_busy()
         {
-            // DaVinci Smart Cache: приоритизируем кэширование вокруг текущего положения курсора (плейхеда)!
+            // DaVinci Smart Cache: приоритизируем кэширование в окне ёмкости кэша (max_frames) вокруг плейхеда,
+            // исключая бесконечное перетирание LRU-кэша на длинных клипах!
             let cur_playhead = self.timeline.playhead_frame;
+            let max_cap = self.render_cache.max_frames.max(60);
+            let forward_window = (max_cap.saturating_sub(30)).max(60) as i64;
+            let backward_window = 30i64;
             let mut uncached_batch = Vec::new();
             let mut chosen_path = None;
             let mut chosen_fps = 60.0;
 
-            // 1) Сначала ищем клип под плейхедом и кэшируем вперед от плейхеда
+            // 1) Сначала ищем клип под плейхедом и кэшируем в пределах окна [playhead - 30 .. playhead + forward_window]
             if let Some(clip) = self.timeline.active_video_clip_at(cur_playhead) {
                 if !clip.is_disabled {
                     if let Some(ref path) = clip.source_path {
-                        let start_f = (cur_playhead - 30).max(clip.start_frame);
-                        for tl_f in start_f..clip.end_frame() {
+                        let start_f = (cur_playhead - backward_window).max(clip.start_frame);
+                        let end_f = (cur_playhead + forward_window).min(clip.end_frame());
+                        for tl_f in start_f..end_f {
                             if !self.render_cache.is_cached(tl_f) {
                                 let src_f = clip.source_frame_from_timeline(tl_f, self.timeline.fps);
                                 let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(&self.timeline, tl_f);
@@ -1043,23 +1048,23 @@ impl eframe::App for NleApp {
                 }
             }
 
-            // 2) Если впереди от плейхеда всё закэшировано — ищем в клипе под плейхедом назад
-            if uncached_batch.is_empty() {
+            // 2) Если окно вокруг плейхеда уже закэшировано и в кэше ещё есть свободные слоты — докэшируем остаток клипа
+            if uncached_batch.is_empty() && self.render_cache.stats().cached_frames < max_cap.saturating_sub(16) {
                 if let Some(clip) = self.timeline.active_video_clip_at(cur_playhead) {
                     if !clip.is_disabled {
                         if let Some(ref path) = clip.source_path {
-                            for tl_f in (clip.start_frame..cur_playhead).rev() {
+                            let remaining_budget = max_cap.saturating_sub(self.render_cache.stats().cached_frames).min(120);
+                            for tl_f in clip.start_frame..clip.end_frame() {
                                 if !self.render_cache.is_cached(tl_f) {
                                     let src_f = clip.source_frame_from_timeline(tl_f, self.timeline.fps);
                                     let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(&self.timeline, tl_f);
                                     uncached_batch.push((src_f, tl_f, sig));
-                                    if uncached_batch.len() >= 120 {
+                                    if uncached_batch.len() >= remaining_budget {
                                         break;
                                     }
                                 }
                             }
                             if !uncached_batch.is_empty() {
-                                uncached_batch.reverse();
                                 chosen_path = Some(path.clone());
                                 chosen_fps = clip.source_fps;
                             }
@@ -1068,8 +1073,9 @@ impl eframe::App for NleApp {
                 }
             }
 
-            // 3) Если под плейхедом всё закэшировано — ищем любой другой клип с красными сегментами
-            if uncached_batch.is_empty() {
+            // 3) Если под плейхедом всё закэшировано и в кэше ещё есть место — ищем любой другой клип
+            if uncached_batch.is_empty() && self.render_cache.stats().cached_frames < max_cap.saturating_sub(16) {
+                let remaining_budget = max_cap.saturating_sub(self.render_cache.stats().cached_frames).min(120);
                 'find_any: for clip in &self.timeline.clips {
                     if clip.is_audio || clip.is_disabled {
                         continue;
@@ -1080,7 +1086,7 @@ impl eframe::App for NleApp {
                             let src_f = clip.source_frame_from_timeline(tl_f, self.timeline.fps);
                             let sig = crate::render_cache::RenderCacheManager::compute_frame_signature(&self.timeline, tl_f);
                             uncached_batch.push((src_f, tl_f, sig));
-                            if uncached_batch.len() >= 120 {
+                            if uncached_batch.len() >= remaining_budget {
                                 break;
                             }
                         }
