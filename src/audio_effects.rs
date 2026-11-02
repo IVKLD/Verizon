@@ -231,6 +231,13 @@ impl ParametricEq {
         }
         sum
     }
+
+    /// Пересчитать коэффициенты всех фильтров после десериализации
+    pub fn recalculate_all(&mut self, sample_rate: f32) {
+        for band in &mut self.bands {
+            band.recalculate_coefficients(sample_rate);
+        }
+    }
 }
 
 // ============================================================================
@@ -359,6 +366,24 @@ impl Default for StudioReverb {
 }
 
 impl StudioReverb {
+    /// Инициализировать гребенчатые буферы после десериализации
+    pub fn ensure_initialized(&mut self) {
+        if self.comb_buffers.is_empty() {
+            let comb_lens = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
+            let mut buffers = Vec::new();
+            let mut indices = Vec::new();
+            let mut stores = Vec::new();
+            for &len in &comb_lens {
+                buffers.push(vec![0.0f32; len]);
+                indices.push(0);
+                stores.push(0.0);
+            }
+            self.comb_buffers = buffers;
+            self.comb_idx = indices;
+            self.comb_filter_store = stores;
+        }
+    }
+
     pub fn process_interleaved(&mut self, buffer: &mut [f32]) {
         if !self.enabled || self.comb_buffers.is_empty() {
             return;
@@ -749,6 +774,87 @@ impl TrackAudioRack {
         self.peak_l = max_l;
         self.peak_r = max_r;
     }
+
+    pub fn to_serialized(&self) -> SerializedTrackRack {
+        let vst_ser = self.vst.as_ref().map(|v| {
+            let mut params = Vec::with_capacity(v.num_params.max(0) as usize);
+            for i in 0..v.num_params {
+                params.push(v.get_parameter(i));
+            }
+            SerializedVstPlugin {
+                path: v.path.clone(),
+                enabled: v.enabled,
+                params,
+            }
+        });
+
+        SerializedTrackRack {
+            track_index: self.track_index,
+            volume_db: self.volume_db,
+            pan: self.pan,
+            is_muted: self.is_muted,
+            is_solo: self.is_solo,
+            eq: self.eq.clone(),
+            dynamics: self.dynamics.clone(),
+            reverb: self.reverb.clone(),
+            vst: vst_ser,
+        }
+    }
+
+    pub fn apply_serialized(&mut self, ser: &SerializedTrackRack) {
+        self.volume_db = ser.volume_db;
+        self.pan = ser.pan;
+        self.is_muted = ser.is_muted;
+        self.is_solo = ser.is_solo;
+        self.eq = ser.eq.clone();
+        self.eq.recalculate_all(AUDIO_SAMPLE_RATE);
+        self.dynamics = ser.dynamics.clone();
+        self.reverb = ser.reverb.clone();
+        self.reverb.ensure_initialized();
+
+        if let Some(ref v_ser) = ser.vst {
+            if self.vst.as_ref().map(|v| &v.path) != Some(&v_ser.path) {
+                self.vst = VstHostInstance::load_from_path(&v_ser.path).ok();
+            }
+            if let Some(ref mut vst) = self.vst {
+                vst.enabled = v_ser.enabled;
+                for (i, &val) in v_ser.params.iter().enumerate() {
+                    vst.set_parameter(i as i32, val);
+                }
+            }
+        } else {
+            self.vst = None;
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SerializedVstPlugin {
+    pub path: PathBuf,
+    pub enabled: bool,
+    pub params: Vec<f32>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SerializedTrackRack {
+    pub track_index: usize,
+    pub volume_db: f32,
+    pub pan: f32,
+    pub is_muted: bool,
+    pub is_solo: bool,
+    pub eq: ParametricEq,
+    pub dynamics: DynamicsCompressor,
+    pub reverb: StudioReverb,
+    pub vst: Option<SerializedVstPlugin>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SerializedMasterRack {
+    pub volume_db: f32,
+    pub eq: ParametricEq,
+    pub dynamics: DynamicsCompressor,
+    pub reverb: StudioReverb,
+    pub vst: Option<SerializedVstPlugin>,
 }
 
 pub struct MasterAudioRack {
@@ -813,6 +919,51 @@ impl MasterAudioRack {
         self.peak_l = max_l;
         self.peak_r = max_r;
     }
+
+    pub fn to_serialized(&self) -> SerializedMasterRack {
+        let vst_ser = self.vst.as_ref().map(|v| {
+            let mut params = Vec::with_capacity(v.num_params.max(0) as usize);
+            for i in 0..v.num_params {
+                params.push(v.get_parameter(i));
+            }
+            SerializedVstPlugin {
+                path: v.path.clone(),
+                enabled: v.enabled,
+                params,
+            }
+        });
+
+        SerializedMasterRack {
+            volume_db: self.volume_db,
+            eq: self.eq.clone(),
+            dynamics: self.dynamics.clone(),
+            reverb: self.reverb.clone(),
+            vst: vst_ser,
+        }
+    }
+
+    pub fn apply_serialized(&mut self, ser: &SerializedMasterRack) {
+        self.volume_db = ser.volume_db;
+        self.eq = self.eq.clone();
+        self.eq.recalculate_all(AUDIO_SAMPLE_RATE);
+        self.dynamics = ser.dynamics.clone();
+        self.reverb = ser.reverb.clone();
+        self.reverb.ensure_initialized();
+
+        if let Some(ref v_ser) = ser.vst {
+            if self.vst.as_ref().map(|v| &v.path) != Some(&v_ser.path) {
+                self.vst = VstHostInstance::load_from_path(&v_ser.path).ok();
+            }
+            if let Some(ref mut vst) = self.vst {
+                vst.enabled = v_ser.enabled;
+                for (i, &val) in v_ser.params.iter().enumerate() {
+                    vst.set_parameter(i as i32, val);
+                }
+            }
+        } else {
+            self.vst = None;
+        }
+    }
 }
 
 // ============================================================================
@@ -858,6 +1009,30 @@ impl FairlightWorkstationState {
     pub fn rescan_plugins(&mut self) {
         self.discovered_vsts = scan_system_vst_plugins();
         self.scan_performed = true;
+    }
+
+    /// Экспортировать состояние всех линеек и мастер-секции для сохранения в файл сцены
+    pub fn export_serialized(&self) -> (Vec<SerializedTrackRack>, SerializedMasterRack) {
+        let tracks = self.track_racks.iter().map(|r| r.to_serialized()).collect();
+        let master = self.master_rack.to_serialized();
+        (tracks, master)
+    }
+
+    /// Загрузить сохранённое состояние линеек и мастер-секции из файла сцены
+    pub fn import_serialized(&mut self, tracks: &[SerializedTrackRack], master: Option<&SerializedMasterRack>) {
+        for t_ser in tracks {
+            if t_ser.track_index < self.track_racks.len() {
+                self.track_racks[t_ser.track_index].apply_serialized(t_ser);
+            } else {
+                let mut rack = TrackAudioRack::new(t_ser.track_index);
+                rack.apply_serialized(t_ser);
+                self.track_racks.push(rack);
+            }
+        }
+        if let Some(m_ser) = master {
+            self.master_rack.apply_serialized(m_ser);
+        }
+        self.dirty = true;
     }
 
     /// Отрисовка микшерного пульта (Mixer Console)

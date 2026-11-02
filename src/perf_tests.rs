@@ -1417,9 +1417,11 @@ fn test_active_video_clip_priority() {
     // На кадре 60 активны оба, но V2 (индекс 0) имеет более высокий приоритет
     assert_eq!(tl.active_video_clip_at(60).unwrap().id, 20);
 
-    // Если клип V1 явно выбран пользователем, он получает приоритет редактирования
+    // Выбор клипа V1 в таймлайне не ломает композитинг: активным верхним клипом остается V2,
+    // а выбранный клип доступен для редактирования через selected_clip()
     tl.selected_clip_id = Some(10);
-    assert_eq!(tl.active_video_clip_at(60).unwrap().id, 10);
+    assert_eq!(tl.active_video_clip_at(60).unwrap().id, 20);
+    assert_eq!(tl.selected_clip().unwrap().id, 10);
 }
 
 #[test]

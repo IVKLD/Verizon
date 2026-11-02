@@ -243,7 +243,7 @@ impl ViewerState {
                 let source_frame = clip.source_frame_from_timeline(timeline.playhead_frame, timeline.fps);
                 if timeline.is_playing && !timeline.is_scrubbing {
                     // Вычисляем ближайшую монтажную склейку (конец текущего клипа или начало клипа на более приоритетной дорожке V2 > V1)
-                    let clip_prio = (clip.track_index, if timeline.selected_clip_id == Some(clip.id) { 0usize } else { 1usize });
+                    let clip_prio = clip.track_index;
                     let clip_end = clip.start_frame + clip.duration_frames;
                     let cut_frame = timeline
                         .clips
@@ -253,7 +253,7 @@ impl ViewerState {
                                 && c.id != clip.id
                                 && c.start_frame > timeline.playhead_frame
                                 && c.start_frame < clip_end
-                                && (c.track_index, if timeline.selected_clip_id == Some(c.id) { 0usize } else { 1usize }) < clip_prio
+                                && c.track_index < clip_prio
                         })
                         .map(|c| c.start_frame)
                         .min()
@@ -266,7 +266,7 @@ impl ViewerState {
                         .clips
                         .iter()
                         .filter(|c| !c.is_audio && c.contains_frame(cut_frame))
-                        .min_by_key(|c| (c.track_index, if timeline.selected_clip_id == Some(c.id) { 0usize } else { 1usize }))
+                        .min_by_key(|c| c.track_index)
                         .or_else(|| {
                             timeline
                                 .clips
@@ -968,12 +968,33 @@ impl ViewerState {
                 }
 
                 // Интерактивная рамка трансформации (Transform Overlay как в DaVinci Resolve)
+                // Если пользователь выбрал конкретный видеоклип под плейхедом — управляем им,
+                // иначе рамка управляет активным верхним клипом композиции.
+                let osc_clip = timeline
+                    .selected_clip()
+                    .filter(|c| !c.is_audio && !c.is_disabled && c.contains_frame(timeline.playhead_frame))
+                    .cloned()
+                    .unwrap_or_else(|| top_clip.clone());
+
+                let osc_w = screen_rect.width() * osc_clip.zoom_x;
+                let osc_h = screen_rect.height() * osc_clip.zoom_y;
+                let osc_center = screen_rect.center() + vec2(osc_clip.position_x * px_scale, osc_clip.position_y * px_scale);
+                let osc_box_rect = Rect::from_center_size(osc_center, vec2(osc_w, osc_h));
+
+                let osc_rot_rad = osc_clip.rotation.to_radians();
+                let (osc_sin_a, osc_cos_a) = osc_rot_rad.sin_cos();
+                let rotate_osc_pt = |p: Pos2| -> Pos2 {
+                    let dx = p.x - osc_center.x;
+                    let dy = p.y - osc_center.y;
+                    pos2(osc_center.x + dx * osc_cos_a - dy * osc_sin_a, osc_center.y + dx * osc_sin_a + dy * osc_cos_a)
+                };
+
                 if self.show_transform_overlay {
                     // Вычисляем ключевые точки рамки с учётом поворота
-                    let p_lt = rotate_pt(video_box_rect.left_top());
-                    let p_rt = rotate_pt(video_box_rect.right_top());
-                    let p_rb = rotate_pt(video_box_rect.right_bottom());
-                    let p_lb = rotate_pt(video_box_rect.left_bottom());
+                    let p_lt = rotate_osc_pt(osc_box_rect.left_top());
+                    let p_rt = rotate_osc_pt(osc_box_rect.right_top());
+                    let p_rb = rotate_osc_pt(osc_box_rect.right_bottom());
+                    let p_lb = rotate_osc_pt(osc_box_rect.left_bottom());
 
                     let p_tc = pos2((p_lt.x + p_rt.x) * 0.5, (p_lt.y + p_rt.y) * 0.5);
                     let p_bc = pos2((p_lb.x + p_rb.x) * 0.5, (p_lb.y + p_rb.y) * 0.5);
@@ -993,13 +1014,13 @@ impl ViewerState {
 
                     // Центральная точка привязки (Anchor Point с перекрестием в стиле Resolve)
                     let resolve_blue = Color32::from_rgb(41, 151, 255);
-                    painter.circle_stroke(clip_center, 5.5, Stroke::new(1.5, resolve_blue));
-                    painter.line_segment([pos2(clip_center.x - 9.0, clip_center.y), pos2(clip_center.x + 9.0, clip_center.y)], Stroke::new(1.5, resolve_blue));
-                    painter.line_segment([pos2(clip_center.x, clip_center.y - 9.0), pos2(clip_center.x, clip_center.y + 9.0)], Stroke::new(1.5, resolve_blue));
+                    painter.circle_stroke(osc_center, 5.5, Stroke::new(1.5, resolve_blue));
+                    painter.line_segment([pos2(osc_center.x - 9.0, osc_center.y), pos2(osc_center.x + 9.0, osc_center.y)], Stroke::new(1.5, resolve_blue));
+                    painter.line_segment([pos2(osc_center.x, osc_center.y - 9.0), pos2(osc_center.x, osc_center.y + 9.0)], Stroke::new(1.5, resolve_blue));
 
                     // Стебель и ручка вращения (Rotation Stalk & Handle вверху клипа)
                     let stalk_len = 28.0;
-                    let stalk_dir = rotate_pt(pos2(clip_center.x, clip_center.y - 1.0)) - clip_center;
+                    let stalk_dir = rotate_osc_pt(pos2(osc_center.x, osc_center.y - 1.0)) - osc_center;
                     let stalk_norm = stalk_dir.normalized();
                     let p_rot = p_tc + stalk_norm * stalk_len;
                     painter.line_segment([p_tc, p_rot], Stroke::new(1.5, resolve_blue));
@@ -1017,7 +1038,7 @@ impl ViewerState {
                     let resp_rc = ui.interact(Rect::from_center_size(p_rc, h_sz), ui.id().with("tr_rc"), egui::Sense::drag());
 
                     let resp_rot = ui.interact(Rect::from_center_size(p_rot, vec2(20.0, 20.0)), ui.id().with("tr_rot"), egui::Sense::drag());
-                    let body_resp = ui.interact(video_box_rect.intersect(rect), ui.id().with("tr_body"), egui::Sense::click_and_drag());
+                    let body_resp = ui.interact(osc_box_rect.intersect(rect), ui.id().with("tr_body"), egui::Sense::click_and_drag());
 
                     if body_resp.double_clicked() {
                         self.zoom_mode = ZoomMode::Fit;
@@ -1051,7 +1072,7 @@ impl ViewerState {
 
                     // Обработка интерактивного изменения положения, масштаба и угла клипа с магнитным прилипанием к краям и центру (DaVinci Resolve Magnetic Snap)
                     let mut clip_mutated = false;
-                    let top_clip_id = top_clip.id;
+                    let target_clip_id = osc_clip.id;
                     let mut active_snap_guide_x: Option<f32> = None;
                     let mut active_snap_guide_y: Option<f32> = None;
                     let is_alt = ui.input(|i| i.modifiers.alt);
@@ -1068,11 +1089,11 @@ impl ViewerState {
                         self.transform_raw_zoom = None;
                     }
 
-                    if let Some(target_clip) = timeline.clips.iter_mut().find(|c| c.id == top_clip_id) {
+                    if let Some(target_clip) = timeline.clips.iter_mut().find(|c| c.id == target_clip_id) {
                         if resp_rot.dragged() {
                             let is_shift = ui.input(|i| i.modifiers.shift);
                             if let Some(mouse_pos) = ui.input(|i| i.pointer.latest_pos()) {
-                                let v = mouse_pos - clip_center;
+                                let v = mouse_pos - osc_center;
                                 let mut angle = v.y.atan2(v.x).to_degrees() + 90.0;
                                 while angle > 180.0 { angle -= 360.0; }
                                 while angle < -180.0 { angle += 360.0; }
@@ -1131,8 +1152,8 @@ impl ViewerState {
                             } else {
                                 (resp_lb.drag_delta(), -1.0f32, 1.0f32)
                             };
-                            let local_dx = (screen_delta.x * cos_a + screen_delta.y * sin_a) * sign_x;
-                            let local_dy = (-screen_delta.x * sin_a + screen_delta.y * cos_a) * sign_y;
+                            let local_dx = (screen_delta.x * osc_cos_a + screen_delta.y * osc_sin_a) * sign_x;
+                            let local_dy = (-screen_delta.x * osc_sin_a + screen_delta.y * osc_cos_a) * sign_y;
                             let half_w = (screen_rect.width() * 0.5).max(1.0);
                             let half_h = (screen_rect.height() * 0.5).max(1.0);
                             let zoom_delta = (local_dx / half_w + local_dy / half_h) * 0.5;
@@ -1160,7 +1181,7 @@ impl ViewerState {
                             } else {
                                 (resp_lc.drag_delta(), -1.0f32)
                             };
-                            let local_dx = (screen_delta.x * cos_a + screen_delta.y * sin_a) * sign_x;
+                            let local_dx = (screen_delta.x * osc_cos_a + screen_delta.y * osc_sin_a) * sign_x;
                             let half_w = (screen_rect.width() * 0.5).max(1.0);
                             let zoom_delta = local_dx / half_w;
                             let (raw_zx, raw_zy) = self
@@ -1182,7 +1203,7 @@ impl ViewerState {
                             } else {
                                 (resp_tc.drag_delta(), -1.0f32)
                             };
-                            let local_dy = (-screen_delta.x * sin_a + screen_delta.y * cos_a) * sign_y;
+                            let local_dy = (-screen_delta.x * osc_sin_a + screen_delta.y * osc_cos_a) * sign_y;
                             let half_h = (screen_rect.height() * 0.5).max(1.0);
                             let zoom_delta = local_dy / half_h;
                             let (raw_zx, raw_zy) = self
@@ -1219,12 +1240,14 @@ impl ViewerState {
                     }
 
                     if clip_mutated {
-                        if let Some(target_clip) = timeline.clips.iter().find(|c| c.id == top_clip_id) {
-                            top_clip.position_x = target_clip.position_x;
-                            top_clip.position_y = target_clip.position_y;
-                            top_clip.zoom_x = target_clip.zoom_x;
-                            top_clip.zoom_y = target_clip.zoom_y;
-                            top_clip.rotation = target_clip.rotation;
+                        if let Some(target_clip) = timeline.clips.iter().find(|c| c.id == target_clip_id) {
+                            if top_clip.id == target_clip_id {
+                                top_clip.position_x = target_clip.position_x;
+                                top_clip.position_y = target_clip.position_y;
+                                top_clip.zoom_x = target_clip.zoom_x;
+                                top_clip.zoom_y = target_clip.zoom_y;
+                                top_clip.rotation = target_clip.rotation;
+                            }
                         }
                         ui.ctx().request_repaint();
                     }

@@ -29,6 +29,11 @@ impl AudioStreamBuffer {
         })
     }
 
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.decoded_len.load(Ordering::Acquire) == 0
+    }
+
     #[cfg(test)]
     pub fn from_vec(v: Vec<f32>) -> Arc<Self> {
         let len = v.len() & !1;
@@ -812,6 +817,9 @@ impl AudioPlayer {
         let key = (path.to_path_buf(), audio_track_index);
         if let Ok(cache) = self.audio_cache.lock() {
             if let Some(buf) = cache.get(&key) {
+                if buf.is_empty() && buf.finished.load(Ordering::Acquire) {
+                    return None;
+                }
                 return Some(buf.clone());
             }
         }
@@ -840,6 +848,11 @@ impl AudioPlayer {
         };
 
         if num_streams == 0 {
+            if let Ok(mut cache) = self.audio_cache.lock() {
+                let empty_buf = AudioStreamBuffer::with_capacity(2);
+                empty_buf.finished.store(true, Ordering::Release);
+                cache.insert(key, empty_buf);
+            }
             return None;
         }
 

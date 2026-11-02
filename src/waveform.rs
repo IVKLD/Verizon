@@ -78,6 +78,7 @@ impl WaveformManager {
         let pending = self.pending.clone();
         let path_buf = path.to_path_buf();
 
+        let requested_track = audio_track_index;
         tokio::spawn(async move {
             let path_for_blocking = path_buf.clone();
             let result = tokio::task::spawn_blocking(move || {
@@ -85,13 +86,29 @@ impl WaveformManager {
             })
             .await;
 
-            if let Ok(Ok(all_peaks)) = result {
-                if let Ok(mut c) = cache.write() {
-                    for (idx, peaks) in all_peaks {
-                        c.insert((path_buf.clone(), idx), Arc::new(peaks));
+            match result {
+                Ok(Ok(all_peaks)) => {
+                    let mut found_requested = false;
+                    if let Ok(mut c) = cache.write() {
+                        for (idx, peaks) in all_peaks {
+                            if idx == requested_track {
+                                found_requested = true;
+                            }
+                            c.insert((path_buf.clone(), idx), Arc::new(peaks));
+                        }
+                        if !found_requested {
+                            c.insert((path_buf.clone(), requested_track), Arc::new(Vec::new()));
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+                _ => {
+                    // При ошибке или отсутствии аудиопотоков кэшируем пустой массив для предотвращения
+                    // бесконечного спама фоновых задач на каждом кадре отрисовки (60-144 FPS)
+                    if let Ok(mut c) = cache.write() {
+                        c.insert((path_buf.clone(), requested_track), Arc::new(Vec::new()));
                     }
                 }
-                ctx.request_repaint();
             }
 
             if let Ok(mut p) = pending.lock() {

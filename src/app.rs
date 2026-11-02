@@ -166,7 +166,12 @@ impl NleApp {
         // Восстановление сохраненного состояния сцены (Project Scene)
         let scene_path = UserPreferences::scene_path();
         if scene_path.exists() {
-            if let Ok(()) = app.timeline.load_scene_file(&scene_path) {
+            if let Ok(scene) = app.timeline.load_scene_file(&scene_path) {
+                if let Some(ref racks) = scene.audio_racks {
+                    app.fairlight.import_serialized(racks, scene.master_rack.as_ref());
+                }
+                app.audio_player.rebuild_timeline_audio_with_racks(&app.timeline, Some(&app.fairlight.track_racks));
+                app.audio_player.set_master_volume(app.fairlight.master_rack.volume_db);
                 if let Some(first_video) = app.timeline.clips.iter().find(|c| !c.is_audio) {
                     if let Some(ref path) = first_video.source_path {
                         let _ = app.video_player.open_file(path, &cc.egui_ctx);
@@ -216,6 +221,16 @@ impl NleApp {
         if let Ok(json) = serde_json::to_string_pretty(&self.dock_state) {
             let _ = std::fs::write(path, json);
         }
+    }
+
+    /// Сохранить полное состояние сцены проекта на диск вместе с настройками линеек Fairlight
+    pub fn save_project_scene(&self) -> Result<(), String> {
+        let (audio_racks, master_rack) = self.fairlight.export_serialized();
+        self.timeline.save_scene_file_with_audio(
+            &UserPreferences::scene_path(),
+            Some(audio_racks),
+            Some(master_rack),
+        )
     }
 
     pub fn set_ui_scale(&mut self, new_scale: f32, ctx: &Context) {
@@ -428,7 +443,7 @@ impl NleApp {
 
             // Ctrl+S: Сохранение сцены проекта
             if (i.modifiers.ctrl || i.modifiers.command) && !i.modifiers.shift && i.key_pressed(egui::Key::S) {
-                if self.timeline.save_scene_file(&UserPreferences::scene_path()).is_ok() {
+                if self.save_project_scene().is_ok() {
                     self.notification = Some(("💾 Сцена проекта сохранена".to_string(), std::time::Instant::now()));
                 }
             }
@@ -745,14 +760,19 @@ impl NleApp {
                     // Верхнее главное меню DaVinci Resolve
                     ui.menu_button("File", |ui| {
                         if ui.button("💾 Save Scene [Ctrl+S]").clicked() {
-                            if self.timeline.save_scene_file(&UserPreferences::scene_path()).is_ok() {
+                            if self.save_project_scene().is_ok() {
                                 self.notification = Some(("💾 Сцена проекта сохранена".to_string(), std::time::Instant::now()));
                             }
                             ui.close();
                         }
                         if ui.button("📂 Open Scene...").clicked() {
                             if let Some(file) = rfd::FileDialog::new().add_filter("Scene JSON", &["json"]).pick_file() {
-                                if self.timeline.load_scene_file(&file).is_ok() {
+                                if let Ok(scene) = self.timeline.load_scene_file(&file) {
+                                    if let Some(ref racks) = scene.audio_racks {
+                                        self.fairlight.import_serialized(racks, scene.master_rack.as_ref());
+                                    }
+                                    self.audio_player.rebuild_timeline_audio_with_racks(&self.timeline, Some(&self.fairlight.track_racks));
+                                    self.audio_player.set_master_volume(self.fairlight.master_rack.volume_db);
                                     self.notification = Some(("📂 Сцена проекта загружена".to_string(), std::time::Instant::now()));
                                     if let Some(first_video) = self.timeline.clips.iter().find(|c| !c.is_audio) {
                                         if let Some(ref path) = first_video.source_path {
@@ -1019,7 +1039,7 @@ impl eframe::App for NleApp {
         if self.timeline.structure_dirty && !is_dragging {
             self.render_cache.invalidate_all();
             self.video_player.flush_queues_on_cut();
-            let _ = self.timeline.save_scene_file(&UserPreferences::scene_path());
+            let _ = self.save_project_scene();
             self.timeline.structure_dirty = false;
         }
 
@@ -1320,7 +1340,7 @@ impl eframe::App for NleApp {
             if self.timeline.structure_dirty && !is_dragging {
                 self.render_cache.invalidate_all();
                 self.video_player.flush_queues_on_cut();
-                let _ = self.timeline.save_scene_file(&UserPreferences::scene_path());
+                let _ = self.save_project_scene();
                 self.timeline.structure_dirty = false;
             }
         }
@@ -1332,6 +1352,7 @@ impl eframe::App for NleApp {
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {
         self.save_preferences();
         self.save_dock_layout();
+        let _ = self.save_project_scene();
     }
 }
 

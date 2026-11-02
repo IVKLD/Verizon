@@ -338,6 +338,10 @@ pub struct ProjectScene {
     pub fps: u32,
     pub in_point: Option<i64>,
     pub out_point: Option<i64>,
+    #[serde(default)]
+    pub audio_racks: Option<Vec<crate::audio_effects::SerializedTrackRack>>,
+    #[serde(default)]
+    pub master_rack: Option<crate::audio_effects::SerializedMasterRack>,
 }
 
 #[derive(Debug, Clone)]
@@ -432,7 +436,20 @@ impl TimelineState {
                     && !self.tracks.get(c.track_index).map(|t| t.is_muted).unwrap_or(false)
                     && c.contains_frame(frame)
             })
-            .min_by_key(|c| (if self.selected_clip_id == Some(c.id) { 0usize } else { 1usize }, c.track_index))
+            .min_by_key(|c| c.track_index)
+    }
+
+    /// Получить ссылку на выбранный клип на таймлайне (если выбран)
+    #[inline]
+    pub fn selected_clip(&self) -> Option<&Clip> {
+        self.selected_clip_id.and_then(|id| self.clips.iter().find(|c| c.id == id))
+    }
+
+    /// Получить изменяемую ссылку на выбранный клип на таймлайне (если выбран)
+    #[inline]
+    pub fn selected_clip_mut(&mut self) -> Option<&mut Clip> {
+        let id = self.selected_clip_id?;
+        self.clips.iter_mut().find(|c| c.id == id)
     }
 
     pub fn track_height(&self, track_idx: usize) -> f32 {
@@ -556,6 +573,8 @@ impl TimelineState {
             fps: self.fps,
             in_point: self.in_point,
             out_point: self.out_point,
+            audio_racks: None,
+            master_rack: None,
         }
     }
 
@@ -584,7 +603,19 @@ impl TimelineState {
 
     /// Сохранить сцену проекта в JSON файл на диске
     pub fn save_scene_file(&self, path: &std::path::Path) -> Result<(), String> {
-        let scene = self.export_scene();
+        self.save_scene_file_with_audio(path, None, None)
+    }
+
+    /// Сохранить сцену проекта в JSON файл на диске вместе с рэками эффектов Fairlight
+    pub fn save_scene_file_with_audio(
+        &self,
+        path: &std::path::Path,
+        audio_racks: Option<Vec<crate::audio_effects::SerializedTrackRack>>,
+        master_rack: Option<crate::audio_effects::SerializedMasterRack>,
+    ) -> Result<(), String> {
+        let mut scene = self.export_scene();
+        scene.audio_racks = audio_racks;
+        scene.master_rack = master_rack;
         let json = serde_json::to_string_pretty(&scene).map_err(|e| e.to_string())?;
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -593,11 +624,11 @@ impl TimelineState {
     }
 
     /// Загрузить сцену проекта из JSON файла на диске
-    pub fn load_scene_file(&mut self, path: &std::path::Path) -> Result<(), String> {
+    pub fn load_scene_file(&mut self, path: &std::path::Path) -> Result<ProjectScene, String> {
         let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let scene: ProjectScene = serde_json::from_str(&content).map_err(|e| e.to_string())?;
-        self.import_scene(scene);
-        Ok(())
+        self.import_scene(scene.clone());
+        Ok(scene)
     }
 
     /// Динамически гарантировать существование аудиодорожек на таймлайне (A1, A2, A3...)
@@ -1918,6 +1949,53 @@ mod tests {
         assert!((loaded_tl.clips[0].speed - 1.5).abs() < 1e-4);
         assert_eq!(loaded_tl.clips[1].name, "Audio 1");
         assert!(loaded_tl.clips[1].is_audio);
+
+        let _ = std::fs::remove_file(scene_file);
+    }
+
+    #[test]
+    fn test_scene_fairlight_audio_racks_persistence_roundtrip() {
+        use crate::audio_effects::FairlightWorkstationState;
+
+        let mut tl = TimelineState::new_empty();
+        tl.fps = 60;
+        let mut fairlight = FairlightWorkstationState::new();
+        fairlight.track_racks[0].volume_db = -6.5;
+        fairlight.track_racks[0].pan = 0.5;
+        fairlight.track_racks[0].eq.bands[0].gain_db = 4.0;
+        fairlight.track_racks[0].dynamics.enabled = true;
+        fairlight.track_racks[0].dynamics.threshold_db = -14.0;
+        fairlight.track_racks[0].reverb.enabled = true;
+        fairlight.track_racks[0].reverb.room_size = 0.8;
+        fairlight.master_rack.volume_db = -1.2;
+
+        let (tracks, master) = fairlight.export_serialized();
+
+        let temp_dir = std::env::temp_dir().join("verizon_test_audio_scene");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let scene_file = temp_dir.join("audio_scene.json");
+
+        assert!(tl.save_scene_file_with_audio(&scene_file, Some(tracks), Some(master)).is_ok());
+
+        let mut loaded_tl = TimelineState::new_empty();
+        let loaded_scene = loaded_tl.load_scene_file(&scene_file).expect("scene must load");
+        assert!(loaded_scene.audio_racks.is_some());
+        assert!(loaded_scene.master_rack.is_some());
+
+        let mut loaded_fairlight = FairlightWorkstationState::new();
+        loaded_fairlight.import_serialized(
+            loaded_scene.audio_racks.as_deref().unwrap(),
+            loaded_scene.master_rack.as_ref(),
+        );
+
+        assert!((loaded_fairlight.track_racks[0].volume_db - (-6.5)).abs() < 1e-4);
+        assert!((loaded_fairlight.track_racks[0].pan - 0.5).abs() < 1e-4);
+        assert!((loaded_fairlight.track_racks[0].eq.bands[0].gain_db - 4.0).abs() < 1e-4);
+        assert!(loaded_fairlight.track_racks[0].dynamics.enabled);
+        assert!((loaded_fairlight.track_racks[0].dynamics.threshold_db - (-14.0)).abs() < 1e-4);
+        assert!(loaded_fairlight.track_racks[0].reverb.enabled);
+        assert!((loaded_fairlight.track_racks[0].reverb.room_size - 0.8).abs() < 1e-4);
+        assert!((loaded_fairlight.master_rack.volume_db - (-1.2)).abs() < 1e-4);
 
         let _ = std::fs::remove_file(scene_file);
     }
