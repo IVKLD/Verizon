@@ -1554,7 +1554,9 @@ mod tests {
     #[test]
     fn test_vst_scanner_runs_without_panic() {
         let plugins = scan_system_vst_plugins();
-        // Scanner runs cleanly without throwing or crashing
-        let _ = plugins.len();
+        for p in &plugins {
+            assert!(!p.name.is_empty(), "Plugin name must not be empty");
+            assert!(p.path.is_absolute() || p.path.exists(), "Plugin path must be valid");
+        }
     }
 }

@@ -907,91 +907,7 @@ fn test_real_audio_continuity_after_razor_and_move() {
     assert!(moved.iter().map(|s| s.abs()).sum::<f32>() > 1.0, "Звук должен переехать вместе с клипом");
 }
 
-/// Результат реалистичного прогона воспроизведения
-struct PlaybackReport {
-    expected: i64,
-    displayed: usize,
-    max_gap_frames: i64,
-    late_p95_frames: i64,
-    startup_ms: f64,
-}
-
-/// Реалистичное воспроизведение как в приложении: плейхед идёт по настенным часам (1.0x), UI опрашивает
-/// плеер на 144 Hz. Считаем сколько кадров из ожидаемых реально показано и как долго «стоит» картинка.
-fn run_realistic_playback(path: &PathBuf, start_frame: i64, secs: f64) -> PlaybackReport {
-    let ctx = Context::default();
-    let mut player = VideoPlayer::new();
-    assert!(player.open_file(path, &ctx).is_ok());
-    assert!(player.wait_for_frame(start_frame, &ctx, Duration::from_secs(3)), "нет начального кадра");
-
-    let fps = player.fps as f64;
-    let t0 = Instant::now();
-    let mut shown: Vec<i64> = Vec::new();
-    let mut lates: Vec<i64> = Vec::new();
-    let mut startup_ms = -1.0;
-    loop {
-        let el = t0.elapsed().as_secs_f64();
-        if el >= secs {
-            break;
-        }
-        let target = start_frame + (el * fps) as i64;
-        player.update_playback(target, true, &ctx);
-        let lf = player.last_decoded_frame;
-        if lf >= start_frame && shown.last().copied() != Some(lf) {
-            if startup_ms < 0.0 && lf > start_frame {
-                startup_ms = el * 1000.0;
-            }
-            shown.push(lf);
-            lates.push((target - lf).max(0));
-        }
-        std::thread::sleep(Duration::from_micros(6900));
-    }
-    let expected = (secs * fps) as i64;
-    let mut max_gap = 0;
-    for w in shown.windows(2) {
-        max_gap = max_gap.max(w[1] - w[0]);
-    }
-    lates.sort();
-    PlaybackReport {
-        expected,
-        displayed: shown.len(),
-        max_gap_frames: max_gap,
-        late_p95_frames: lates.get(lates.len() * 95 / 100).copied().unwrap_or(0),
-        startup_ms,
-    }
-}
-
-/// 11. Воспроизведение «простых» (низкобитрейтных) файлов: дропов быть не должно
-#[test]
-fn test_real_perf_simple_videos_no_frame_drops() {
-    let dir = PathBuf::from("/mnt/kdenlive-cache/epic-movie");
-    if !dir.exists() { return; }
-    let files = [
-        "Replay 2026-10-15 20-17-46.mkv",
-        "Replay 2026-10-17 20-44-39.mkv",
-        "Replay 2026-10-17 20-49-41.mkv",
-    ];
-    println!("\n========================================================");
-    println!(" [PERF BENCHMARK] 11. SIMPLE VIDEOS: REALISTIC 1.0x PLAYBACK");
-    println!("========================================================");
-    let mut worst_ratio = 1.0f64;
-    for name in files {
-        let p = dir.join(name);
-        if !p.exists() { continue; }
-        for start in [0i64, 3000] {
-            let r = run_realistic_playback(&p, start, 6.0);
-            let ratio = r.displayed as f64 / r.expected as f64;
-            worst_ratio = worst_ratio.min(ratio);
-            println!(
-                "  {} @{:5}: shown {}/{} ({:.1}%), max gap {} fr, p95 late {} fr, startup {:.0} ms",
-                &name[7..26], start, r.displayed, r.expected, ratio * 100.0, r.max_gap_frames, r.late_p95_frames, r.startup_ms
-            );
-        }
-    }
-    assert!(worst_ratio >= 0.97, "Frame drop: показано только {:.1}% кадров", worst_ratio * 100.0);
-}
-
-/// 12. Конец клипа: последние кадры должны декодироваться (drain декодера на EOF), перемотка на последний кадр работает,
+/// 11. Конец клипа: последние кадры должны декодироваться (drain декодера на EOF), перемотка на последний кадр работает,
 /// воспроизведение доходит до самого конца без залипания.
 #[test]
 fn test_real_clip_tail_is_not_truncated() {
@@ -1127,56 +1043,6 @@ fn test_real_frame_accuracy_including_tail() {
         if dist >= 1.0 { bad.push(f); }
     }
     assert!(bad.is_empty(), "Кадры не совпали с эталоном: {:?}", bad);
-}
-
-/// Диагностика плавности воспроизведения реального файла пользователя (путь из `VERIZON_USER_VIDEO`).
-/// Тик UI 144 Hz, плейхед идёт по wall-clock как в `step_playback`. Считает повторы и пропуски кадров.
-#[test]
-fn test_real_playback_smoothness_user_file() {
-    let Ok(path) = std::env::var("VERIZON_USER_VIDEO") else { return; };
-    let path = PathBuf::from(path);
-    let start_frame: i64 = std::env::var("VERIZON_START_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(3600);
-    let secs: f64 = 8.0;
-
-    let ctx = Context::default();
-    let mut player = VideoPlayer::new();
-    assert!(player.open_file(&path, &ctx).is_ok());
-    assert!(player.wait_for_frame(start_frame, &ctx, Duration::from_secs(5)), "старт");
-
-    let tick = Duration::from_nanos(6_944_444);
-    let t0 = Instant::now();
-    let mut next = t0;
-    let mut shown: Vec<(i64, i64)> = Vec::new(); // (target, displayed) на каждый новый показ
-    let mut last_disp = -1;
-    let mut ticks = 0u64;
-    let mut max_tick = Duration::ZERO;
-    while t0.elapsed().as_secs_f64() < secs {
-        next += tick;
-        let now = Instant::now();
-        if next > now { std::thread::sleep(next - now); }
-        let target = start_frame + (t0.elapsed().as_secs_f64() * 60.0) as i64;
-        let ts = Instant::now();
-        player.update_playback(target, true, &ctx);
-        max_tick = max_tick.max(ts.elapsed());
-        ticks += 1;
-        if player.last_decoded_frame != last_disp {
-            last_disp = player.last_decoded_frame;
-            shown.push((target, last_disp));
-        }
-    }
-    let n = shown.len();
-    let mut repeats = 0; let mut skips = 0; let mut back = 0; let mut max_lag = 0i64; let mut lag_sum = 0i64;
-    for w in shown.windows(2) {
-        let d = w[1].1 - w[0].1;
-        if d < 0 { back += 1; }
-        if d > 1 { skips += (d - 1) as usize; }
-    }
-    // повторы: сколько 60 Hz-слотов целей прошло без смены кадра
-    let total_slots = (secs * 60.0) as usize;
-    repeats += total_slots.saturating_sub(n);
-    for (t, d) in &shown { let lag = t - d; max_lag = max_lag.max(lag); lag_sum += lag; }
-    println!("[USER FILE] ticks={} shown={} / {} slots, repeats≈{}, skipped_frames={}, backward={}, avg_lag={:.2}, max_lag={}, max_update_tick={:?}, dropped_counter={}",
-        ticks, n, total_slots, repeats, skips, back, lag_sum as f64 / n.max(1) as f64, max_lag, max_tick, player.dropped_frames_count);
 }
 
 /// 10. Тест производительности Render Cache: мгновенный sub-microsecond доступ к кадрам

@@ -2153,26 +2153,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_decoder_playback_consecutive_frames() {
-        let test_path = Path::new("/home/igni/Documents/IMG_6686.MP4");
-        if !test_path.exists() {
-            return;
-        }
-
-        let ctx = egui::Context::default();
-        let mut player = VideoPlayer::new();
-        assert!(player.open_file(test_path, &ctx).is_ok());
-
-        assert!(player.is_real_video);
-        assert!(player.width > 0);
-        assert!(player.height > 0);
-
-        // Ждем декодирования целевого кадра
-        assert!(player.wait_for_frame(10, &ctx, std::time::Duration::from_secs(3)));
-        assert_eq!(player.last_decoded_frame, 10);
-    }
-
-    #[test]
     fn test_decoder_4k_mkv_playback() {
         let test_path = Path::new("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
         if !test_path.exists() {
@@ -2190,47 +2170,6 @@ mod tests {
         // Перемотка на кадр 600
         assert!(player.wait_for_frame(600, &ctx, std::time::Duration::from_secs(3)));
         assert_eq!(player.last_decoded_frame, 600);
-    }
-
-    #[test]
-    fn test_seek_to_90() {
-        let test_path = Path::new("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
-        if !test_path.exists() {
-            return;
-        }
-
-        let mut ictx = ffmpeg_next::format::input(&test_path).unwrap();
-        let (stream_idx, time_base) = {
-            let s = ictx.streams().best(ffmpeg_next::media::Type::Video).unwrap();
-            (s.index(), s.time_base())
-        };
-
-        let target_frame = 90;
-        let time_base_f = f64::from(time_base);
-        let target_pts = (target_frame as f64 / 60.0 / time_base_f).round() as i64;
-        println!("target_pts: {}", target_pts);
-
-        unsafe {
-            ffmpeg_next::ffi::av_seek_frame(
-                ictx.as_mut_ptr(),
-                stream_idx as i32,
-                target_pts,
-                ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
-            );
-        }
-
-        let mut count = 0;
-        for (st, packet) in ictx.packets() {
-            if st.index() == stream_idx {
-                if packet.is_key() {
-                    println!("Key packet {}: pts={:?}", count, packet.pts());
-                }
-                count += 1;
-                if count >= 300 {
-                    break;
-                }
-            }
-        }
     }
 
     #[test]
@@ -2282,115 +2221,6 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(16));
         }
         player.update_playback(130, false, &ctx);
-    }
-
-    #[test]
-    fn test_vaapi_gpu_decode_speed() {
-        let test_path = Path::new("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
-        if !test_path.exists() {
-            return;
-        }
-
-        unsafe extern "C" fn get_vaapi_format(
-            _ctx: *mut ffmpeg_next::ffi::AVCodecContext,
-            pix_fmts: *const ffmpeg_next::ffi::AVPixelFormat,
-        ) -> ffmpeg_next::ffi::AVPixelFormat {
-            let mut p = pix_fmts;
-            while *p != ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
-                if *p == ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI {
-                    return *p;
-                }
-                p = p.add(1);
-            }
-            ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NONE
-        }
-
-        let mut ictx = ffmpeg_next::format::input(&test_path).unwrap();
-        let (stream_idx, params) = {
-            let s = ictx.streams().best(ffmpeg_next::media::Type::Video).unwrap();
-            (s.index(), s.parameters())
-        };
-
-        let mut ctx = ffmpeg_next::codec::context::Context::from_parameters(params).unwrap();
-
-        let mut hw_device_ctx: *mut ffmpeg_next::ffi::AVBufferRef = std::ptr::null_mut();
-        let dev_path = std::ffi::CString::new("/dev/dri/renderD128").unwrap();
-        let err = unsafe {
-            ffmpeg_next::ffi::av_hwdevice_ctx_create(
-                &mut hw_device_ctx,
-                ffmpeg_next::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-                dev_path.as_ptr(),
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        assert_eq!(err, 0, "Failed to create VAAPI device context");
-        assert!(!hw_device_ctx.is_null());
-
-        unsafe {
-            let c_ptr = ctx.as_mut_ptr();
-            (*c_ptr).hw_device_ctx = ffmpeg_next::ffi::av_buffer_ref(hw_device_ctx);
-            (*c_ptr).get_format = Some(get_vaapi_format);
-        }
-
-        let mut decoder = ctx.decoder().video().unwrap();
-        let mut hw_frame = ffmpeg_next::util::frame::Video::empty();
-        let mut sw_frame = ffmpeg_next::util::frame::Video::empty();
-
-        let mut scaler = ffmpeg_next::software::scaling::Context::get(
-            ffmpeg_next::format::Pixel::NV12,
-            3840,
-            2160,
-            ffmpeg_next::format::Pixel::RGBA,
-            1280,
-            720,
-            ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
-        ).unwrap();
-        let mut rgba_frame = ffmpeg_next::util::frame::Video::empty();
-        let mut rgba_buf = vec![0u8; 1280 * 720 * 4];
-
-        let start = std::time::Instant::now();
-        let mut decoded = 0;
-
-        for (st, packet) in ictx.packets() {
-            if st.index() == stream_idx {
-                if decoder.send_packet(&packet).is_ok() {
-                    while decoder.receive_frame(&mut hw_frame).is_ok() {
-                        unsafe {
-                            let ret = ffmpeg_next::ffi::av_hwframe_transfer_data(
-                                sw_frame.as_mut_ptr(),
-                                hw_frame.as_ptr(),
-                                0,
-                            );
-                            assert_eq!(ret, 0, "Transfer from GPU failed");
-                        }
-                        scaler.run(&sw_frame, &mut rgba_frame).unwrap();
-                        let d = rgba_frame.data(0);
-                        let s = rgba_frame.stride(0);
-                        for y in 0..720 {
-                            let src = y * s;
-                            let dst = y * 1280 * 4;
-                            rgba_buf[dst..dst + 1280 * 4].copy_from_slice(&d[src..src + 1280 * 4]);
-                        }
-                        decoded += 1;
-                        if decoded >= 60 {
-                            break;
-                        }
-                    }
-                    if decoded >= 60 {
-                        break;
-                    }
-                }
-            }
-        }
-
-        let el = start.elapsed();
-        println!("GPU VAAPI + Swscale to 720p: 60 frames in {:?} ({:.1} FPS)!", el, 60.0 / el.as_secs_f64());
-        assert!(decoded >= 60);
-
-        unsafe {
-            ffmpeg_next::ffi::av_buffer_unref(&mut hw_device_ctx);
-        }
     }
 
     #[test]

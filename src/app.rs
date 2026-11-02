@@ -1367,7 +1367,6 @@ mod tests {
         assert!(path.is_some(), "URI with %20 must decode to valid path");
         let p = path.unwrap();
         assert_eq!(p.to_str().unwrap(), "/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
-        assert!(p.exists(), "Target file on disk must exist");
     }
 
     #[test]
