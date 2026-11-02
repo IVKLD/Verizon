@@ -38,7 +38,8 @@ impl InspectorState {
             if let Some(clip_idx) = timeline.clips.iter().position(|c| c.id == clip_id) {
                 let mut clip = timeline.clips[clip_idx].clone();
                 let mut needs_history = false;
-                let mut video_changed = false;
+                let mut transform_changed = false;
+                let mut structure_changed = false;
                 let mut audio_changed = false;
 
                 // Автоматическое переключение на вкладку Audio для чисто звуковых клипов
@@ -115,13 +116,13 @@ impl InspectorState {
                                             if self.zoom_linked {
                                                 clip.zoom_y = zx;
                                             }
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         if ui.button("⟲").on_hover_text("Сбросить зум").clicked() {
                                             needs_history = true;
                                             clip.zoom_x = 1.0;
                                             clip.zoom_y = 1.0;
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         ui.end_row();
 
@@ -136,7 +137,7 @@ impl InspectorState {
                                             if self.zoom_linked {
                                                 clip.zoom_x = zy;
                                             }
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         ui.checkbox(&mut self.zoom_linked, "🔗");
                                         ui.end_row();
@@ -148,12 +149,12 @@ impl InspectorState {
                                             needs_history = true;
                                         }
                                         if px_resp.changed() {
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         if ui.button("⟲").on_hover_text("Сбросить позицию X").clicked() {
                                             needs_history = true;
                                             clip.position_x = 0.0;
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         ui.end_row();
 
@@ -163,12 +164,12 @@ impl InspectorState {
                                             needs_history = true;
                                         }
                                         if py_resp.changed() {
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         if ui.button("⟲").on_hover_text("Сбросить позицию Y").clicked() {
                                             needs_history = true;
                                             clip.position_y = 0.0;
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         ui.end_row();
 
@@ -179,12 +180,12 @@ impl InspectorState {
                                             needs_history = true;
                                         }
                                         if rot_resp.changed() {
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         if ui.button("⟲").on_hover_text("Сбросить вращение").clicked() {
                                             needs_history = true;
                                             clip.rotation = 0.0;
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         ui.end_row();
 
@@ -200,7 +201,7 @@ impl InspectorState {
                                             if ui.add(h_btn).on_hover_text("Отразить по горизонтали (Flip Horizontal)").clicked() {
                                                 needs_history = true;
                                                 clip.flip_h = !clip.flip_h;
-                                                video_changed = true;
+                                                transform_changed = true;
                                             }
 
                                             let v_btn = egui::Button::new(
@@ -212,14 +213,14 @@ impl InspectorState {
                                             if ui.add(v_btn).on_hover_text("Отразить по вертикали (Flip Vertical)").clicked() {
                                                 needs_history = true;
                                                 clip.flip_v = !clip.flip_v;
-                                                video_changed = true;
+                                                transform_changed = true;
                                             }
                                         });
                                         if ui.button("⟲").on_hover_text("Сбросить отражение").clicked() {
                                             needs_history = true;
                                             clip.flip_h = false;
                                             clip.flip_v = false;
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         ui.end_row();
                                     });
@@ -246,12 +247,12 @@ impl InspectorState {
                                             needs_history = true;
                                         }
                                         if cl_resp.changed() {
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         if ui.button("⟲").on_hover_text("Сбросить Crop Left").clicked() {
                                             needs_history = true;
                                             clip.crop_left = 0.0;
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         ui.end_row();
 
@@ -261,12 +262,12 @@ impl InspectorState {
                                             needs_history = true;
                                         }
                                         if cr_resp.changed() {
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         if ui.button("⟲").on_hover_text("Сбросить Crop Right").clicked() {
                                             needs_history = true;
                                             clip.crop_right = 0.0;
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         ui.end_row();
 
@@ -276,12 +277,12 @@ impl InspectorState {
                                             needs_history = true;
                                         }
                                         if ct_resp.changed() {
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         if ui.button("⟲").on_hover_text("Сбросить Crop Top").clicked() {
                                             needs_history = true;
                                             clip.crop_top = 0.0;
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         ui.end_row();
 
@@ -291,12 +292,12 @@ impl InspectorState {
                                             needs_history = true;
                                         }
                                         if cb_resp.changed() {
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         if ui.button("⟲").on_hover_text("Сбросить Crop Bottom").clicked() {
                                             needs_history = true;
                                             clip.crop_bottom = 0.0;
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         ui.end_row();
                                     });
@@ -323,12 +324,12 @@ impl InspectorState {
                                             needs_history = true;
                                         }
                                         if op_resp.changed() {
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         if ui.button("⟲").on_hover_text("Сбросить Opacity к 100%").clicked() {
                                             needs_history = true;
                                             clip.opacity = 100.0;
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         ui.end_row();
 
@@ -339,12 +340,12 @@ impl InspectorState {
                                             needs_history = true;
                                         }
                                         if fi_resp.changed() {
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         if ui.button("⟲").on_hover_text("Сбросить Fade In").clicked() {
                                             needs_history = true;
                                             clip.fade_in_frames = 0;
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         ui.end_row();
 
@@ -355,12 +356,12 @@ impl InspectorState {
                                             needs_history = true;
                                         }
                                         if fo_resp.changed() {
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         if ui.button("⟲").on_hover_text("Сбросить Fade Out").clicked() {
                                             needs_history = true;
                                             clip.fade_out_frames = 0;
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         ui.end_row();
                                     });
@@ -396,7 +397,7 @@ impl InspectorState {
                                                 let new_dur = ((clip.duration_frames as f64 * ratio).round() as i64).max(1);
                                                 clip.duration_frames = new_dur;
                                                 clip.speed = target_speed;
-                                                video_changed = true;
+                                                structure_changed = true;
                                                 audio_changed = true;
                                             }
                                         }
@@ -406,7 +407,7 @@ impl InspectorState {
                                             let new_dur = ((clip.duration_frames as f64 * old_speed_abs).round() as i64).max(1);
                                             clip.duration_frames = new_dur;
                                             clip.speed = if clip.speed < 0.0 { -1.0 } else { 1.0 };
-                                            video_changed = true;
+                                            structure_changed = true;
                                             audio_changed = true;
                                         }
                                         ui.end_row();
@@ -416,14 +417,14 @@ impl InspectorState {
                                         if ui.checkbox(&mut is_rev, "Reverse").changed() {
                                             needs_history = true;
                                             clip.speed = if is_rev { -clip.speed.abs() } else { clip.speed.abs() };
-                                            video_changed = true;
+                                            structure_changed = true;
                                             audio_changed = true;
                                         }
                                         ui.end_row();
 
                                         ui.label(egui::RichText::new("Retime Controls").size(11.0).color(ResolveColors::TEXT_MUTED));
                                         if ui.checkbox(&mut clip.retime_controls_open, "Show [Ctrl+R]").changed() {
-                                            video_changed = true;
+                                            transform_changed = true;
                                         }
                                         ui.end_row();
                                     });
@@ -569,15 +570,14 @@ impl InspectorState {
                 if needs_history {
                     timeline.push_history();
                 }
-                if video_changed || audio_changed {
+                if transform_changed || structure_changed || audio_changed {
                     timeline.clips[clip_idx] = clip;
                 }
-                if video_changed {
+                if structure_changed {
                     timeline.structure_dirty = true;
                 }
                 if audio_changed {
                     timeline.audio_dirty = true;
-                    timeline.structure_dirty = true;
                 }
             }
         } else {
@@ -590,5 +590,47 @@ impl InspectorState {
                 );
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::timeline::Clip;
+
+    #[test]
+    fn test_inspector_transform_does_not_set_structure_dirty() {
+        let ctx = egui::Context::default();
+        let mut inspector = InspectorState::new();
+        let mut timeline = TimelineState::new_empty();
+
+        timeline.clips.push(Clip {
+            id: 1,
+            name: "Video Clip".to_string(),
+            track_index: 0,
+            start_frame: 0,
+            duration_frames: 100,
+            is_audio: false,
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            position_x: 0.0,
+            position_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+            ..Default::default()
+        });
+        timeline.selected_clip_id = Some(1);
+
+        let input = egui::RawInput::default();
+        let mut out = ctx.run_ui(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                inspector.render(ui, &mut timeline);
+            });
+        });
+        out.textures_delta.clear();
+
+        // После отрисовки инспектора структура не должна быть помечена как грязная
+        assert!(!timeline.structure_dirty, "Inspector rendering must not set structure_dirty");
+        assert_eq!(timeline.clips[0].zoom_x, 1.0);
     }
 }
