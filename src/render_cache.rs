@@ -624,18 +624,7 @@ impl BackgroundCacheEngine {
                     pts
                 };
 
-                let matched_key = if target_map.contains_key(&cur_src_f) {
-                    Some(cur_src_f)
-                } else if target_map.contains_key(&(cur_src_f - 1)) {
-                    Some(cur_src_f - 1)
-                } else if target_map.contains_key(&(cur_src_f + 1)) {
-                    Some(cur_src_f + 1)
-                } else {
-                    None
-                };
-
-                if let Some(key) = matched_key {
-                    let tl_targets = target_map.remove(&key).unwrap();
+                if let Some(tl_targets) = target_map.remove(&cur_src_f) {
                     let fmt = unsafe { (*decoded_frame.as_ptr()).format };
                     let frame_to_scale = if fmt == ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32 {
                         let ok = unsafe {

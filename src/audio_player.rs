@@ -888,12 +888,21 @@ impl AudioPlayer {
         result_buf
     }
 
-    /// Мгновенная сборка снимка аудио-таймлайна (Multi-Track Mixer): O(число клипов), без копирования PCM.
-    /// Само микширование выполняется в real-time коллбэке только для текущего окна ~10 мс.
-    /// Поддерживает неограниченное число аудиодорожек (A1, A2, A3...), Mute/Solo, громкость (volume_db), панораму (pan)
+    /// Сборка снимка аудио для тестов без внешних рэков эффектов
+    #[cfg(test)]
     pub fn rebuild_timeline_audio(&mut self, timeline: &TimelineState) {
+        self.rebuild_timeline_audio_with_racks(timeline, None);
+    }
+
+    /// Сборка снимка аудио с поддержкой консольных линеек Fairlight (Track Audio Racks: volume_db, pan, mute, solo)
+    pub fn rebuild_timeline_audio_with_racks(
+        &mut self,
+        timeline: &TimelineState,
+        racks: Option<&[crate::audio_effects::TrackAudioRack]>,
+    ) {
         let fps = timeline.fps.max(1) as f64;
-        let has_solo = timeline.tracks.iter().any(|t| !t.is_video && t.is_solo);
+        let has_solo = timeline.tracks.iter().any(|t| !t.is_video && t.is_solo)
+            || racks.map(|r| r.iter().any(|rk| rk.is_solo)).unwrap_or(false);
         let mut segments: Vec<MixSegment> = Vec::with_capacity(timeline.clips.len());
         let mut total_len = 0usize;
 
@@ -902,14 +911,22 @@ impl AudioPlayer {
                 continue;
             }
 
+            let track_rack = racks.and_then(|r| r.get(c.track_index));
+            let rack_muted = track_rack.map(|r| r.is_muted).unwrap_or(false);
+            let rack_solo = track_rack.map(|r| r.is_solo).unwrap_or(false);
+            let rack_vol_linear = track_rack.map(|r| 10.0f32.powf(r.volume_db / 20.0)).unwrap_or(1.0);
+            let rack_pan = track_rack.map(|r| r.pan).unwrap_or(0.0);
+
             // Проверка Mute / Solo для дорожки клипа
             if let Some(t) = timeline.tracks.get(c.track_index) {
-                if t.is_muted {
+                if t.is_muted || rack_muted {
                     continue;
                 }
-                if has_solo && !t.is_solo {
+                if has_solo && !t.is_solo && !rack_solo {
                     continue;
                 }
+            } else if rack_muted || (has_solo && !rack_solo) {
+                continue;
             }
 
             let path = match &c.source_path {
@@ -922,10 +939,11 @@ impl AudioPlayer {
                 None => continue,
             };
 
-            let vol_linear = 10.0f32.powf(c.volume_db / 20.0);
+            let vol_linear = 10.0f32.powf(c.volume_db / 20.0) * rack_vol_linear;
             let pan_norm = if c.pan.abs() > 1.0 { (c.pan / 100.0).clamp(-1.0, 1.0) } else { c.pan.clamp(-1.0, 1.0) };
-            let pan_l = ((1.0 - pan_norm) / 2.0).clamp(0.0, 1.0);
-            let pan_r = ((1.0 + pan_norm) / 2.0).clamp(0.0, 1.0);
+            let comb_pan = (pan_norm + rack_pan).clamp(-1.0, 1.0);
+            let pan_l = ((1.0 - comb_pan) / 2.0).clamp(0.0, 1.0);
+            let pan_r = ((1.0 + comb_pan) / 2.0).clamp(0.0, 1.0);
 
             let start = ((c.start_frame.max(0) as f64 / fps) * AUDIO_RATE as f64).round() as usize * 2;
             let in_off = (c.source_in_secs.max(0.0) * AUDIO_RATE as f64).round() as usize * 2;
@@ -1243,5 +1261,48 @@ mod tests {
         assert!((out[10] - 1.0).abs() < 1e-4);
         // Пара 8 (середина Fade Out, осталось 2 из 4): 0.5
         assert!((out[16] - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_audio_mixer_track_racks_volume_pan_mute() {
+        let mut player = AudioPlayer::new();
+        let mut timeline = TimelineState::new_empty();
+        timeline.fps = 24;
+
+        let test_path = Path::new("/mnt/kdenlive-cache/epic-movie/Replay 2026-10-13 21-12-56.mkv");
+        if !test_path.exists() {
+            return;
+        }
+
+        timeline.clips.push(Clip {
+            id: 1,
+            name: "Track Rack Test".to_string(),
+            track_index: 0,
+            start_frame: 0,
+            duration_frames: 48,
+            is_audio: true,
+            source_path: Some(test_path.to_path_buf()),
+            volume_db: 0.0,
+            pan: 0.0,
+            ..Default::default()
+        });
+
+        let mut racks = vec![crate::audio_effects::TrackAudioRack::new(0)];
+        racks[0].volume_db = -6.0; // -6 dB fader
+        racks[0].pan = -1.0; // Full left
+
+        player.rebuild_timeline_audio_with_racks(&timeline, Some(&racks));
+        let snapshot = player.engine.snapshot.load();
+        assert_eq!(snapshot.segments.len(), 1);
+        let seg = &snapshot.segments[0];
+        let expected_vol = 10.0f32.powf(-6.0 / 20.0);
+        assert!((seg.gain_l - expected_vol).abs() < 1e-3);
+        assert!(seg.gain_r.abs() < 1e-4);
+
+        // Теперь тестируем Mute трека
+        racks[0].is_muted = true;
+        player.rebuild_timeline_audio_with_racks(&timeline, Some(&racks));
+        let snapshot_muted = player.engine.snapshot.load();
+        assert_eq!(snapshot_muted.segments.len(), 0, "Muted track must produce 0 segments");
     }
 }

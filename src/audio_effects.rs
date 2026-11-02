@@ -826,6 +826,7 @@ pub struct FairlightWorkstationState {
     pub selected_channel: Option<usize>, // None = Master, Some(idx) = Track A1, A2...
     pub is_vst_modal_open: bool,
     pub scan_performed: bool,
+    pub dirty: bool,
 }
 
 impl FairlightWorkstationState {
@@ -843,6 +844,7 @@ impl FairlightWorkstationState {
             selected_channel: None,
             is_vst_modal_open: false,
             scan_performed: true,
+            dirty: false,
         }
     }
 
@@ -873,8 +875,9 @@ impl FairlightWorkstationState {
         peak_r: f32,
         gr_db: f32,
         is_selected: bool,
-    ) -> bool {
+    ) -> (bool, bool) {
         let mut clicked = false;
+        let mut changed = false;
         let strip_width = 86.0;
 
         let frame = egui::Frame::new()
@@ -933,7 +936,9 @@ impl FairlightWorkstationState {
                 // Панорама
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Pan").size(9.5).color(Color32::from_rgb(0x8c, 0x92, 0xa4)));
-                    ui.add(egui::Slider::new(pan, -1.0..=1.0).show_value(false));
+                    if ui.add(egui::Slider::new(pan, -1.0..=1.0).show_value(false)).changed() {
+                        changed = true;
+                    }
                 });
 
                 ui.add_space(6.0);
@@ -951,6 +956,7 @@ impl FairlightWorkstationState {
 
                     if ui.add(m_btn).clicked() {
                         *is_muted = !*is_muted;
+                        changed = true;
                     }
 
                     let s_btn = egui::Button::new(
@@ -964,6 +970,7 @@ impl FairlightWorkstationState {
 
                     if ui.add(s_btn).clicked() {
                         *is_solo = !*is_solo;
+                        changed = true;
                     }
                 });
 
@@ -972,11 +979,13 @@ impl FairlightWorkstationState {
                 // Вертикальный фейдер и стерео VU-метр
                 ui.horizontal(|ui| {
                     // Фейдер громкости
-                    ui.add(
+                    if ui.add(
                         egui::Slider::new(vol_db, -60.0..=12.0)
                             .vertical()
                             .show_value(false),
-                    );
+                    ).changed() {
+                        changed = true;
+                    }
 
                     // VU метр
                     let vu_height = 140.0;
@@ -1018,11 +1027,12 @@ impl FairlightWorkstationState {
             });
         });
 
-        clicked
+        (clicked, changed)
     }
 
     /// Интерактивный визуализатор параметрического эквалайзера DaVinci Fairlight
-    pub fn render_eq_visualizer(ui: &mut Ui, eq: &mut ParametricEq) {
+    pub fn render_eq_visualizer(ui: &mut Ui, eq: &mut ParametricEq) -> bool {
+        let mut changed = false;
         let (graph_rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 160.0), egui::Sense::hover());
         ui.painter().rect_filled(graph_rect, CornerRadius::same(4), Color32::from_rgb(0x12, 0x13, 0x17));
         ui.painter().rect_stroke(graph_rect, CornerRadius::same(4), Stroke::new(1.0, Color32::from_rgb(0x24, 0x27, 0x30)), egui::StrokeKind::Inside);
@@ -1084,20 +1094,25 @@ impl FairlightWorkstationState {
                     ui.set_width(110.0);
                     ui.vertical(|ui| {
                         ui.label(egui::RichText::new(format!("Band {}", i + 1)).size(10.5).color(band_colors[i]).strong());
-                        ui.add(egui::Slider::new(&mut band.freq_hz, 20.0..=20000.0).logarithmic(true).text("Hz"));
-                        ui.add(egui::Slider::new(&mut band.gain_db, -24.0..=24.0).text("dB"));
-                        ui.add(egui::Slider::new(&mut band.q, 0.1..=10.0).text("Q"));
-                        band.recalculate_coefficients(AUDIO_SAMPLE_RATE);
+                        let c1 = ui.add(egui::Slider::new(&mut band.freq_hz, 20.0..=20000.0).logarithmic(true).text("Hz")).changed();
+                        let c2 = ui.add(egui::Slider::new(&mut band.gain_db, -24.0..=24.0).text("dB")).changed();
+                        let c3 = ui.add(egui::Slider::new(&mut band.q, 0.1..=10.0).text("Q")).changed();
+                        if c1 || c2 || c3 {
+                            band.recalculate_coefficients(AUDIO_SAMPLE_RATE);
+                            changed = true;
+                        }
                     });
                 });
             }
         });
+
+        changed
     }
 
     /// Интерактивный блок VST плагинов
     pub fn render_vst_section(&mut self, ui: &mut Ui, target_rack_name: &str) {
         ui.group(|ui| {
-            ui.set_width(ui.available_width());
+            ui.set_min_width(ui.available_width());
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -1206,7 +1221,7 @@ impl FairlightWorkstationState {
                         for (i, rack) in self.track_racks.iter_mut().enumerate() {
                             let title = format!("A{}", i + 1);
                             let is_sel = self.selected_channel == Some(i);
-                            let clicked = Self::render_mixer_strip(
+                            let (clicked, changed) = Self::render_mixer_strip(
                                 ui,
                                 &title,
                                 Color32::from_rgb(0x35, 0x84, 0xe4),
@@ -1224,6 +1239,9 @@ impl FairlightWorkstationState {
                             if clicked {
                                 selected_to_set = Some(Some(i));
                             }
+                            if changed {
+                                self.dirty = true;
+                            }
                             ui.add_space(4.0);
                         }
 
@@ -1232,7 +1250,7 @@ impl FairlightWorkstationState {
                         let mut dummy_muted = false;
                         let mut dummy_solo = false;
                         let mut dummy_pan = 0.0;
-                        let clicked_master = Self::render_mixer_strip(
+                        let (clicked_master, changed_master) = Self::render_mixer_strip(
                             ui,
                             "MAIN",
                             Color32::from_rgb(0xff, 0x78, 0x00),
@@ -1249,6 +1267,9 @@ impl FairlightWorkstationState {
                         );
                         if clicked_master {
                             selected_to_set = Some(None);
+                        }
+                        if changed_master {
+                            self.dirty = true;
                         }
 
                         if let Some(target) = selected_to_set {
@@ -1274,16 +1295,21 @@ impl FairlightWorkstationState {
                     .color(Color32::WHITE),
             );
 
+            let mut eq_changed = false;
             ui.columns(2, |cols| {
                 // Левая колонка: 4-полосный EQ
                 cols[0].vertical(|ui| {
                     ui.label(egui::RichText::new("4-Band Parametric EQ").strong().color(Color32::from_rgb(0x40, 0xd0, 0x90)));
                     if let Some(ch) = self.selected_channel {
                         if let Some(rack) = self.track_racks.get_mut(ch) {
-                            Self::render_eq_visualizer(ui, &mut rack.eq);
+                            if Self::render_eq_visualizer(ui, &mut rack.eq) {
+                                eq_changed = true;
+                            }
                         }
                     } else {
-                        Self::render_eq_visualizer(ui, &mut self.master_rack.eq);
+                        if Self::render_eq_visualizer(ui, &mut self.master_rack.eq) {
+                            eq_changed = true;
+                        }
                     }
                 });
 
@@ -1292,6 +1318,10 @@ impl FairlightWorkstationState {
                     self.render_vst_section(ui, &selected_name);
                 });
             });
+
+            if eq_changed {
+                self.dirty = true;
+            }
         });
     }
 }

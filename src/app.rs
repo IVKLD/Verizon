@@ -1249,6 +1249,38 @@ impl eframe::App for NleApp {
             self.save_dock_layout();
         }
 
+        // Синхронизация микшера Fairlight (громкость, панорама, mute, solo)
+        if self.fairlight.dirty {
+            let master_linear = 10.0f32.powf(self.fairlight.master_rack.volume_db / 20.0);
+            self.audio_player.set_master_volume(master_linear);
+            self.timeline.audio_dirty = true;
+            self.fairlight.dirty = false;
+        }
+
+        // Обновление живых VU-метров в Fairlight консоли
+        let (vu_l, vu_r) = self.audio_player.get_vu_levels();
+        self.fairlight.master_rack.peak_l = vu_l;
+        self.fairlight.master_rack.peak_r = vu_r;
+
+        let cur_f = self.timeline.playhead_frame;
+        let is_playing = self.timeline.is_playing;
+        for (i, rack) in self.fairlight.track_racks.iter_mut().enumerate() {
+            if !is_playing || rack.is_muted {
+                rack.peak_l = 0.0;
+                rack.peak_r = 0.0;
+            } else {
+                let has_clip = self.timeline.clips.iter().any(|c| c.is_audio && !c.is_disabled && c.track_index == i && c.contains_frame(cur_f));
+                if has_clip {
+                    let vol = 10.0f32.powf(rack.volume_db / 20.0);
+                    rack.peak_l = (vu_l * vol).clamp(0.0, 1.0);
+                    rack.peak_r = (vu_r * vol).clamp(0.0, 1.0);
+                } else {
+                    rack.peak_l = 0.0;
+                    rack.peak_r = 0.0;
+                }
+            }
+        }
+
         // 7. Синхронизация Audio Mixer ПОСЛЕ обработки всех событий ввода, кликов и изменений таймлайна в текущем кадре
         if self.audio_player.has_new_decoded_audio() {
             self.audio_player.export_waveforms_to(&self.waveform_mgr);
@@ -1256,7 +1288,7 @@ impl eframe::App for NleApp {
             ctx.request_repaint();
         }
         if self.timeline.audio_dirty {
-            self.audio_player.rebuild_timeline_audio(&self.timeline);
+            self.audio_player.rebuild_timeline_audio_with_racks(&self.timeline, Some(&self.fairlight.track_racks));
             self.timeline.audio_dirty = false;
         }
         self.audio_player.sync_playhead_frame(
@@ -1271,7 +1303,7 @@ impl eframe::App for NleApp {
             ap.tick(self, &ctx);
             self.autopilot = Some(ap);
             if self.timeline.audio_dirty {
-                self.audio_player.rebuild_timeline_audio(&self.timeline);
+                self.audio_player.rebuild_timeline_audio_with_racks(&self.timeline, Some(&self.fairlight.track_racks));
                 self.timeline.audio_dirty = false;
             }
             self.audio_player.sync_playhead_frame(

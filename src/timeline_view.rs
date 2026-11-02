@@ -104,8 +104,9 @@ impl TimelineView {
                     }
                 }
 
-                // Скролл и Зум колесиком мыши (поддержка любых мышей, тачпадов и колесиков с засечками)
-                let (scroll_x, scroll_y) = ui.input(|i| {
+                // Скролл и Зум колесиком мыши (поддержка любых мышей, тачпадов и колесиков с засечками, а также Ctrl+Колесо)
+                let (zoom_delta, scroll_x, scroll_y, is_zoom, is_shift) = ui.input(|i| {
+                    let zd = i.zoom_delta();
                     let mut dx = i.smooth_scroll_delta.x;
                     let mut dy = i.smooth_scroll_delta.y;
                     for ev in &i.events {
@@ -118,30 +119,33 @@ impl TimelineView {
                             }
                         }
                     }
-                    (dx, dy)
+                    let zoom = i.modifiers.alt || i.modifiers.ctrl || i.modifiers.command;
+                    let shift = i.modifiers.shift;
+                    (zd, dx, dy, zoom, shift)
                 });
 
                 if scroll_x != 0.0 {
                     timeline.scroll_x = (timeline.scroll_x - scroll_x * 1.5).max(0.0);
                 }
 
-                if scroll_y != 0.0 {
-                    let is_zoom = ui.input(|i| i.modifiers.alt || i.modifiers.ctrl || i.modifiers.command);
-                    let is_shift = ui.input(|i| i.modifiers.shift);
-
-                    if is_zoom {
-                        // Плавный гранулярный зум с настраиваемым шагом (по умолчанию 8%) под курсором мыши
-                        let old_zoom = timeline.zoom_factor;
-                        let step = (timeline.zoom_step_percent / 100.0).clamp(0.01, 0.35);
+                let has_zoom_gesture = (zoom_delta - 1.0).abs() > 0.001;
+                if is_zoom || has_zoom_gesture {
+                    let old_zoom = timeline.zoom_factor;
+                    let step = (timeline.zoom_step_percent / 100.0).clamp(0.01, 0.35);
+                    let factor = if has_zoom_gesture {
+                        zoom_delta.clamp(0.75, 1.35)
+                    } else {
                         let raw_delta = if scroll_y.abs() > 30.0 { scroll_y.signum() } else { scroll_y * 0.05 };
-                        let factor = (1.0 + step * raw_delta).clamp(0.5, 2.0);
-                        let new_zoom = (old_zoom * factor).clamp(0.0005, 50.0);
+                        (1.0 + step * raw_delta).clamp(0.5, 2.0)
+                    };
 
-                        let mouse_rel_x = m_pos.x - canvas_rect.min.x;
-                        let target_frame = (mouse_rel_x + timeline.scroll_x) / old_zoom;
-                        timeline.zoom_factor = new_zoom;
-                        timeline.scroll_x = (target_frame * new_zoom - mouse_rel_x).max(0.0);
-                    } else if is_shift {
+                    let new_zoom = (old_zoom * factor).clamp(0.0005, 50.0);
+                    let mouse_rel_x = m_pos.x - canvas_rect.min.x;
+                    let target_frame = (mouse_rel_x + timeline.scroll_x) / old_zoom;
+                    timeline.zoom_factor = new_zoom;
+                    timeline.scroll_x = (target_frame * new_zoom - mouse_rel_x).max(0.0);
+                } else if scroll_y != 0.0 {
+                    if is_shift {
                         // Shift + Колесо: вертикальный скролл дорожек
                         timeline.scroll_y = (timeline.scroll_y - scroll_y * 1.5).max(0.0);
                     } else {
@@ -1953,5 +1957,47 @@ impl TimelineView {
             [pos2(playhead_x, ruler.max.y), pos2(playhead_x, canvas.max.y)],
             Stroke::new(1.5, orange),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::timeline::TimelineState;
+    use crate::waveform::WaveformManager;
+    use crate::render_cache::RenderCacheManager;
+
+    #[test]
+    fn test_timeline_ctrl_wheel_zoom() {
+        let ctx = egui::Context::default();
+        let mut timeline = TimelineState::new_empty();
+        let initial_zoom = 1.0;
+        timeline.zoom_factor = initial_zoom;
+
+        let waveform_mgr = WaveformManager::new();
+        let mut render_cache = RenderCacheManager::default();
+
+        let mut init_input = egui::RawInput::default();
+        init_input.screen_rect = Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1080.0)));
+        let mut out1 = ctx.run_ui(init_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                TimelineView::render(ui, &mut timeline, &waveform_mgr, &mut render_cache);
+            });
+        });
+        out1.textures_delta.clear();
+
+        let mut zoom_input = egui::RawInput::default();
+        zoom_input.screen_rect = Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1080.0)));
+        zoom_input.events.push(egui::Event::PointerMoved(egui::pos2(600.0, 350.0)));
+        zoom_input.events.push(egui::Event::Zoom(1.25));
+
+        let mut out2 = ctx.run_ui(zoom_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                TimelineView::render(ui, &mut timeline, &waveform_mgr, &mut render_cache);
+            });
+        });
+        out2.textures_delta.clear();
+
+        assert!(timeline.zoom_factor > initial_zoom, "Timeline zoom factor must increase when zooming in with Ctrl+Wheel");
     }
 }
